@@ -29,6 +29,16 @@ impl Provider {
         }
     }
 
+    /// Compact provider name used by the status bar.
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Provider::Ollama => "Ollama",
+            Provider::LmStudio => "LM Studio",
+            Provider::OpenAi => "OpenAI",
+            Provider::Anthropic => "Anthropic",
+        }
+    }
+
     pub fn is_cloud(self) -> bool {
         matches!(self, Provider::OpenAi | Provider::Anthropic)
     }
@@ -49,7 +59,7 @@ impl Provider {
     pub fn default_model(self) -> &'static str {
         match self {
             Provider::Ollama => "llava",
-            Provider::LmStudio => "local-model",
+            Provider::LmStudio => "",
             Provider::OpenAi => "gpt-4o-mini",
             Provider::Anthropic => "claude-sonnet-4-20250514",
         }
@@ -129,6 +139,10 @@ pub struct Config {
     pub global_prompt: String,
     /// Optional explicit path to exiftool. Empty means auto-detect.
     pub exiftool_path: String,
+    /// Last folder opened in the browser, restored on next launch.
+    pub last_folder: String,
+    /// Number of concurrent AI workers for a batch (clamped to 1..=4 at use).
+    pub concurrency: usize,
     /// Where this config was loaded from / will be saved to.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -144,6 +158,8 @@ impl Default for Config {
             anthropic: ProviderSettings::for_provider(Provider::Anthropic),
             global_prompt: String::new(),
             exiftool_path: String::new(),
+            last_folder: String::new(),
+            concurrency: 1,
             path: None,
         }
     }
@@ -162,6 +178,13 @@ impl Config {
         }
     }
 
+    /// Remove the retired LM Studio placeholder from configs written by older builds.
+    fn clear_legacy_placeholders(&mut self) {
+        if self.lmstudio.model.trim().eq_ignore_ascii_case("local-model") {
+            self.lmstudio.model.clear();
+        }
+    }
+
     pub fn load() -> Self {
         let path = Self::config_path();
         let mut cfg = match std::fs::read_to_string(&path) {
@@ -171,7 +194,9 @@ impl Config {
             }),
             Err(_) => Self::default(),
         };
+        cfg.clear_legacy_placeholders();
         cfg.path = Some(path.clone());
+
         if !path.exists() {
             let _ = cfg.save();
         }
@@ -229,8 +254,13 @@ mod tests {
     fn provider_defaults_are_complete_and_consistent() {
         for provider in Provider::ALL {
             assert!(provider.default_base_url().starts_with("http"));
-            assert!(!provider.default_model().is_empty());
+            if provider == Provider::LmStudio {
+                assert!(provider.default_model().is_empty());
+            } else {
+                assert!(!provider.default_model().is_empty());
+            }
             assert!(!provider.label().is_empty());
+            assert!(!provider.status_label().is_empty());
             assert!(!provider.guidance().is_empty());
             assert!(!provider.base_hint().is_empty());
             assert!(!provider.model_hint().is_empty());
@@ -249,6 +279,18 @@ mod tests {
         assert!(!Provider::LmStudio.is_cloud());
         assert!(Provider::OpenAi.is_cloud());
         assert!(Provider::Anthropic.is_cloud());
+    }
+
+    #[test]
+    fn legacy_lmstudio_placeholder_is_cleared() {
+        let mut cfg = Config::default();
+        cfg.lmstudio.model = "local-model".into();
+        cfg.clear_legacy_placeholders();
+        assert!(cfg.lmstudio.model.is_empty());
+
+        cfg.lmstudio.model = "qwen2-vl".into();
+        cfg.clear_legacy_placeholders();
+        assert_eq!(cfg.lmstudio.model, "qwen2-vl");
     }
 
     #[test]
@@ -275,6 +317,8 @@ mod tests {
         assert_eq!(cfg.anthropic.base_url, Provider::Anthropic.default_base_url());
         assert!(cfg.global_prompt.is_empty());
         assert!(cfg.exiftool_path.is_empty());
+        assert!(cfg.last_folder.is_empty());
+        assert_eq!(cfg.concurrency, 1);
     }
 
     #[test]
@@ -305,6 +349,8 @@ mod tests {
         cfg.lmstudio.base_url = "http://localhost:4321/v1".into();
         cfg.global_prompt = "Prefer British spelling.".into();
         cfg.exiftool_path = "C:\\tools\\exiftool.exe".into();
+        cfg.last_folder = "C:\\Photos\\2026_Stock".into();
+        cfg.concurrency = 3;
 
         cfg.save().expect("save config");
         assert!(path.is_file());
@@ -320,6 +366,8 @@ mod tests {
         assert_eq!(reloaded.lmstudio.base_url, "http://localhost:4321/v1");
         assert_eq!(reloaded.global_prompt, "Prefer British spelling.");
         assert_eq!(reloaded.exiftool_path, "C:\\tools\\exiftool.exe");
+        assert_eq!(reloaded.last_folder, "C:\\Photos\\2026_Stock");
+        assert_eq!(reloaded.concurrency, 3);
         assert!(reloaded.path.is_none(), "path is not serialized");
 
         // Saving twice overwrites cleanly.

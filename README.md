@@ -1,74 +1,79 @@
 # AutoWording
 
-**A native Windows desktop application that uses a vision LLM to generate microstock metadata (Title, Caption, 50 keywords) and writes it directly into JPEG EXIF / IPTC / XMP tags.**
+**A native Windows 11 ACDSee-style desktop application that uses a vision LLM to generate microstock metadata (Title, Caption, 50 keywords) for one image or a multi-selection, then writes it directly into JPEG EXIF / IPTC / XMP tags.**
 
 | Item | Value |
 | --- | --- |
-| Language | Rust 2021 (minimum `rust-version = 1.85`; verified with 1.99.1) |
-| GUI | `eframe` / `egui` 0.28.1, OpenGL (`glow`), custom Windows 11 light theme, Segoe UI |
+| Language | Rust 2021, minimum `rust-version = 1.85` (verified with 1.99.1) |
+| GUI | `eframe` / `egui` 0.28.1, OpenGL (`glow`), Windows 11 light theme, Segoe UI |
+| Workspace | ACDSee Classic dual-mode: **Browser** (folder tree + thumbnail grid + preview) and **Viewer** (single image + filmstrip) |
+| Selection | Path-based multi-selection with Ctrl+Click, Shift+Click, Ctrl+Shift+Click, Ctrl+A, and checkbox overlays |
 | AI transport | `reqwest` 0.12 + `tokio` multi-thread runtime, `native-tls` (Windows Schannel) |
+| Batch engine | 1–4 concurrent AI workers, live `Queued`/`Processing`/`Generated`/`Saved`/`Error` badges |
 | Metadata engine | ExifTool command-line executable (external dependency) |
-| Platform | Windows 10/11 (code paths and build instructions are Windows-specific) |
+| Platform | Windows 10/11 (build and runtime are Windows-specific) |
 | Binary | `target\release\autowording.exe` (~21 MB, Windows subsystem, no console window) |
-| Tests | **78** unit/integration tests, all passing as of 2026-11-05 |
-| State | Single-crate application, no workspace, no CI, no installer, no license file |
+| Tests | **98** unit/integration tests, all passing as of 2026-11-05 |
+| State | Single crate, no workspace, no CI, no installer, no license file |
 
-This README is written to be sufficient context for another LLM or developer to modify the project safely **without reading every source file first**. It documents not only what the app does, but the exact wire formats, prompt text, filesystem contracts, invariants, and known pitfalls.
-
----
-
-## 1. What the application does
-
-AutoWording is a batch keywording tool for microstock photographers.
-
-1. The user queues JPEG files or folders (drag-and-drop or file dialogs).
-2. A vision-capable language model receives the image plus a strict system prompt.
-3. The model returns four fields: `Title`, `Editorial Status`, `Caption`, `Keywords`.
-4. The reply is parsed tolerantly (markdown, numbered labels, CRLF, full-width colons), normalized, and validated.
-5. The user reviews/edits the fields in a desktop UI.
-6. ExifTool writes the result into three metadata families simultaneously: **EXIF**, **IPTC**, and **XMP**.
-7. Status badges track each image through `Pending → Processing → Generated → Saved`, with `Error` for failures.
-
-The app is intentionally local-first: files never leave the machine except when a cloud provider (OpenAI or Anthropic) is selected. Ollama and LM Studio run locally. API keys are stored on disk in plain text.
+This README is the operating manual for another LLM or developer. It records the exact prompt, wire formats, tag mappings, selection rules, batch semantics, filesystem contracts, and pitfalls that are easy to regress.
 
 ---
 
-## 2. Agent quick contract (read this before changing code)
+## 1. Agent quick contract (read before changing code)
 
-These are the non-obvious rules that make the app correct. Breaking one is likely to reintroduce a bug that already has a regression test.
+1. **JPEG only.** The `image` crate is compiled with only the `jpeg` feature. Accepted extensions are `.jpg`, `.jpeg`, `.jpe`, `.jfif` (case-insensitive). Do not claim PNG/TIFF/HEIC/RAW support without adding codecs and tests.
+2. **ExifTool is required for metadata reads and writes.** There is no native Rust metadata writer. Without ExifTool, AI generation works but Save is disabled and existing metadata is not loaded.
+3. **Keyword replacement requires repeated `=` assignments and no `+=`.** ExifTool treats `=` like `+=` in any command that also contains `+=`/`-=`. `writer::write_args` MUST emit only `-IPTC:Keywords=value` and `-XMP-dc:Subject=value`.
+4. **Every ExifTool argument goes through a UTF-8 argfile.** Windows `argv` code-page conversion mangles `Café` to `Cafe`. Do not "simplify" `ExifTool::run` back to direct tag/path arguments.
+5. **Saving overwrites the original JPEG.** `-overwrite_original` is always used. There are no `_original` backups and no undo.
+6. **The prompt and tag mapping are product requirements.** The exact system prompt is in §11.3; tests assert substrings and parsed outputs. Do not reword casually.
+7. **The advisory validation does not block saving.** Title word count, caption length, and 50-keyword count only produce warning labels.
+8. **Selection is path-based.** `Selection` stores `HashSet<PathBuf>` plus `active` and `anchor`. Do not replace it with grid indices; statuses must survive folder reloads and reordering.
+9. **The grid shows the current folder's direct JPEGs**, plus any explicitly added files, sorted case-insensitively. Folder scanning is non-recursive; adding a dropped folder is recursive.
+10. **Metadata loading never clobbers generated/edited content.** `MetaLoaded` fills only an empty item whose status is `Pending`.
+11. **Only one batch runs at a time.** Generation and saving share `App::batch`; all batch buttons are disabled while it is `Some`.
+12. **AI batches may run concurrently, saves are sequential.** `Config::concurrency` is clamped to `1..=4`. Statuses go `Queued → Processing` as each worker starts.
+13. **Saving requires a non-empty title.** Selected items without a title are skipped and counted in a toast.
+14. **Config auto-saves; metadata does not.** Provider/prompt/ExifTool/folder/concurrency settings persist after a 500 ms debounce. Image metadata is written only on Save.
+15. **API keys are plaintext** in `config.toml`. Never commit, print, or log that file.
 
-1. **JPEG only.** The `image` crate is compiled with only the `jpeg` feature. Accepted extensions are `.jpg`, `.jpeg`, `.jpe`, `.jfif` (case-insensitive). Do not claim PNG/TIFF/HEIC support without adding codecs and updating tests.
-2. **ExifTool is required for reads and writes.** There is no native Rust metadata writer. If ExifTool is absent, generation still works but save is disabled and existing metadata cannot be loaded.
-3. **Keyword replacement requires repeated `=` assignments and no `+=`.** ExifTool treats `=` like `+=` anywhere in a command that also contains `+=`/`-=`. `write_args` MUST emit only `-IPTC:Keywords=value` and `-XMP-dc:Subject=value`. See §11.4.
-4. **All ExifTool arguments go through a UTF-8 argfile.** Passing non-ASCII values (e.g. `Café`) through Windows `argv` mangles them to the ANSI code page. Do not "simplify" `ExifTool::run` back to `Command::arg` for tag values or paths.
-5. **Saving overwrites the original file.** `-overwrite_original` is always used. There are no `_original` backups and no undo.
-6. **The system prompt and metadata mapping are product requirements, not suggestions.** The exact text is reproduced in §10.3. Tests assert specific substrings and parsed output. Do not reword casually.
-7. **A batch slot is shared by generation and saving.** Only one batch runs at a time; `self.batch.is_some()` disables batch actions. Do not start a second background batch without redesigning progress accounting.
-8. **Metadata loading never overwrites a non-empty editor.** Existing file metadata populates an item only when title, caption, and keywords are all empty and status is `Pending`.
-9. **Validation is advisory.** Title word count, caption length, and keyword count produce warning labels but never block generation or saving.
-10. **Config is auto-saved, metadata is not.** Provider/prompt/ExifTool settings persist after a 500 ms debounce. Generated metadata is written only when the user saves.
-11. **API keys are plaintext** in `config.toml`. Never commit that file or print its contents.
-12. **Tests must keep their exact behavior.** In particular, ExifTool integration tests skip (not fail) when the executable is unavailable. Do not make CI assume ExifTool exists.
+---
+
+## 2. What the application does
+
+AutoWording is a batch keywording workspace for microstock photographers. The workflow follows ACDSee Photo Studio's Browser/Viewer model:
+
+1. Open a stock folder. The left tree browses subfolders; the center grid shows that folder's JPEGs.
+2. Select one image (single inspector) or many (batch inspector).
+3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt to a vision model.
+4. Review/edit Title, Editorial status, Caption, and keyword chips. In batch mode, inspect common/mixed values and apply title/caption/keyword changes across the selection.
+5. Save one or many files through ExifTool into EXIF, IPTC, and XMP simultaneously.
+6. Thumbnails show `Pending`, `In queue`, `Processing`, `Generated`, `Saved`, `Failed`, or `Modified` badges.
+7. Switch to Viewer for a large single-image view with previous/next navigation and a filmstrip.
+
+Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Studio keep traffic local. Files are modified in place.
 
 ---
 
 ## 3. Feature summary
 
-- Three-pane Windows 11-style UI: queue (left), preview + editor (center), settings/actions (right).
-- Drag-and-drop files or folders; recursive folder scan; duplicate suppression.
-- Thumbnails (max 128 px) and a large preview (max 1800 px), decoded off the UI thread.
-- Four providers behind one interface: Ollama, LM Studio, OpenAI, Anthropic.
-- Per-provider endpoint, model, and API key settings.
-- Optional per-session situational context; optional persistent extra system-prompt instructions.
-- Tolerant response parser and keyword normalizer (dedupe, punctuation stripping, camel-case splitting is **not** performed; see §10.5).
-- Live compliance chips: title word count, caption character count, keyword count, editorial indicator.
-- Editable title, caption, keyword chips, commercial/editorial toggle.
-- Batch generation for all pending/error images; batch save for all dirty generated images.
-- Status badges and a `Modified` badge when generated/saved fields are edited.
-- ExifTool auto-detection, manual path override, re-check, and version display.
-- Config persistence to `%APPDATA%\AutoWording\config\config.toml`.
-- Keyboard shortcuts: `↑`/`↓`, `Ctrl+Enter`, `Ctrl+S`, `Ctrl+O`.
-- Real ExifTool integration tests for overwrite semantics, 50 keywords, Unicode values, and Unicode file names.
+- ACDSee-style menu bar: **File / Edit / View / Tools / Help**, plus **Browser | Viewer** mode toggle.
+- Three-pane Browser: lazy folder browser (276 px) with parent navigation and path display, responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
+- Selection: plain click, Ctrl+Click toggle, Shift+Click contiguous range, Ctrl+Shift+Click additive range, Ctrl+A, and per-card checkbox overlays.
+- Visual states: selected accent border, active focus ring, status badges, checkbox checkmarks, hover feedback.
+- Single inspector: editable title/caption/editorial/keywords, live compliance chips, add/remove/normalize keywords.
+- Batch inspector: selection count, common/mixed fields (`<Multiple values>`), keyword cloud with occurrence counts, batch title/caption overwrite, keyword append/replace.
+- Concurrent batch AI: configurable 1–4 workers, per-image live status, partial-failure reporting, retry-failed action.
+- Batch save: selected items with titles written sequentially, progress bar, per-file errors.
+- Viewer mode: large active image, previous/next, filmstrip, error overlay, Escape returns to Browser.
+- Folder browser is lazy/cached, sorts directories, skips dot-directories and common junk folders, and supports **Up** / `Alt+Up` parent navigation.
+- Four providers: Ollama, LM Studio, OpenAI, Anthropic.
+- Endpoint model discovery: fetch/refresh a model dropdown from Ollama `/api/tags`, LM Studio and OpenAI `/v1/models`, and Anthropic `/v1/models` with provider authentication.
+- ExifTool auto-detection, manual path override, version display, re-check, Unicode-safe argfile execution.
+- Config persistence: `%APPDATA%\AutoWording\config\config.toml`.
+- Keyboard shortcuts: `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+A`, `Ctrl+S`, `Ctrl+Enter`, `F5`, `Alt+Up`, arrows, `Esc`.
+- 98 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags, real ExifTool round-trips, selection math, folder tree, cache lifecycle, config.
 
 ---
 
@@ -76,30 +81,31 @@ These are the non-obvious rules that make the app correct. Breaking one is likel
 
 ### 4.1 Runtime
 
-- Windows 10 or 11 (developed on Windows 11).
-- [ExifTool](https://exiftool.org/) installed and either:
+- Windows 10 or 11.
+- [ExifTool](https://exiftool.org/) installed and:
   - on `PATH` as `exiftool`, or
-  - selected in the **EXIF writer** panel, or
-  - placed at one of the auto-detected locations listed in §11.2.
-- A vision-capable model:
-  - Ollama with a model such as `llava`, `minicpm-v`, `qwen2-vl`; or
-  - LM Studio with a vision model and the local server enabled; or
-  - an OpenAI API key; or
-  - an Anthropic API key.
+  - selected in **AI Settings → EXIF writer**, or
+  - placed in one of the auto-detected locations in §12.2.
+- A vision model:
+  - Ollama with `llava`, `minicpm-v`, `qwen2-vl`, etc.; or
+  - LM Studio with a vision model and local server enabled; or
+  - OpenAI API key; or
+  - Anthropic API key.
 
 ### 4.2 Build
 
-- Rust stable, at least 1.85.
+- Rust stable ≥ 1.85.
 - A working linker:
-  - **Preferred/normal:** MSVC toolchain + Visual Studio Build Tools with the Windows SDK, or
-  - **This machine's setup:** GNU toolchain `stable-x86_64-pc-windows-gnu` plus the portable linker tools in `.tools\gnu-bin` (gitignored).
-- No C compiler is needed at build time because `reqwest` uses `native-tls`/Schannel instead of `ring`. Do not switch back to `rustls` unless a C toolchain is available; `ring` previously failed to build here.
+  - MSVC toolchain + Visual Studio Build Tools + Windows SDK, or
+  - GNU toolchain `stable-x86_64-pc-windows-gnu` plus portable linker tools in `.tools\gnu-bin` (this machine's setup, gitignored).
+
+`reqwest` uses `native-tls`/Schannel, so no C compiler is required. Do not switch back to `rustls` without a C toolchain; `ring` previously failed here.
 
 ---
 
-## 5. Build, run, and test
+## 5. Build, run, test
 
-### 5.1 Canonical Windows helper
+### 5.1 Canonical helper
 
 ```bat
 build.bat test
@@ -107,15 +113,15 @@ build.bat build --release
 build.bat run --release
 ```
 
-`build.bat` prepends `%~dp0.tools\gnu-bin` to `PATH` and invokes:
+`build.bat` prepends `%~dp0.tools\gnu-bin` to `PATH` and calls:
 
 ```bat
 cargo +stable-x86_64-pc-windows-gnu %*
 ```
 
-It exists because the MSVC toolchain on the development machine has no Windows SDK (`kernel32.lib` missing) and Git's `link.exe` shadows the MSVC linker.
+It exists because the MSVC toolchain on this machine lacks the Windows SDK (`kernel32.lib` missing) and Git's `link.exe` shadows the MSVC linker.
 
-### 5.2 Equivalent Bash/Git-Bash command used for verification
+### 5.2 Verified Bash command
 
 ```bash
 SELF="$HOME/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained"
@@ -124,123 +130,211 @@ cargo +stable-x86_64-pc-windows-gnu test
 cargo +stable-x86_64-pc-windows-gnu build --release
 ```
 
-The extra `SELF` directory provides the GNU linker's self-contained runtime. `build.bat` works without it in the tested environment, but if linking fails with missing DLLs, add it.
+The extra `SELF` directory supplies the GNU linker's self-contained runtime.
 
 ### 5.3 Normal MSVC build
 
-With Visual Studio Build Tools and the Windows SDK installed:
+With Visual Studio Build Tools and the Windows SDK:
 
 ```bat
 cargo test
 cargo run --release
 ```
 
-### 5.4 Artifacts and ignored paths
+### 5.4 Ignored paths
 
-- `target/` — Cargo output, gitignored.
-- `.tools/` — portable `gcc.exe`, `ld.exe`, `dlltool.exe`, `as.exe`, gitignored.
-- `.freebuff/` — local agent workspace metadata, gitignored.
-- `%APPDATA%\AutoWording\config\config.toml` — user settings and API keys, outside the repo.
+- `target/` — Cargo output.
+- `.tools/` — `gcc.exe`, `ld.exe`, `dlltool.exe`, `as.exe`.
+- `.freebuff/` — local agent metadata.
+- `%APPDATA%\AutoWording\config\config.toml` — user settings and API keys.
 
-### 5.5 Build profile
-
-`Cargo.toml` sets `[profile.release] opt-level = 2`. There is no LTO, stripping, icon, manifest, or installer configuration.
+`[profile.release] opt-level = 2`; no LTO, stripping, icon, manifest, installer, code signing, or auto-update.
 
 ---
 
 ## 6. End-user workflow
 
-1. Launch `autowording.exe`.
-2. Add images with **Add images**, **Add folder**, drag-and-drop, or `Ctrl+O`.
-3. Pick a provider in the top bar or the **AI provider** panel.
-4. Set endpoint/model. Cloud providers also require an API key.
-5. Optionally enter **Situational context** (applies to every request this session, not persisted).
-6. Optionally expand **Advanced system prompt** and add persistent extra rules.
-7. Select an image and press **Generate** / `Ctrl+Enter`, or **Process all pending**.
-8. Review the title, editorial toggle, caption, and keyword chips. Click a chip to remove it; type a keyword and press Enter to add one.
-9. Press **Save to file** / `Ctrl+S`, or **Save all generated**.
-10. The badge changes to **Saved**; editing afterward shows **Modified**.
+### 6.1 Open and browse
 
-The UI never auto-saves metadata. Closing the app with unsaved edits loses them (only settings persist).
+1. Launch `autowording.exe`. The last folder from config is reopened automatically if it still exists.
+2. **File → Open Folder…** (`Ctrl+O`) or the folder panel's **Open Folder…** button chooses a root.
+3. Expand folders in the tree. Clicking a folder loads its direct JPEGs into the grid.
+4. Use **Up** or `Alt+Up` to browse the parent directory; the current path is shown above the tree.
+5. **Add images…** (`Ctrl+Shift+O`) appends arbitrary JPEGs; dropped folders are scanned recursively.
+6. **F5** refreshes the current folder, thumbnails, metadata cache, and tree children.
+
+### 6.2 Select
+
+- **Click** a card: select only that image, set active focus, show it in preview.
+- **Ctrl+Click**: toggle that card without clearing others.
+- **Shift+Click**: select the contiguous range from the anchor to the target.
+- **Ctrl+Shift+Click**: add that range to the existing selection.
+- **Ctrl+A** (when no text field is focused): select all grid images.
+- **Checkbox** (top-left of a card): toggle that image without clearing others.
+- **Clear** in the grid header empties the selection.
+- **↑/↓** moves the active image and selects it singly (when not typing).
+- Double-clicking a card switches to Viewer.
+
+The **active** image is the primary focus, shown in the center preview/Viewer and used for the single inspector. It can be part of a larger selection.
+
+### 6.3 Single-image editing
+
+With exactly one selected image, the right panel shows:
+
+- File name, status badge, dimensions.
+- Title field + 3–5 word chip.
+- Commercial/Editorial toggle.
+- Caption field + 50–180 character chip.
+- Keyword chips (click `×` to remove), count chip, **Normalize**.
+- Keyword add field (Enter or **Add**).
+- Advisory validation bullets.
+- **Generate** (`Ctrl+Enter`) and **Save to file** (`Ctrl+S`).
+- **Clear fields** clears the three metadata fields locally.
+
+Editing a `Generated` or `Saved` image sets `dirty` and changes the badge to **Modified**. Editing a `Pending`/`Error` image leaves the status but makes it saveable once a title exists.
+
+### 6.4 Batch selection editing
+
+With 2+ images selected, the inspector shows:
+
+- `Multi-Selection (N items)` banner.
+- Aggregated title/caption: the shared value, or `<Multiple values>` in amber.
+- Aggregated editorial status: `Commercial`, `Editorial`, or `<Multiple values>`.
+- Keyword cloud: union of keywords with per-keyword counts, sorted by count then alphabetically (max 80 displayed).
+- **Batch edit**:
+  - Title field + **Apply title to all** (overwrites every selected title).
+  - Caption field + **Apply caption to all**.
+  - Keywords field + **Append keywords** (dedupe, cap 50) or **Replace keywords**.
+- **Batch Run AI (N)**: processes all selected images, including saved ones.
+- **Save Selected to EXIF (N)**: writes all selected images with non-empty titles.
+- **Retry failed (K)**: reprocesses selected `Error` items.
+- Status summary and batch progress bar.
+
+Batch fields are not a live merged editor; they are explicit apply operations. A blank title/caption cannot be applied. Keywords use the same normalizer as the AI parser (alphabetic words, dedupe, max 50).
+
+### 6.5 Save
+
+- Single: **Save to file** writes the active image.
+- Batch: **Save Selected to EXIF** writes every selected image with a non-empty title.
+- Items without a title are skipped; the toast reports the skipped count.
+- Success sets `Saved` and clears `dirty`; failure keeps the previous status and shows `Save failed: …`.
+- Metadata is never auto-saved. Closing the app with unsaved edits loses them.
+
+### 6.6 Viewer
+
+- Switch with **View → Viewer**, the top-right mode toggle, or a thumbnail double-click.
+- Large image with dark letterboxing, previous/next buttons, position (`3 / 24`), dimensions, status.
+- Error message overlay at the bottom of the image.
+- Horizontal filmstrip of 58 px thumbnails with status dots; click to change active image.
+- `↑/↓` navigates; `Esc` returns to Browser.
+
+### 6.7 Choose a provider and model
+
+1. Expand **AI Settings** in the right inspector.
+2. Choose the provider. Its endpoint is prefilled with the provider default and remains editable.
+3. The model list is fetched automatically from the configured endpoint when the settings panel is opened, when the provider changes, and after an endpoint or API-key edit loses focus. **Fetch** re-queries on demand.
+4. Choose a model from the dropdown. The list contains endpoint-provided IDs. If no model is configured, the first fetched model is selected; the retired LM Studio placeholder `local-model` is never inserted. A configured real model missing from the current response is still shown so it can be retained.
+5. If discovery fails, the error is shown inline and the model remains an editable text field; a manually entered model ID is still usable.
+6. Cloud providers require an API key before their model list can be fetched. Local providers need no key.
+
+The list is sorted case-insensitively, deduplicated, and limited to model IDs (`name` for Ollama, `id` for the OpenAI-compatible and Anthropic APIs). Model discovery does not call the chat/generation endpoint.
 
 ---
 
-## 7. UI map and interaction details
+## 7. UI reference
 
 ### 7.1 Layout
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Top bar: logo, AutoWording, provider combo, ExifTool status                  │
-├──────────────┬───────────────────────────────────────────┬───────────────────┤
-│ Queue        │ Preview card                              │ AI provider       │
-│ (316 px)     │   filename, status, dimensions, ‹ / ›     │ Prompt            │
-│              ├───────────────────────────────────────────┤ Batch actions     │
-│ thumbnails   │ Metadata editor                           │ EXIF writer       │
-│ status pills │   Title / editorial / caption / keywords  │ config path       │
-├──────────────┴───────────────────────────────────────────┴───────────────────┤
-│ Status bar: toast or Ready · queued / generated / saved counts               │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ File  Edit  View  Tools  Help                          [Browser | Viewer]      │
+├──────────────────┬─────────────────────────────────────────┬───────────────────┤
+│ FOLDER BROWSER   │  FOLDER HEADER  [n] [selected]  Refresh │ METADATA          │
+│  [Up] [Open…] [Refresh]                                  │  single / batch   │
+│  C:\Photos       │  ┌──────┬──────┬──────┬──────┐         │  Title            │
+│  ▾ C:\Photos     │  │ card │ card │ card │ card │         │  Editorial        │
+│    ▸ 2026_Stock  │  └──────┴──────┴──────┴──────┘         │  Caption          │
+│    ▸ Portraits   │  ACTIVE PREVIEW                         │  Keywords         │
+│  [Add images…]   │  ┌───────────────────────────────┐      │  AI Generator     │
+│                  │  │      large primary image      │      │  [Batch Run AI]   │
+│                  │  └───────────────────────────────┘      │  AI Settings ▸    │
+├──────────────────┴─────────────────────────────────────────┴───────────────────┤
+│ Status: 24 images loaded | 3 selected          Ollama (Connected: qwen2-vl)     │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - Window: 1440×920 initial, minimum 1180×720.
-- Left panel width: 316 px, not resizable.
-- Right panel width: 346 px, not resizable.
-- Center editor height: 47% of available height, clamped to 280–430 px; preview gets the rest.
-- Preview image max decode dimension: 1800 px; thumbnail max: 128 px.
-- Light theme only. Segoe UI is loaded from `C:\Windows\Fonts\segoeui.ttf`; if missing, egui's default font is used.
+- Left panel: 276 px, fixed.
+- Right panel: 372 px, fixed.
+- Grid max height: 55% of center height, clamped 180–560 px.
+- Grid card: 148×164 px, 6 px padding; columns computed from available width.
+- Thumbnails: max 160 px decode. Preview: max 2200 px decode.
+- Viewer filmstrip: 58 px squares, 82 px strip height.
+- Light theme only. Segoe UI from `C:\Windows\Fonts\segoeui.ttf`; default egui font if absent.
 
-### 7.2 Statuses
+### 7.2 Menus
+
+| Menu | Items |
+| --- | --- |
+| File | Open Folder… (`Ctrl+O`), Add Images… (`Ctrl+Shift+O`), Save Selected to EXIF (`Ctrl+S`), Exit |
+| Edit | Select All (`Ctrl+A`), Clear Selection, Run AI on Selected (`Ctrl+Enter`), Save Selected |
+| View | Browser, Viewer, Refresh Folder (`F5`) |
+| Tools | Re-check ExifTool, About / Diagnostics |
+| Help | About AutoWording |
+
+The top-right toggle switches Browser/Viewer without losing selection.
+
+### 7.3 Statuses
 
 | Status | Badge | Meaning |
 | --- | --- | --- |
-| `Pending` | Pending (gray) | Newly queued, no metadata generated |
+| `Pending` | Pending (gray) | No metadata generated |
+| `Queued` | In queue (blue) | Waiting for a batch worker slot |
 | `Processing` | Processing (blue) | AI request in flight |
-| `Generated` | Generated (violet) | AI result parsed successfully |
-| `Saved` | Saved (green) | Metadata written successfully |
-| `Error` | Failed (red) | Generation failed; message shown under preview |
-| `Generated`/`Saved` + `dirty` | Modified (amber) | User edited fields after generation/save |
+| `Generated` | Generated (violet) | Parsed AI result |
+| `Saved` | Saved (green) | Written to disk |
+| `Error` | Failed (red) | Generation/save error; message on item |
+| `Generated`/`Saved` + dirty | Modified (amber) | Edited after generation/save |
 
-`Status::Error` counts as pending for batch retry (`ImageItem::is_pending` returns true for `Pending | Error`).
+`ImageItem::is_pending()` is true for `Pending | Error`; `Queued` is not retried by that helper. `retry_failed` explicitly filters `Error`.
 
-### 7.3 Keyboard shortcuts
+### 7.4 Keyboard shortcuts
 
 | Shortcut | Action | Notes |
 | --- | --- | --- |
-| `↑` / `↓` | Previous / next image | Only when no text field has focus |
-| `Ctrl+Enter` | Generate for the selected image | Consumed globally |
-| `Ctrl+S` | Save the selected image | Consumed globally; requires non-empty title |
-| `Ctrl+O` | Add images | Consumed globally |
+| `Ctrl+O` | Open folder | Global |
+| `Ctrl+Shift+O` | Add images | Global |
+| `Ctrl+A` | Select all grid images | Only when no text field has focus |
+| `Ctrl+Enter` | Run AI on selection | Global |
+| `Ctrl+S` | Save selection | Global |
+| `F5` | Refresh folder/tree | Global |
+| `Alt+Up` | Open parent folder | Only when no text field has focus |
+| `↑` / `↓` | Previous/next active image | Only when no text field has focus |
+| `Esc` | Leave Viewer | Only in Viewer |
 
-Shortcuts are handled with `consume_key`, so they do not also reach the focused widget.
+Shortcuts use `consume_key`, so they do not also reach text fields.
 
-### 7.4 Queue behavior
+### 7.5 Grid card details
 
-- `Add images` filters to `jpg/jpeg/jpe/jfif`.
-- `Add folder` recursively walks with `walkdir`, sorted by file name within each directory.
-- Dropped files/folders are handled on every frame via `ctx.input().raw.dropped_files`.
-- Paths are converted to absolute paths with `std::path::absolute` when possible.
-- Duplicate suppression uses exact `PathBuf` equality, not case-insensitive comparison.
-- Right-click a row to **Remove from queue**.
-- **Clear** empties the queue, selection, thumbnail cache, preview, and metadata-request set.
-- Selecting a row requests a preview and (if ExifTool is ready) existing metadata.
+- Rounded white card; selected cards use a light blue fill and accent border.
+- The active card gets a thicker accent focus ring.
+- Thumbnail area is dark-neutral; failed images show `Unreadable`, loading shows `Loading…`.
+- File name truncated to 21 characters; dimensions at the bottom-right.
+- Status badge painted at the bottom-left.
+- Checkbox is visible on every card; checked cards use the accent fill; 17 px hit area.
+- Tooltip shows full path, status, and keyword count.
+- Hover does not load metadata; selection does.
 
-### 7.5 Editing semantics
+### 7.6 Folder browser
 
-- Title is a single-line field; caption is a multiline field; keywords are removable chips plus an add field.
-- **Normalize** runs the same keyword normalizer used by the AI parser.
-- `Clear fields` clears title, caption, and keywords locally.
-- Editing a `Generated` or `Saved` item sets `dirty = true`; editing a `Pending` or `Error` item does not (it remains pending).
-- Compliance warnings come from `prompt::validate` and are recomputed live.
-- The editorial toggle is a UI state plus the `editorial` bool on the image item; it does **not** change the caption automatically after generation. The AI is responsible for producing the Shutterstock caption format.
-
-### 7.6 Batch actions
-
-- **Process selected** — one image; equivalent to `Ctrl+Enter`.
-- **Process all pending (N)** — all `Pending` and `Error` images.
-- **Save all generated (N)** — all items with non-empty title and `dirty == true`.
-- A progress bar reports `Processing done/total` or `Saving done/total`.
-- There is **no cancel**. Closing the app while a batch runs aborts the process, potentially mid-write.
+- Root is expanded on open; children load lazily and cache per directory.
+- Directories sorted case-insensitively.
+- Skips names starting with `.`, plus `target`, `node_modules`, `$RECYCLE.BIN`, `System Volume Information`.
+- Current folder is highlighted and shows its direct-image count.
+- Opening a folder clears selection, preview, and metadata-request cache.
+- Refreshing a folder clears the tree cache while preserving expansion state.
+- **Up** / `Alt+Up` moves to the parent and re-roots the tree there; the full current path is shown below the navigation buttons.
+- The grid always shows only the current folder's direct JPEGs, not images from its subfolders.
 
 ---
 
@@ -250,8 +344,9 @@ Shortcuts are handled with `consume_key`, so they do not also reach the focused 
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ egui UI thread (App::update, ~60 fps)                      │
-│  - paints widgets, handles input, owns queue and textures  │
+│ egui UI thread (App::update)                               │
+│  - paints Browser/Viewer/metadata panels                   │
+│  - owns items, folder_images, Selection, textures          │
 │  - drains WorkerEvent channel in poll_events()             │
 │  - debounces and writes config.toml                        │
 └───────────────┬────────────────────────────────────────────┘
@@ -259,83 +354,109 @@ Shortcuts are handled with `consume_key`, so they do not also reach the focused 
                 ▼
 ┌────────────────────────────────────────────────────────────┐
 │ tokio multi-thread runtime (2 worker threads)              │
-│  - image decode/resize for thumbnails and preview          │
-│  - AI request: prepare_image + reqwest HTTP                │
+│  - thumbnail/preview decode + resize                       │
+│  - AI: prepare_image + reqwest HTTP                        │
 │  - ExifTool read/write in spawn_blocking                   │
-│  - sends WorkerEvent back through unbounded mpsc           │
+│  - sends WorkerEvent through unbounded mpsc                │
 └────────────────────────────────────────────────────────────┘
 ```
 
-- The runtime is created once in `App::new` with `worker_threads(2)` and `enable_all()`.
-- `tokio::sync::mpsc::unbounded_channel` carries `WorkerEvent`.
-- UI texture creation happens only on the UI thread in `poll_events`.
-- Background tasks call `ctx.request_repaint()` after sending an event.
-- `App::update` requests a repaint every 120 ms while a batch is running or a preview is loading.
-- Config changes are timestamped in `cfg_dirty`; `poll_events` saves after `CONFIG_SAVE_DELAY` (500 ms), then requests a repaint.
+- Runtime created once with `worker_threads(2)` and `enable_all()`.
+- UI texture creation happens only on the UI thread.
+- Background tasks call `ctx.request_repaint()` after events.
+- `App::update` requests repaint every 120 ms while a batch runs or a preview loads.
+- Config changes set `cfg_dirty`; `poll_events` saves after 500 ms.
 
-### 8.2 Generation data flow
-
-```
-queue paths
-  └─ generate_paths()
-       ├─ validate model / API key
-       ├─ mark each item Processing
-       ├─ create BatchProgress { total, done: 0, saving: false }
-       └─ spawn async task
-            for each path (sequential):
-              spawn_blocking(prepare_image)      // decode, resize, JPEG q85, base64
-              ai::generate(AiRequest)           // provider HTTP
-              send WorkerEvent::AiDone
-            send WorkerEvent::BatchFinished
-```
-
-`AiDone` replaces the item's title/caption/keywords/editorial wholesale, sets `Generated` and `dirty = true`.
-
-### 8.3 Save data flow
+### 8.2 Folder-open flow
 
 ```
-save_items(Vec<(PathBuf, Metadata)>)
-  ├─ require no active batch and ExifTool present
+open_root(path)
+  ├─ folder_of(path): directory or parent of a file
+  ├─ folder_root = dir; FolderTree::set_root
+  ├─ cfg.last_folder = dir (debounced save)
+  └─ open_folder(dir)
+       ├─ clear selection/preview/metadata-request cache
+       ├─ collect_folder_jpegs(dir) (non-recursive, sorted)
+       ├─ ensure ImageItem for each file
+       ├─ thumbs.retain(current paths)
+       ├─ selection.retain_existing(...)
+       ├─ select first image if selection became empty
+       └─ request preview + metadata for selected images
+```
+
+`add_paths` instead uses `collect_jpegs` (recursive) and appends new paths to the grid; if no folder is open, the first file's parent becomes the root.
+
+### 8.3 AI batch flow
+
+```
+generate_paths(paths)
+  ├─ reject if batch active / empty / no model / cloud key missing
+  ├─ dedupe paths, set items to Queued
+  ├─ BatchProgress { total, done: 0, saving: false }
+  └─ spawn async coordinator
+       ├─ Semaphore(concurrency 1..=4)
+       ├─ for each path: acquire permit, spawn task
+       │    ├─ send AiStarted → UI sets Processing
+       │    ├─ spawn_blocking(prepare_image)
+       │    ├─ ai::generate(AiRequest)
+       │    └─ drop permit, return (path, result)
+       └─ join tasks: count ok/failed, send AiDone per result
+            then send BatchFinished
+```
+
+`AiDone` replaces Title/Caption/Keywords/Editorial, sets `Generated` and `dirty`, and increments `batch.done`. Failed results set `Error` and a message. `BatchFinished` clears the batch slot and shows a success/partial-failure toast.
+
+### 8.4 Save flow
+
+```
+save_selected()
+  ├─ reject if batch active / no ExifTool
+  ├─ selected items with has_metadata() (title non-empty)
   ├─ BatchProgress { saving: true }
-  └─ spawn async task
-       for each item (sequential):
-         spawn_blocking(ExifTool::write)
-         send WorkerEvent::SaveDone
-       send WorkerEvent::BatchSaved
+  └─ spawn sequential loop
+       ├─ spawn_blocking(ExifTool::write)
+       ├─ send SaveDone (Saved, dirty=false, or error message)
+       └─ send BatchSaved; clear batch slot
 ```
 
-`SaveDone` on success sets `Saved`, clears `dirty`, clears the error message. On failure it leaves the status unchanged and sets a `Save failed: …` message.
+Saves are deliberately sequential to avoid launching many ExifTool processes over the same folder.
 
-### 8.4 Metadata load flow
+### 8.5 Metadata load flow
 
 ```
-select(index)
-  ├─ request_preview
-  └─ request_metadata (only if ExifTool ready and not already requested)
-       spawn_blocking(ExifTool::read)
-       send WorkerEvent::MetaLoaded
+selection change / open folder / ExifTool ready
+  └─ request_metadata(path) for selected paths
+       ├─ skip if no tool or already requested
+       ├─ spawn_blocking(ExifTool::read)
+       └─ send MetaLoaded
+            ├─ fill dims if absent
+            └─ populate title/caption/keywords only if all empty AND status Pending
 ```
 
-`MetaLoaded` fills dimensions if missing and populates title/caption/keywords **only** when all three are empty and the item is `Pending`. `meta_requested` prevents repeated reads; it is cleared when ExifTool becomes ready and when an item is removed.
+`meta_requested` prevents duplicate reads. It is cleared on folder refresh/open and when ExifTool becomes ready.
 
-### 8.5 Event reference (`src/state.rs::WorkerEvent`)
+### 8.6 Event reference (`src/state.rs::WorkerEvent`)
 
 | Event | Payload | UI handling |
 | --- | --- | --- |
-| `Thumbnail` | path, `ColorImage` | create texture, cache in `thumbs` |
-| `Preview` | path, `ColorImage` | create texture, replace `preview` |
-| `ImageFailed` | path, error | mark decode failure, show message |
-| `AiDone` | path, `Result<GeneratedMetadata, String>` | fill fields or set `Error` |
-| `BatchFinished` | ok, failed | clear batch, show toast |
-| `SaveDone` | path, `Result<(), String>` | set `Saved` or message |
-| `BatchSaved` | ok, failed | clear batch, show toast |
-| `MetaLoaded` | path, `ExistingMetadata` | populate empty pending item |
-| `ExifToolReady` | `Option<ExifTool>`, status | store tool, retry metadata for selection |
+| `Thumbnail` | path, `ColorImage` | create texture, cache |
+| `Preview` | path, `ColorImage` | replace preview texture |
+| `ImageFailed` | path, error | mark cache failure + item message |
+| `AiStarted` | path | `Queued → Processing` |
+| `AiDone` | path, `Result<GeneratedMetadata, String>` | fill fields or set `Error`; progress++ |
+| `BatchFinished` | ok, failed | clear batch; toast |
+| `SaveDone` | path, `Result<(), String>` | `Saved`/message; progress++ |
+| `BatchSaved` | ok, failed | clear batch; toast |
+| `MetaLoaded` | path, `ExistingMetadata` | fill empty pending item |
+| `ModelsLoaded` | provider, endpoint, `Result<Vec<String>, String>` | populate model dropdown or inline error; ignore stale endpoint/provider results |
+| `ExifToolReady` | `Option<ExifTool>`, status | store tool; retry metadata for the selection |
 
-### 8.6 Core data structures
+### 8.7 Core data structures
 
 ```rust
-enum Status { Pending, Processing, Generated, Saved, Error }
+enum Status {
+    Pending, Queued, Processing, Generated, Saved, Error,
+}
 
 struct ImageItem {
     path: PathBuf,
@@ -349,19 +470,23 @@ struct ImageItem {
     dims: Option<(u32, u32)>,
 }
 
-struct GeneratedMetadata { title, caption, keywords, editorial }
-
-struct Metadata { title, caption, keywords }          // what gets written
-
-struct ExistingMetadata {
-    title: Option<String>,
-    caption: Option<String>,
-    keywords: Vec<String>,
-    dims: Option<(u32, u32)>,
+struct Selection {
+    selected: HashSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    active: Option<PathBuf>,
 }
 
 struct BatchProgress { total: usize, done: usize, saving: bool }
+
+struct GeneratedMetadata { title, caption, keywords, editorial }
+struct Metadata { title, caption, keywords }       // written to disk
+struct ExistingMetadata {
+    title: Option<String>, caption: Option<String>,
+    keywords: Vec<String>, dims: Option<(u32, u32)>,
+}
 ```
+
+`App` keeps `items: HashMap<PathBuf, ImageItem>` for status/metadata persistence, `folder_images: Vec<PathBuf>` for grid order, and one `Selection`.
 
 ---
 
@@ -374,22 +499,31 @@ build.bat                      GNU-toolchain build wrapper
 README.md                      this document
 
 src/main.rs                    Windows subsystem attr, egui window setup
-src/app.rs                     all UI, workers, batch orchestration, shortcuts (1887 lines)
-src/state.rs                   queue/item/status model, JPEG discovery, decode, WorkerEvent
-src/config.rs                  Provider enum, ProviderSettings, Config load/save/defaults
+src/app.rs                     controller: folders, selection, workers, batches, shortcuts
+src/state.rs                   ImageItem/Status/Selection, folder scan, decode, events
+src/config.rs                  Provider, ProviderSettings, Config load/save/defaults
 src/theme.rs                   colors, egui style, Segoe UI loading, card frame
-src/ui.rs                      shared widgets: buttons, chips, status pills, dots
+src/cache/mod.rs               cache module root + ThumbnailCache re-export
+src/cache/thumbnails.rs        texture cache, in-flight/failure sets, lifecycle test
 
-src/ai/mod.rs                  AiRequest, prepare_image, generate dispatch, endpoint, snippet
-src/ai/prompt.rs               exact prompt, parser, keyword normalization, validation
-src/ai/ollama.rs               Ollama payload and chat
+src/ui/mod.rs                  menu bar, mode toggle, status bar, widgets, about, drop overlay
+src/ui/browser.rs              folder panel + multi-select grid + active preview
+src/ui/viewer.rs               large viewer + navigation + filmstrip
+src/ui/metadata_panel.rs       single inspector, batch inspector, AI/EXIF settings
+src/ui/tree.rs                 lazy cached folder tree with expansion tests
+
+src/ai/mod.rs                  AiRequest, prepare_image, provider dispatch, endpoint, snippet
+src/ai/prompt.rs               exact prompt, tolerant parser, keyword normalizer, validation
+src/ai/ollama.rs               Ollama payload/chat
 src/ai/lmstudio.rs             LM Studio payload, endpoint normalization, chat
-src/ai/openai.rs               OpenAI-compatible payload and chat
-src/ai/anthropic.rs            Anthropic Messages payload and chat
-src/ai/tests.rs                hand-written TCP mock HTTP server tests for all providers
+src/ai/models.rs               provider model-list discovery, endpoint normalization, parsing
+src/ai/openai.rs               OpenAI-compatible payload/chat
+src/ai/anthropic.rs            Anthropic Messages payload/chat
+src/ai/tests.rs                hand-written TCP mock HTTP server tests for all providers and model lists
 
-src/metadata/mod.rs            ExifTool detection, argfile protocol, read/write, integration tests
-src/metadata/tags.rs           tag mapping, exiftool argument builder, JSON parser, tag tests
+src/metadata/mod.rs            ExifTool detection, argfile protocol, read/write, round-trips
+src/metadata/tags.rs           read tag list, exiftool JSON parser, read tests
+src/metadata/writer.rs         Metadata type, tag-writing argument builder, writer tests
 ```
 
 Dependency roles:
@@ -397,24 +531,52 @@ Dependency roles:
 | Crate | Role |
 | --- | --- |
 | `eframe`/`egui` 0.28.1 | Native window, OpenGL rendering, widgets |
-| `tokio` | Runtime, channels, spawn_blocking |
-| `reqwest` 0.12 (`json`, `native-tls`) | HTTP to providers (Schannel on Windows) |
+| `tokio` | Runtime, channels, `JoinSet`, `Semaphore`, spawn_blocking |
+| `reqwest` 0.12 (`json`, `native-tls`) | Provider HTTP (Schannel on Windows) |
 | `serde` / `serde_json` | Config and provider JSON |
 | `toml` | Config persistence |
 | `directories` 5 | OS config directory |
-| `rfd` 0.14 | Native file/folder pickers |
-| `walkdir` 2.5 | Recursive folder scan |
+| `rfd` 0.14 | Native file/folder dialogs |
+| `walkdir` 2.5 | Recursive add/drop scan |
 | `base64` 0.22 | Image payload encoding |
 | `regex` 1.10 | Tolerant field parser |
-| `chrono` 0.4 (`clock`) | Local date for the editorial timestamp |
+| `chrono` 0.4 (`clock`) | Local editorial date |
 | `anyhow` 1 | Error context |
-| `image` 0.25 (`jpeg` only) | Decode, resize, re-encode JPEGs |
+| `image` 0.25 (`jpeg` only) | Decode, resize, re-encode |
 
 ---
 
-## 10. AI subsystem
+## 10. Selection engine
 
-### 10.1 Request contract (`src/ai/mod.rs`)
+`Selection` is intentionally independent of egui so it can be tested without a window.
+
+### 10.1 Rules
+
+- `selected`: path set.
+- `anchor`: starting point for Shift ranges; normally the last plain/Ctrl-click.
+- `active`: image shown in preview/Viewer; always selected after a click.
+- `primary(ordered)`: returns active if it is still selected; otherwise the first selected path in grid order.
+
+### 10.2 Behavior
+
+| Gesture | Result |
+| --- | --- |
+| Plain click | Clear, select target, active = anchor = target |
+| Ctrl+Click selected | Deselect target; active moves to first remaining selected path |
+| Ctrl+Click unselected | Add target; active = anchor = target |
+| Shift+Click | Clear (unless Ctrl held), select range anchor↔target, active = target; anchor stays |
+| Ctrl+Shift+Click | Add range to current selection, active = target |
+| Checkbox | Toggle target without clearing; active = target when selecting, first remaining when deselecting |
+| Ctrl+A | Select all grid paths; anchor = first; active preserved if still valid, else first |
+| Retain after folder change | Drop paths not present; repair anchor/active; active falls back to first selected |
+
+`app.rs` calls `after_selection_change`, which requests the preview for the active path and metadata for every selected path.
+
+---
+
+## 11. AI subsystem
+
+### 11.1 Request contract (`src/ai/mod.rs`)
 
 ```rust
 struct AiRequest {
@@ -427,29 +589,29 @@ struct AiRequest {
 }
 ```
 
-`ai::generate` validates in this order:
+Validation order:
 
-1. Model must be non-empty, else `No model configured for <provider>.`
-2. Cloud providers require a non-empty API key.
-3. Image base64 must be non-empty.
-4. Build a `reqwest::Client` with a **300-second timeout**.
-5. Dispatch to the provider module.
-6. Parse the returned text with `prompt::parse_response`, adding provider context on failure.
+1. Model non-empty.
+2. Cloud provider API key non-empty.
+3. Image base64 non-empty.
+4. Build `reqwest::Client` with **300-second timeout**.
+5. Dispatch to provider.
+6. Parse with `prompt::parse_response`, adding provider context on failure.
 
-There are no retries, backoff, streaming, or cancellation tokens.
+No retries, backoff, streaming, or cancellation.
 
-### 10.2 Image preparation (`prepare_image`)
+### 11.2 Image preparation
 
-- Opens the file with `image::open` (JPEG only in this build).
-- If `max(width, height) > 1600`, scales so the longest side is 1600 px, using `FilterType::Triangle`.
-- Always converts to RGB8 and re-encodes as JPEG at quality **85**, even if no resize was needed.
-- Returns standard Base64 without a `data:` prefix.
-- This strips all metadata before the image is sent to a provider.
-- EXIF orientation is **not** applied; a portrait photo with an orientation tag may be sent sideways. (Known limitation.)
+- `image::open` (JPEG only in this build).
+- Downscale longest side to **1600 px** with `FilterType::Triangle` if larger.
+- Always convert to RGB8 and re-encode JPEG quality **85**.
+- Base64 standard encoding, no `data:` prefix.
+- Strips all metadata before transmission.
+- EXIF orientation is **not** applied; portrait photos with orientation tags may be analyzed sideways.
 
-### 10.3 Exact system prompt
+### 11.3 Exact system prompt
 
-The following text lives in `SYSTEM_TEMPLATE` in `src/ai/prompt.rs`. `{DATE}` is replaced with the batch's local date formatted as `Month D, YYYY` (English month name, no leading zero). Then, if `global_prompt` is non-empty, this is appended:
+`SYSTEM_TEMPLATE` in `src/ai/prompt.rs`; `{DATE}` is replaced with `Month D, YYYY` (English month, no leading zero). If `global_prompt` is non-empty:
 
 ```
 \n\nAdditional instructions from the photographer (follow these too):\n<trimmed global_prompt>
@@ -499,23 +661,20 @@ Keywords: [word1, word2, word3, ... word50]
 Reply with the four labelled lines above and nothing else. Do not use markdown.
 ```
 
-Date formatting is done once per batch in `App::generate_paths`:
-
+Date is computed once per batch:
 ```rust
 let now = chrono::Local::now();
 let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
 ```
 
-### 10.4 User prompt (`user_prompt`)
+### 11.4 User prompt
 
 Without context:
-
 ```text
 Analyze the attached image and return the four labelled fields exactly as specified.
 ```
 
-With context (trimmed; empty/whitespace is treated as absent):
-
+With context (trimmed; blank = absent):
 ```text
 Situational context supplied by the photographer (treat it as ground truth):
 <context>
@@ -523,153 +682,129 @@ Situational context supplied by the photographer (treat it as ground truth):
 Analyze the attached image and return the four labelled fields exactly as specified.
 ```
 
-### 10.5 Provider wire formats
+### 11.5 Provider wire formats
 
-All providers receive the same system and user prompts and the same base64 JPEG. Differences:
-
-| Provider | Default base URL | Final endpoint | Auth | Image field | Temperature / tokens | Response extraction |
+| Provider | Default base URL | Final endpoint | Auth | Image field | Sampling | Response |
 | --- | --- | --- | --- | --- | --- | --- |
-| Ollama | `http://localhost:11434` | `/api/chat` (base ending `/api` becomes `/api/chat`) | none | `messages[1].images = [base64]` | `stream: false`, `options.temperature: 0.2` | `message.content`, fallback `response`; checks top-level `error` |
-| LM Studio | `http://localhost:1234/v1` | if base ends `/chat/completions` use as-is; if ends `/v1` append `/chat/completions`; otherwise append `/v1/chat/completions` | none | OpenAI-style `image_url` data URI | `temperature: 0.2`, `max_tokens: 900` | `choices[0].message.content` (string) |
-| OpenAI | `https://api.openai.com/v1` | `/chat/completions` | `Authorization: Bearer <key>` | `image_url` data URI | `temperature: 0.2`, `max_tokens: 900` | `choices[0].message.content`; string or array of text parts joined with `\n` |
-| Anthropic | `https://api.anthropic.com/v1` | `/messages` | `x-api-key`, `anthropic-version: 2023-06-01` | `content[0] = image` with `source.type = base64`, `media_type = image/jpeg` | `temperature: 0.2`, `max_tokens: 900`; system is top-level | `content[]` text blocks joined with `\n` |
+| Ollama | `http://localhost:11434` | `/api/chat` (base `/api` → `/api/chat`) | none | `messages[1].images = [base64]` | `stream:false`, temp 0.2 | `message.content`, fallback `response`; checks `error` |
+| LM Studio | `http://localhost:1234/v1` | full `/chat/completions`, or `/v1` + `/chat/completions`, or bare + `/v1/chat/completions` | none | OpenAI `image_url` data URI | temp 0.2, max 900 | `choices[0].message.content` |
+| OpenAI | `https://api.openai.com/v1` | `/chat/completions` | `Authorization: Bearer` | `image_url` data URI | temp 0.2, max 900 | content string, or text parts joined by `\n` |
+| Anthropic | `https://api.anthropic.com/v1` | `/messages` | `x-api-key`, `anthropic-version: 2023-06-01` | base64 image block, `image/jpeg` | temp 0.2, max 900; system top-level | text blocks joined by `\n` |
 
-`ai::endpoint(base, path)` behavior:
+`endpoint(base, path)` trims whitespace/trailing slash; empty base returns the path; exact suffix returns base unchanged; `/api` + `/api/chat` special case; otherwise concatenates.
 
-- Trim whitespace and trailing `/`.
-- Empty base → return the path (not a usable URL; prevents accidental localhost fallback).
-- If base already ends with the exact path → return base unchanged.
-- Special case: `/api/chat` with base ending `/api` → `base/chat`.
-- Otherwise `base + path`.
+HTTP errors include provider-specific hints for local servers, a 400-character snippet of the body, and JSON parse context. Missing expected fields are errors.
 
-HTTP/network failures include a human hint for Ollama/LM Studio ("Is the server running?"). Non-2xx bodies are truncated with `snippet` (400 chars, whitespace collapsed, `…` suffix). JSON parse errors include the snippet. Missing expected fields produce provider-specific errors.
+### 11.6 Tolerant reply parser
 
-### 10.6 Tolerant reply parser
+Accepts:
 
-Field labels are found with a case-insensitive regex that accepts:
-
-- Start of line, whitespace, comma, or semicolon before the label.
-- Optional numbering: `1.`, `2)`, etc.
-- Optional markdown decorations: `*`, `#`, `>`, `-`.
+- Start of line/whitespace/comma/semicolon before a label.
+- Optional numbering (`1.`, `2)`).
+- Optional markdown (`*`, `#`, `>`, `-`).
 - Labels: `Title`, `Editorial Status`, `Editorial`, `Caption`, `Description`, `Keywords`, `Keyword`.
-- Optional emphasis asterisks after the label.
-- ASCII `:` or full-width `：`.
+- Optional `*` after the label; ASCII `:` or full-width `：`.
 
-A field's value runs from the colon to the start of the next recognized label (or end of text), so captions and keyword lists may span lines. Values are cleaned by:
+Values run to the next label, so captions/keywords may span lines. Cleaning trims whitespace/`*`/backticks/underscores, collapses whitespace, removes wrapping quotes, and strips a trailing title period.
 
-- Trimming whitespace, `*`, backticks, and underscores at the edges.
-- Collapsing internal whitespace runs to one space.
-- Removing wrapping double quotes.
-- Title additionally loses a trailing period.
+Duplicate labels: last wins. Missing title/caption/keywords: error listing the missing fields plus a 400-character raw snippet. Editorial defaults to Commercial; the word `commercial` anywhere wins over `editorial`; otherwise `editorial` presence sets true.
 
-Duplicate labels: the **last** occurrence wins (the map is inserted in order).
+### 11.7 Keyword normalization
 
-Missing title, caption, or keywords produces an error listing the missing fields plus a 400-character raw reply snippet. Editorial defaults to Commercial; the word `commercial` anywhere in the status wins over `editorial` (so "Not editorial - commercial use only" → false). Otherwise the presence of `editorial` sets `editorial = true`.
+Shared by AI parsing, the single inspector's **Normalize**, and batch append/replace:
 
-### 10.7 Keyword normalization
-
-`normalize_keywords(raw)` is shared by AI parsing and the UI **Normalize** button:
-
-1. Split on comma, semicolon, newline, CR, `|`, or `/`.
-2. Split each chunk on whitespace (so multi-word phrases become separate words).
-3. Keep only alphabetic characters (`char::is_alphabetic`; Unicode letters survive, including `Café` and `北京`).
+1. Split on `, ; newline CR | /`.
+2. Split each chunk on whitespace.
+3. Keep only alphabetic characters (`char::is_alphabetic`; Unicode letters survive).
 4. Drop results shorter than 2 characters.
-5. Deduplicate case-insensitively, preserving the first spelling and order.
-6. Stop at exactly 50.
+5. Deduplicate case-insensitively, preserving first spelling/order.
+6. Cap at exactly 50.
 
-Consequences:
+Examples: `2024` → dropped; `3d` → dropped; `blue-sky` → `bluesky`; `New York` → `New`, `York`; `Café`/`北京` preserved.
 
-- `2024` → dropped (no letters ⇒ empty).
-- `3d` → `d` → dropped (1 char).
-- `blue-sky` → `bluesky`.
-- `New York` → `New`, `York`.
-- `a` / `I` → dropped.
-- Non-ASCII punctuation is removed; non-Latin scripts are preserved.
-- Case variants (`Sunset`, `sunset`) count as one, keeping the first.
+### 11.8 Validation (advisory)
 
-### 10.8 Validation (advisory only)
-
-`validate(title, caption, keywords)` returns strings for:
-
-- Title word count not in `3..=5` (split on whitespace).
-- Caption character count not in `50..=180` (`chars().count()`, so Unicode scalar values, not bytes).
+- Title word count outside 3–5.
+- Caption character count outside 50–180 (`chars().count()`).
 - Keyword count not exactly 50.
-- First keyword that is not at least 2 alphabetic characters or contains a non-alphabetic character.
+- First keyword under 2 characters or containing non-alphabetic characters.
 
-The UI renders these as amber bullets. Saving is still allowed.
+Warnings never block generation or saving.
+
+### 11.9 Model discovery
+
+`AI Settings` fetches the list of model IDs from the selected provider's endpoint, rather than requiring the ID to be typed from memory.
+
+| Provider | Model-list request | Authentication | Parsed field |
+| --- | --- | --- | --- |
+| Ollama | `GET /api/tags` | none | `models[].name` (fallback `model`) |
+| LM Studio | `GET /v1/models` | none | `data[].id` |
+| OpenAI | `GET /v1/models` | `Authorization: Bearer <key>` | `data[].id` |
+| Anthropic | `GET /v1/models` | `x-api-key`, `anthropic-version: 2023-06-01` | `data[].id` |
+
+Endpoint normalization accepts the provider defaults plus common user variants: Ollama base `/api` or `/api/chat` maps to `/api/tags`; LM Studio bare host, `/v1`, or `/v1/chat/completions` maps to `/v1/models`; OpenAI/Anthropic full chat/messages URLs map back to `/v1/models`.
+
+The request has a 20-second timeout. HTTP/JSON errors include the provider and a body snippet. Cloud providers reject discovery without a key before sending a request. Results are sorted case-insensitively and deduplicated. A configured real model missing from the response is inserted into the dropdown so it can still be selected. The retired LM Studio `local-model` placeholder is never inserted; when LM Studio has no model configured, the first endpoint model is selected. Discovery is asynchronous through `WorkerEvent::ModelsLoaded`; stale responses from an old provider/endpoint are ignored. The `Fetch` button retries after an error.
 
 ---
 
-## 11. Metadata subsystem
+## 12. Metadata subsystem
 
-### 11.1 Tag mapping (product requirement)
+### 12.1 Tag mapping
 
-| Logical field | Tags written |
+| Field | Tags written |
 | --- | --- |
 | Title | `XMP-dc:Title`, `IPTC:ObjectName`, `EXIF:XPTitle` |
 | Caption | `EXIF:ImageDescription`, `IPTC:Caption-Abstract`, `XMP-dc:Description` |
 | Keywords | repeating `IPTC:Keywords`, repeating `XMP-dc:Subject` |
 
-If the caption is empty but the title is non-empty, **only** `EXIF:ImageDescription` is set to the title. If the title is empty, no title tags are written. If both are empty, no descriptive tags are written.
+- Caption empty + title present → only `EXIF:ImageDescription=title`.
+- Title empty → no title tags.
+- Both empty → no descriptive tags.
+- Keyword list empty → no keyword arguments, so existing file keywords remain. The UI cannot clear keywords.
+- `writer::write_args` caps keywords at 50.
 
-If the keyword list is empty, **no keyword arguments are emitted**, so existing keywords in the file are left untouched. The UI cannot clear a keyword list. (To implement clearing, add an explicit empty assignment once and verify ExifTool semantics; do not mix `=` and `+=`.)
+### 12.2 ExifTool detection order
 
-### 11.2 ExifTool detection order
-
-`ExifTool::detect(preferred)` tries, in order:
-
-1. `preferred` from config:
-   - if it is a directory → `<dir>\exiftool.exe`, `<dir>\exiftool`
-   - else use the path as-is
-2. Next to the executable: `exiftool.exe`
+1. Configured `exiftool_path`:
+   - directory → `<dir>\exiftool.exe`, `<dir>\exiftool`
+   - file → as-is
+2. `<exe>\exiftool.exe`
 3. `<exe>\resources\exiftool\exiftool.exe`
 4. `<exe>\resources\exiftool.exe`
 5. `<cwd>\resources\exiftool\exiftool.exe`
 6. `<cwd>\resources\exiftool.exe`
 7. `exiftool` from `PATH`
 
-Each candidate is accepted only if `exiftool -ver` exits successfully and prints a non-empty version. Detection runs in `spawn_blocking`. The version is displayed in the UI and stored in `ExifTool::version`.
+A candidate is accepted only if `exiftool -ver` succeeds and prints a non-empty version. Detection runs in `spawn_blocking`; the version appears in the status bar and EXIF settings.
 
-### 11.3 ExifTool invocation protocol
+### 12.3 Invocation protocol
 
-Every read/write goes through `ExifTool::run`:
+Every read/write:
 
-1. Build a `Vec<String>` of arguments.
-2. Write them to `%TEMP%\autowording-exif-<pid>-<counter>.args` as UTF-8, one argument per line.
-3. Flatten `\r`/`\n` inside each argument to spaces.
-4. Execute:
+1. Build `Vec<String>` arguments.
+2. Write them UTF-8 to `%TEMP%\autowording-exif-<pid>-<counter>.args`, one argument per line.
+3. Flatten `\r`/`\n` inside values to spaces.
+4. Execute `<exiftool> -charset filename=utf8 -@ <argfile>`.
+5. Remove the argfile after the process finishes, success or failure.
+6. On Windows set `CREATE_NO_WINDOW` (0x0800_0000).
 
-```text
-<exiftool> -charset filename=utf8 -@ <argfile>
-```
+Why: Windows converts `argv` to the process ANSI code page, mangling `Café`; a UTF-8 argfile preserves accented/CJK values and file names. `-charset filename=utf8` tells ExifTool the argfile names are UTF-8. Do not reintroduce direct `Command::arg` for tag values/paths.
 
-5. Remove the argfile after the process completes (success or failure).
-6. On Windows, set `CREATE_NO_WINDOW` (0x0800_0000) so no console flashes.
+### 12.4 Write arguments
 
-Why an argfile:
-
-- Windows converts `argv` to the process's ANSI code page, so `Café` became `Cafe` in earlier versions.
-- A UTF-8 argfile preserves accented and CJK characters in both values and file paths.
-- `-charset filename=utf8` tells ExifTool that file names in the argfile are UTF-8, so Unicode file names work.
-
-Do **not** reintroduce direct `Command::arg` for tag values or paths. Direct arguments are still used for `-ver` (ASCII only) and for the fixed `-charset filename=utf8 -@ <argfile>` invocation.
-
-### 11.4 Write arguments
-
-Base flags, always present and in this order:
+Base flags, always:
 
 ```text
 -P -overwrite_original -charset iptc=utf8 -m
 ```
 
-- `-P` preserves the file's modification date/time.
-- `-overwrite_original` overwrites in place and suppresses `_original` backups.
+- `-P` preserves file modification time.
+- `-overwrite_original` overwrites in place; no `_original` backups.
 - `-charset iptc=utf8` writes IPTC as UTF-8.
 - `-m` ignores minor metadata errors.
 
-Then title tags (if non-empty), caption tags (if non-empty, else optional `ImageDescription` fallback), then keywords.
-
-**Critical keyword rule:** every keyword is emitted as its own `=` assignment:
+Keyword rule: every keyword uses its own `=` assignment:
 
 ```text
 -IPTC:Keywords=bridge
@@ -678,11 +813,9 @@ Then title tags (if non-empty), caption tags (if non-empty, else optional `Image
 -XMP-dc:Subject=sunrise
 ```
 
-ExifTool documentation states that using `=` is equivalent to `+=` in any command where the same tag is also set with `+=` or `-=`. Therefore, mixing `=` and `+=` preserves the old list. Repeated pure `=` assignments replace the list with exactly the supplied values. The regression test `overwriting_metadata_replaces_previous_keywords` verifies this against real ExifTool.
+ExifTool treats `=` like `+=` if the same tag is also set with `+=`/`-=` in the same command. Pure repeated `=` replaces the list. `overwriting_metadata_replaces_previous_keywords` verifies this against real ExifTool.
 
-### 11.5 Read arguments and precedence
-
-Arguments:
+### 12.5 Read arguments and precedence
 
 ```text
 -j -charset iptc=utf8
@@ -691,36 +824,31 @@ Arguments:
 <path>
 ```
 
-JSON parsing (`parse_read_json`):
+`parse_read_json`:
 
 - Requires a JSON array with at least one object.
-- Title preference: `Title` → `XPTitle` → `ObjectName`; empty/whitespace values fall through.
-- Caption preference: `Description` → `Caption-Abstract` → `ImageDescription`.
-- Keywords: merge `Keywords` then `Subject`; each may be an array of strings or a comma-separated string; trim, drop empties, dedupe case-insensitively (first spelling/order preserved).
-- `ImageSize` is parsed only as lowercase `WIDTHxHEIGHT`; uppercase `X` is rejected.
-- Invalid JSON, an empty array, or an object instead of an array is an error.
-- Values of the wrong JSON type are ignored rather than failing the whole read.
-- Output is decoded with `String::from_utf8_lossy` before JSON parsing.
+- Title: `Title` → `XPTitle` → `ObjectName`; empty/whitespace falls through.
+- Caption: `Description` → `Caption-Abstract` → `ImageDescription`.
+- Keywords: merge `Keywords` then `Subject`; array or comma-separated string; trim/drop empty; case-insensitive dedupe.
+- `ImageSize` only lowercase `WIDTHxHEIGHT`; uppercase `X` rejected.
+- Invalid JSON/empty array/object instead of array = error.
+- Wrong-type values are ignored.
+- Output decoded with `from_utf8_lossy` before JSON parsing.
 
-The UI's `READ_TAGS` uses short names (`-Title`, `-Description`, `-Subject`) because ExifTool resolves them to the preferred group. The parser still checks the specific fallback keys in case the output includes them.
+### 12.6 Errors
 
-### 11.6 File and error behavior
-
-- `write` rejects a path that is not an existing file before invoking ExifTool.
-- `read` does not pre-check; ExifTool's failure is surfaced.
-- A non-zero exit is an error. Write errors use stderr if non-empty, otherwise stdout, trimmed.
-- Success is determined solely by exit status; ExifTool's "1 image files updated" text is not parsed.
-- Each file is a separate ExifTool process. There is no directory batching.
-- If the argfile cannot be written, the write/read fails with that context.
-- If the process cannot be spawned (e.g. tool deleted after detection), the error says `Could not run exiftool at <path>`.
+- `write` rejects a path that is not an existing file.
+- `read` lets ExifTool report missing files.
+- Non-zero exit is an error; write errors prefer stderr, then stdout, trimmed.
+- Success is exit status only; "1 image files updated" is not parsed.
+- Each file is a separate ExifTool process; no directory batching.
+- Argfile write failure and spawn failure are surfaced with context.
 
 ---
 
-## 12. Configuration
+## 13. Configuration
 
-### 12.1 Location
-
-`Config::config_path()` uses:
+### 13.1 Location
 
 ```rust
 directories::ProjectDirs::from("", "", "AutoWording")
@@ -728,63 +856,60 @@ directories::ProjectDirs::from("", "", "AutoWording")
     .join("config.toml")
 ```
 
-On Windows, `ProjectDirs::config_dir()` appends `config`, so the real path on the development machine is:
+On Windows this resolves to:
 
 ```text
 C:\Users\<user>\AppData\Roaming\AutoWording\config\config.toml
 ```
 
-(The settings panel displays the exact resolved path.) If `ProjectDirs` fails, it falls back to the executable's directory, then to the relative `config.toml`.
+`ProjectDirs::config_dir()` appends `config`. The settings panel shows the exact path. Fallbacks: executable directory, then relative `config.toml`.
 
-`Config::load()`:
+`Config::load`:
 
-- Reads the file if present.
-- On a TOML parse error, prints a message to stderr and uses **all defaults** (including default API keys).
-- On a missing file, uses defaults and immediately saves them.
-- Sets `cfg.path` to the resolved path. `path` is `#[serde(skip)]`, so it is never written.
+- Reads if present.
+- On parse error, logs to stderr and uses **all defaults**.
+- On missing file, uses defaults and immediately saves.
+- Sets `path` (serde-skipped, never written).
 
-`Config::save()` creates parent directories and writes pretty TOML. The UI debounces saves by 500 ms after any change.
+`Config::save` creates parent directories and writes pretty TOML. UI debounces 500 ms.
 
-### 12.2 Schema and defaults
+### 13.2 Schema and defaults
 
 ```rust
 enum Provider { Ollama, LmStudio, OpenAi, Anthropic } // serde: snake_case
-struct ProviderSettings { base_url: String, model: String, api_key: String }
+struct ProviderSettings { base_url, model, api_key }
 struct Config {
-    provider: Provider,
-    ollama: ProviderSettings,
-    lmstudio: ProviderSettings,
-    openai: ProviderSettings,
-    anthropic: ProviderSettings,
-    global_prompt: String,
-    exiftool_path: String,
-    #[serde(skip)] path: Option<PathBuf>,
+    provider,
+    ollama, lmstudio, openai, anthropic: ProviderSettings,
+    global_prompt,
+    exiftool_path,
+    last_folder,        // reopened at startup
+    concurrency,        // AI workers, clamped 1..=4 at use
+    #[serde(skip)] path,
 }
 ```
 
 | Field | Default |
 | --- | --- |
 | `provider` | `ollama` |
-| `ollama.base_url` | `http://localhost:11434` |
-| `ollama.model` | `llava` |
-| `lmstudio.base_url` | `http://localhost:1234/v1` |
-| `lmstudio.model` | `local-model` |
-| `openai.base_url` | `https://api.openai.com/v1` |
-| `openai.model` | `gpt-4o-mini` |
-| `anthropic.base_url` | `https://api.anthropic.com/v1` |
-| `anthropic.model` | `claude-sonnet-4-20250514` |
-| all `api_key` fields | empty |
+| `ollama.base_url` / `model` | `http://localhost:11434` / `llava` |
+| `lmstudio.base_url` / `model` | `http://localhost:1234/v1` / empty (first fetched model is selected) |
+| `openai.base_url` / `model` | `https://api.openai.com/v1` / `gpt-4o-mini` |
+| `anthropic.base_url` / `model` | `https://api.anthropic.com/v1` / `claude-sonnet-4-20250514` |
+| all `api_key` | empty |
 | `global_prompt` | empty |
 | `exiftool_path` | empty (auto-detect) |
+| `last_folder` | empty |
+| `concurrency` | `1` |
 
-TOML provider values are exactly `ollama`, `lm_studio`, `open_ai`, `anthropic`. An unknown value is a parse error and causes the whole config to fall back to defaults. `#[serde(default)]` on `Config` and `ProviderSettings` means missing fields/sections are filled from defaults.
-
-Example:
+TOML provider values: `ollama`, `lm_studio`, `open_ai`, `anthropic`. Unknown values fail the whole parse and fall back to defaults. `#[serde(default)]` fills missing fields/sections.
 
 ```toml
 provider = "open_ai"
 global_prompt = "Prefer British spelling and avoid brand names."
 exiftool_path = ""
+last_folder = "C:\\Photos\\2026_Stock"
+concurrency = 2
 
 [ollama]
 base_url = "http://localhost:11434"
@@ -793,7 +918,7 @@ api_key = ""
 
 [lmstudio]
 base_url = "http://localhost:1234/v1"
-model = "local-model"
+model = ""
 api_key = ""
 
 [openai]
@@ -807,20 +932,21 @@ model = "claude-sonnet-4-20250514"
 api_key = ""
 ```
 
-### 12.3 Security
+### 13.3 Security
 
-- API keys are stored **in plain text**. The UI masks the field but the file is not encrypted.
-- `config.toml` lives outside the repository. Never commit it, print it, or paste its contents into logs.
-- No telemetry, analytics, auto-update, or crash reporting exists.
-- Network traffic goes only to the selected provider endpoint. Ollama and LM Studio traffic stays local when their base URLs are local.
-- Images are re-encoded and downscaled before transmission, which removes metadata as a side effect.
-- ExifTool runs locally with the user's permissions.
+- API keys are plaintext; the UI masks the field only.
+- `config.toml` is outside the repo. Never commit, print, or log it.
+- No telemetry, analytics, auto-update, or crash reporting.
+- Only the selected provider endpoint receives network traffic.
+- Images are re-encoded/downscaled before transmission, stripping metadata.
+- ExifTool runs locally with user permissions.
+- Saving is destructive: `-overwrite_original`.
 
 ---
 
-## 13. Tests
+## 14. Tests
 
-### 13.1 Commands
+### 14.1 Run
 
 ```bat
 build.bat test
@@ -834,144 +960,150 @@ export PATH="$PWD/.tools/gnu-bin:$SELF:$PATH"
 cargo +stable-x86_64-pc-windows-gnu test
 ```
 
-Expected: `78 passed; 0 failed; 0 ignored`.
+Expected: **98 passed; 0 failed; 0 ignored**.
 
-List tests:
+List: `cargo test -- --list`.
 
-```bash
-cargo test -- --list
-```
-
-### 13.2 Test inventory
+### 14.2 Inventory
 
 | Module | Count | Coverage |
 | --- | --- | --- |
-| `ai::prompt::tests` | 24 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, validation boundaries, exact caption preservation |
-| `ai::tests` | 17 | mock HTTP server for all four providers; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation |
-| `config::tests` | 6 | defaults, serde names (`lm_studio`, `open_ai`), accessors, save/load round-trip, invalid TOML, path stability |
-| `metadata::tags::tests` | 13 | all written tags, title fallback, empty metadata, keyword replacement (no `+=`), Unicode arguments, read precedence/fallbacks/merge/dedupe/invalid payloads |
-| `metadata::tests` | 8 | real ExifTool round-trip, overwrite semantics, 50 keywords, Unicode values, Unicode file names, missing files, explicit path/directory detection, argfile formatting |
-| `state::tests` | 10 | extension recognition, recursive collection, single/missing paths, decode resize/no-resize/corrupt, item conversion/status, progress fraction, selection stepping/removal |
+| `ai::prompt::tests` | 24 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, validation boundaries, exact editorial caption |
+| `ai::tests` | 23 | mock HTTP server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation |
+| `config::tests` | 7 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`concurrency`, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
+| `metadata::tags::tests` | 7 | read precedence/fallbacks/merge/dedupe/invalid payloads/string keywords |
+| `metadata::writer::tests` | 7 | all tags, title fallback, empty metadata, no `+=`, Unicode, 50-keyword cap |
+| `metadata::tests` | 8 | real ExifTool round-trip, overwrite semantics, 50 keywords, Unicode values, Unicode file names, missing files, explicit/directory detection, argfile formatting |
+| `state::tests` | 19 | extension/folder scans, decode resize/corrupt, item conversion, progress, selection math, Ctrl/Shift/checkbox/toggle/retain, aggregate common/mixed, keyword append |
+| `cache::thumbnails::tests` | 1 | request lifecycle blocks duplicates/failures |
+| `ui::tree::tests` | 2 | sorted children/expansion/depth; refresh preserves expansion and rereads children |
 
-ExifTool integration tests call `ExifTool::detect("")`; if no tool is found they print `exiftool not available; skipping test` and return successfully. This is intentional so the suite can run on machines without ExifTool, but it means those eight tests are not evidence of metadata correctness unless ExifTool is installed. On the development machine ExifTool is installed and all eight execute.
+ExifTool integration tests skip with `exiftool not available; skipping test` if detection fails. This keeps the suite runnable without ExifTool, but those eight only prove metadata correctness when ExifTool is installed. On this machine they run.
 
-Provider tests do **not** contact real APIs. `src/ai/tests.rs` contains a small single-request TCP HTTP server bound to `127.0.0.1:0`; it reads the request, asserts method/path/headers/body, and returns canned JSON. No API keys or network access are required.
+Provider tests make no real API calls. `src/ai/tests.rs` has a single-request TCP HTTP server on `127.0.0.1:0`; it reads the request, asserts method/path/headers/body, and returns canned JSON.
 
-Test artifacts are written under `%TEMP%\autowording-tests`, `%TEMP%\autowording-state-tests`, and `%TEMP%\autowording-config-tests`.
+Temporary artifacts: `%TEMP%\autowording-tests`, `autowording-state-tests`, `autowording-config-tests`, `autowording-tree-tests`.
 
-### 13.3 What is deliberately not tested
+### 14.3 Not tested
 
-- egui rendering, widget interaction, drag-and-drop, and keyboard shortcuts (no UI automation).
+- egui rendering, widget interaction, drag-and-drop, shortcut dispatch, and visual layout (no UI automation).
 - Live Ollama/LM Studio/OpenAI/Anthropic calls.
-- Windows file dialogs (`rfd`).
-- ExifTool behavior on malformed/corrupt JPEGs.
-- Concurrent batch saves, cancellation, or process interruption.
-- Long-running memory behavior with thousands of images.
+- Windows native file dialogs (`rfd`).
+- Real folder volumes, permission errors, junctions/symlink loops.
+- ExifTool behavior on corrupt JPEGs.
+- Concurrent batch save, cancellation, process interruption.
+- Memory behavior with thousands of images.
 - Non-Windows builds.
 
 ---
 
-## 14. Invariants, gotchas, and design rationale
+## 15. Invariants and gotchas
 
-1. **Repeated `=` replaces; `+=` appends.** Mixing them makes `=` behave like `+=`. The code and test `keyword_arguments_use_replacement_not_append` enforce no `+=`.
-2. **UTF-8 argfile is mandatory on Windows.** Direct `argv` loses accents/CJK. `unicode_metadata_round_trips` and `unicode_file_names_round_trip` protect this.
-3. **`-overwrite_original` is destructive.** No backup files are created. The README and UI should not imply undo.
-4. **Metadata is only loaded into empty pending items.** This prevents a late-arriving `MetaLoaded` from clobbering a generation result or user edit.
-5. **Generation replaces all four fields**, including a manually edited caption. There is no merge/confirm prompt.
-6. **Save requires a non-empty title.** Caption-only or keyword-only items cannot be saved from the UI, even though the metadata layer could write them.
-7. **Validation never blocks save.** A one-word title or 3 keywords will still be written.
-8. **Only one batch runs at a time**, and generation/saving share the slot. A stuck provider request blocks other batches for up to 300 s.
-9. **Sequential processing.** Images in a batch are handled one at a time; two tokio workers do not parallelize the per-image loop.
-10. **`batch.done` counting is mode-dependent.** `AiDone` increments only when `!saving`; `SaveDone` increments only when `saving`.
-11. **Selection is clamped by pure helpers.** `stepped_index(None, n, ...)` returns `Some(0)`; an out-of-range selection is clamped. `index_after_removal` keeps a valid neighbor or returns `None` for an empty queue.
-12. **`Config::load` falls back wholesale on a parse error**, not field-by-field. A single invalid provider value resets all settings in memory (the bad file remains on disk until the next save).
-13. **`path` is skipped by serde.** Tests assert it does not round-trip through TOML.
-14. **The config path includes a `config` directory** on Windows because of `ProjectDirs::config_dir()`. Do not document it as `%APPDATA%\AutoWording\config.toml`; that was wrong.
-15. **Anthropic uses `x-api-key`, not Bearer.** OpenAI uses Bearer. LM Studio and Ollama send no auth header.
-16. **LM Studio endpoint normalization is special.** It accepts a bare host, a `/v1` base, or a full `/chat/completions` URL.
-17. **Ollama accepts a base ending in `/api`.** `endpoint` turns it into `/api/chat`.
-18. **No automatic retry.** Transient 429/500/network errors surface immediately as `Error`; the user can reprocess.
-19. **The AI sees a re-encoded JPEG, not the original.** Quality 85 and max 1600 px may hide fine detail (e.g. small species markings).
-20. **No EXIF orientation correction.** The image crate decodes raw pixels; a rotated photo may be analyzed sideways.
-21. **Keywords are single words by design.** Multi-word concepts are split, which can reduce stock relevance; the prompt asks the model to emit single words anyway.
-22. **Keyword dedupe is case-insensitive but preserves the first spelling.** `Bridge` then `bridge` yields `Bridge`.
-23. **Unicode keywords are allowed by validation** (`is_alphabetic`), even though the prompt asks for "alphabetic characters only".
-24. **The editorial bool does not alter the caption.** If the model ignores the Shutterstock format, toggling Editorial will not fix it.
-25. **The app is not code-signed.** SmartScreen may warn. There is no installer or auto-update.
-
----
-
-## 15. How to extend safely
-
-### 15.1 Add a provider
-
-1. Add a variant to `Provider` in `src/config.rs`.
-2. Update `Provider::ALL`, `label`, `is_cloud`, `requires_key`, `default_base_url`, `default_model`, `base_hint`, `model_hint`, `guidance`.
-3. Add a `ProviderSettings` field to `Config`, its default, and the `settings`/`settings_mut` match arms.
-4. Create `src/ai/<provider>.rs` with `payload(...)` and `chat(...)`, following the existing patterns.
-5. Declare the module in `src/ai/mod.rs` and add a match arm in `generate`.
-6. Add mock-server tests to `src/ai/tests.rs` (payload shape, endpoint, auth header, response parsing, HTTP error).
-7. Add the provider to config round-trip tests.
-8. Update this README's provider table and defaults.
-
-Exhaustive `match` arms will force most of these updates at compile time.
-
-### 15.2 Change the prompt or output schema
-
-1. Edit `SYSTEM_TEMPLATE` / `system_prompt` / `user_prompt` in `src/ai/prompt.rs`.
-2. If fields change, update `GeneratedMetadata`, `parse_fields`, `parse_response`, and the missing-field error.
-3. Update `validate` and the UI warning chips in `src/app.rs`.
-4. Update `metadata/tags.rs` and `state.rs` if the new field must be written.
-5. Add parser tests for old and new formats; keep tolerance for markdown.
-6. Update §10.3 of this README verbatim.
-
-### 15.3 Add or change a metadata tag
-
-1. Update `Metadata` and/or `ExistingMetadata` in `src/metadata/tags.rs`.
-2. Update `write_args` (and avoid mixing `=` with `+=`).
-3. Update `READ_TAGS` and `parse_read_json` with an explicit precedence order.
-4. Update `ImageItem`, `to_metadata`, and the UI editor.
-5. Update tests for argument generation and real round-trip behavior.
-6. Update the mapping table in §11.1.
-
-### 15.4 Change keyword semantics
-
-Edit `normalize_keywords` only, because the AI parser and UI Normalize button share it. Preserve:
-
-- Unicode letters.
-- Case-insensitive dedupe with first spelling.
-- The 50-keyword cap.
-- Splitting on `, ; newline CR | /` and whitespace.
-
-Then update the normalization tests and §10.7.
-
-### 15.5 Add UI automation
-
-The app has no test hooks or headless mode. To add UI tests you would need to refactor `App` to separate pure state transitions from egui rendering (e.g. an `AppCore` with an event-in/event-out API), or drive the real window with a Windows UI automation tool. Do not claim UI coverage without such work.
+1. **Repeated `=` replaces; any `+=` makes `=` behave like append.** Do not mix.
+2. **UTF-8 argfile is mandatory on Windows.** Direct `argv` loses accents/CJK.
+3. **`-overwrite_original` is irreversible.** No backups/undo.
+4. **Metadata only loads into empty `Pending` items.** Prevents clobbering generation/user edits.
+5. **Generation replaces all four fields**, including manual edits.
+6. **Save requires a non-empty title.** Caption-only/keyword-only items are skipped.
+7. **Validation never blocks save.**
+8. **One batch at a time**, shared by AI and save. A stuck provider can hold it for up to 300 s.
+9. **AI concurrency is 1–4; saves are sequential.** `batch.done` increments in `AiDone` only when `!saving`.
+10. **Selection is by path, not index.** Grid reorder/reload must not corrupt it.
+11. **Shift anchor persists** across Shift clicks; Ctrl+Shift extends without clearing.
+12. **`primary()` falls back to the first selected path** if the active path is gone.
+13. **Config parse failure resets everything in memory**, not field-by-field.
+14. **The config path contains an extra `config` directory** on Windows.
+15. **Anthropic uses `x-api-key`; OpenAI uses Bearer;** local providers send no auth.
+16. **LM Studio endpoint normalization** accepts host, `/v1`, or full `/chat/completions`.
+17. **Ollama base ending `/api`** becomes `/api/chat`.
+18. **No automatic retry.** `Error` items can be retried via **Retry failed** or by rerunning the selected batch.
+19. **The model sees a re-encoded JPEG**, quality 85, max 1600 px; fine detail may be lost.
+20. **No EXIF orientation correction.**
+21. **Keywords are single words by design**; multi-word concepts split.
+22. **Keyword dedupe preserves first spelling**, case-insensitive.
+23. **Unicode keywords pass validation** (`is_alphabetic`), despite the prompt asking for alphabetic characters.
+24. **Editorial toggle does not rewrite the caption.**
+25. **Folder scans are non-recursive for the grid**, recursive for dropped folders/add paths.
+26. **The tree skips dot-directories and common junk dirs**, but not Windows hidden attributes.
+27. **`folder_root` is separate from `current_folder`**: the root is the tree root; the current folder is selected.
+28. **Refreshing re-selects the first image if selection became empty**, even after Clear.
+29. **`meta_requested` is cleared on folder open/refresh/ExifTool-ready**, causing re-reads.
+30. **The app is not code-signed**; SmartScreen may warn.
+31. **No installer, auto-update, single-instance enforcement, or tray icon.**
+32. **The UI does not auto-save metadata.**
 
 ---
 
-## 16. Troubleshooting
+## 16. Extending safely
+
+### 16.1 Add a provider
+
+1. Add a `Provider` variant in `config.rs`.
+2. Update `ALL`, `label`, `is_cloud`, `requires_key`, `default_base_url`, `default_model`, `base_hint`, `model_hint`, `guidance`.
+3. Add a `ProviderSettings` field, default, and `settings`/`settings_mut` arms.
+4. Create `src/ai/<provider>.rs` with testable `payload`/`chat`.
+5. Declare it in `ai/mod.rs` and add a `generate` match arm.
+6. Add mock-server tests and config round-trip coverage.
+7. Update this README's provider table/defaults.
+
+Exhaustive matches force most updates at compile time.
+
+### 16.2 Change the prompt/schema
+
+1. Edit `SYSTEM_TEMPLATE`/`system_prompt`/`user_prompt`.
+2. Update `GeneratedMetadata`, `parse_fields`, `parse_response`, missing-field errors.
+3. Update `validate`, the single inspector chips, and batch aggregate fields.
+4. Update metadata writer/state if the new field must persist.
+5. Add parser tests for old and new formats.
+6. Update §11.3 verbatim.
+
+### 16.3 Add/change a metadata tag
+
+1. Update `Metadata`/`ExistingMetadata`.
+2. Update `writer::write_args` (never mix `=`/`+=`).
+3. Update `READ_TAGS` and `parse_read_json` precedence.
+4. Update `ImageItem`, `to_metadata`, inspector UI, and batch aggregation if needed.
+5. Add tag-argument and real round-trip tests.
+6. Update §12.1.
+
+### 16.4 Change selection behavior
+
+Edit `Selection` in `state.rs`, then update `state::tests` for plain/Ctrl/Shift/Ctrl+Shift/checkbox/retain. The UI only converts egui modifiers into `SelectModifiers`; keep that translation thin.
+
+### 16.5 Change batch concurrency
+
+`Config::concurrency` is clamped in `generate_paths`. Worker tasks acquire a `Semaphore` permit before spawning; `AiStarted` is sent inside the task, so images waiting for a permit stay `Queued`. Preserve that distinction if refactoring.
+
+### 16.6 Add UI automation
+
+There are no test hooks or headless mode. You would need to separate pure state transitions from egui rendering (e.g. an `AppCore` event-in/out API) or drive the real window with Windows UI automation. Do not claim UI coverage without that work.
+
+---
+
+## 17. Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| `ExifTool not found — install it or set its path` | Install ExifTool, add it to `PATH`, or browse to `exiftool.exe` in the EXIF writer panel and press **Re-check**. |
-| `Could not run exiftool at …` | The configured path disappeared or is not executable; press **Use PATH** or re-select. |
-| Save button disabled | No ExifTool, no active selection, or a batch is running. |
-| `Generate or type a title before saving` | The UI requires a non-empty title. |
-| Keywords were not replaced | Check `write_args` for `+=`; see §11.4. |
-| Accented text became plain ASCII | Arguments are going through `argv`; ensure `ExifTool::run` still uses the UTF-8 argfile. |
-| OpenAI/Anthropic 401 | Missing/incorrect API key; keys are per-provider. |
-| Ollama/LM Studio connection refused | Start the local server; check the base URL and port. |
-| LM Studio 404 on `/v1/v1/...` | The endpoint normalizer should prevent this; verify `lmstudio::endpoint_for`. |
-| Model returns unparseable text | The error includes a 400-char snippet. Use a stronger instruction-following vision model; the parser tolerates markdown but needs the four labels. |
-| Metadata appears in one program but not another | Different readers prioritize different tag families. The app writes EXIF, IPTC, and XMP; verify with `exiftool -a -G1 -s file.jpg`. |
-| Build fails with `kernel32.lib` / `link.exe` errors | Use `build.bat` (GNU toolchain) or install the Windows SDK and ensure the correct `link.exe` is on `PATH`. |
-| Build fails in `ring` | `reqwest` was switched away from `rustls`; do not re-enable it without a C compiler. |
-| Unicode file name is not found by ExifTool | Ensure `-charset filename=utf8` is still passed and the path is inside the argfile. |
-| Tests pass but metadata tests were skipped | ExifTool was not detected; install it and rerun. Check stderr for `exiftool not available; skipping test`. |
+| `ExifTool not found` | Install it, add to `PATH`, or set the path in **AI Settings → EXIF writer**, then **Re-check**. |
+| Save disabled | No ExifTool, no selection, no title, or a batch is running. |
+| Grid empty | The folder has no direct `.jpg/.jpeg/.jpe/.jfif` files; use **Add images** or select a different folder. |
+| Tree does not show a subfolder | It starts with `.` or is one of the skipped names; refresh after creating it. |
+| `Ctrl+A` types in a field instead of selecting | Shortcuts are suppressed while a widget has focus; click the grid first. |
+| Batch buttons disabled | A generation/save batch is already running. |
+| Keywords not replaced | Check `writer::write_args` for `+=`. |
+| Accented text becomes ASCII | Arguments bypassed the UTF-8 argfile. |
+| OpenAI/Anthropic 401 | Missing/incorrect API key; keys are per provider. |
+| Model list is empty or fails | Check the endpoint/port and click **Fetch**; cloud providers need an API key. A failed discovery leaves a manually editable model field. |
+| Ollama/LM Studio connection refused | Start the local server; check endpoint/port. |
+| LM Studio 404 `/v1/v1/...` | Verify `lmstudio::endpoint_for` still normalizes. |
+| Model reply unparseable | Error includes a 400-char snippet; use a stronger instruction-following vision model. |
+| Metadata visible in one app, not another | Readers prioritize different families; verify with `exiftool -a -G1 -s file.jpg`. |
+| Build `kernel32.lib` / `link.exe` errors | Use `build.bat` or install the Windows SDK and fix `link.exe` order. |
+| `ring` build failure | `reqwest` uses `native-tls`; do not re-enable rustls without a C compiler. |
+| Unicode filename not found | Ensure `-charset filename=utf8` and argfile path handling remain intact. |
+| Tests skip metadata cases | ExifTool not detected; check stderr and install it. |
 
-Useful diagnostic command:
+Diagnostic:
 
 ```bat
 exiftool -a -G1 -s "path\to\image.jpg"
@@ -979,49 +1111,51 @@ exiftool -a -G1 -s "path\to\image.jpg"
 
 ---
 
-## 17. Limitations and non-goals
+## 18. Limitations and non-goals
 
-- Windows-only target; no macOS/Linux packaging or testing.
-- JPEG only; no PNG, TIFF, HEIC, RAW, or video.
-- No XMP sidecar workflow; writes into the JPEG itself.
-- No batch cancellation, pause, resume, or per-image retry button (use **Process all pending**).
-- No request retries/backoff, rate-limit handling, or token/cost accounting.
-- No automatic EXIF orientation correction before sending to the model.
-- No metadata diff, preview of raw ExifTool output, or undo.
-- No keyword translation, synonym expansion, or per-market keyword limits.
-- No support for clearing existing keywords when the new list is empty.
-- No project/session persistence beyond config; the queue is in memory only.
-- No installer, code signing, auto-update, tray icon, or single-instance enforcement.
-- No CI configuration. Tests are run manually.
-- No license file. Add one before redistributing; the absence of a license means all rights are reserved by default.
+- Windows-only; no macOS/Linux packaging or testing.
+- JPEG only; no PNG/TIFF/HEIC/RAW/video.
+- Writes into the JPEG; no XMP sidecars.
+- No batch cancellation, pause/resume, or per-image cancel.
+- No automatic retries/backoff/rate-limit handling/cost accounting.
+- No EXIF orientation correction before AI.
+- No undo, metadata diff, or raw ExifTool output viewer.
+- No keyword clearing when the list is empty.
+- No keyword translation/synonym expansion/per-market limits.
+- Queue/selection are in memory only; only config persists.
+- Folder grid does not show subfolder images recursively.
+- No installer, signing, auto-update, tray icon, single-instance enforcement.
+- No CI; tests run manually.
+- No license file. Add one before redistribution (default is all rights reserved).
 
 ---
 
-## 18. Glossary
+## 19. Glossary
 
 | Term | Meaning |
 | --- | --- |
-| **Microstock** | Low-cost royalty-free/editorial stock photography marketplaces (Shutterstock, Adobe Stock, etc.). |
-| **Editorial** | Content that documents newsworthy/recognizable people or events; usually cannot be used commercially without releases. |
-| **Commercial** | Content usable for advertising; recognizable faces/property generally require releases. |
-| **IPTC** | Legacy news metadata standard; `Keywords`, `ObjectName`, `Caption-Abstract`. |
-| **XMP** | Adobe's XML metadata framework; `dc:Title`, `dc:Description`, `dc:subject`. |
-| **EXIF** | Camera/image metadata; `ImageDescription`, `XPTitle`. |
-| **ExifTool** | Phil Harvey's Perl-based command-line metadata reader/writer used by this app. |
-| **Argfile** | A UTF-8 text file passed with `-@`, one ExifTool argument per line, used to bypass Windows code-page conversion. |
+| **ACDSee layout** | Browser mode with folder tree + thumbnail grid + preview/inspector; Viewer mode for a single large image. |
+| **Microstock** | Low-cost royalty-free/editorial stock marketplaces. |
+| **Editorial** | Newsworthy/documentary content; recognizable people/events usually need releases for commercial use. |
+| **Commercial** | Advertising-usable content. |
+| **IPTC** | News metadata: `Keywords`, `ObjectName`, `Caption-Abstract`. |
+| **XMP** | Adobe XML metadata: `dc:title`, `dc:description`, `dc:subject`. |
+| **EXIF** | Camera/image metadata: `ImageDescription`, `XPTitle`. |
+| **ExifTool** | Phil Harvey's Perl metadata CLI used here. |
+| **Argfile** | UTF-8 file passed with `-@`, one ExifTool argument per line. |
 | **Shutterstock caption format** | `CITY, STATE/COUNTRY – MONTH DAY, YEAR: Factual sentence.` |
-| **Dirty** | UI flag indicating generated/saved fields were edited and need saving. |
+| **Active image** | Primary focus shown in preview/Viewer; may be part of a larger selection. |
+| **Anchor** | Starting image for Shift+Click range selection. |
+| **Dirty** | Generated/saved metadata was edited and needs saving. |
 
 ---
 
-## 19. Verification record
+## 20. Verification record
 
 Last verified on the development machine (Windows 11, 2026-11-05):
 
-- `cargo +stable-x86_64-pc-windows-gnu test` → **78 passed, 0 failed**.
-- `cargo +stable-x86_64-pc-windows-gnu build --release` → success, `target/release/autowording.exe` ~21 MB.
-- Real ExifTool tests executed (ExifTool detected on `PATH`).
-- README claims about Unicode argfiles, keyword replacement, and config path were verified against the running code/tests.
-- The GUI was launched in an earlier smoke run but was **not** visually inspected in this verification pass; no screenshots are committed.
-
-When updating this section, report exactly what ran. Do not claim live provider calls or UI automation unless they were actually performed.
+- `cargo +stable-x86_64-pc-windows-gnu test` → **98 passed, 0 failed** (includes real ExifTool round-trips).
+- `cargo +stable-x86_64-pc-windows-gnu build --release` → success, no warnings; `target/release/autowording.exe` ~21 MB.
+- The redesigned release was smoke-launched; the native window `AutoWording` was created and responding.
+- The UI was **not** visually inspected or driven through folder/grid/batch interactions in this pass; selection/tree logic is covered by unit tests, but layout and click behavior remain visually unverified.
+- No live generation calls were made; provider tests use mock HTTP servers. A live LM Studio `/v1/models` endpoint was reachable and returned model IDs, but the settings dropdown was not visually driven.

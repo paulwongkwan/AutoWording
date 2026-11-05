@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod lmstudio;
+pub mod models;
 pub mod ollama;
 pub mod openai;
 pub mod prompt;

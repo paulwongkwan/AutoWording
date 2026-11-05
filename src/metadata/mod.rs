@@ -1,6 +1,8 @@
 pub mod tags;
+pub mod writer;
 
-pub use tags::{ExistingMetadata, Metadata};
+pub use tags::ExistingMetadata;
+pub use writer::Metadata;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -84,7 +86,7 @@ impl ExifTool {
             bail!("File not found: {}", path.display());
         }
 
-        let mut args = tags::write_args(md);
+        let mut args = writer::write_args(md);
         args.push(path.to_string_lossy().to_string());
 
         let output = self.run(args)?;

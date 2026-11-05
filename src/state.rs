@@ -1,18 +1,35 @@
 use crate::ai::prompt::GeneratedMetadata;
+use crate::config::Provider;
 use crate::metadata::{ExistingMetadata, ExifTool, Metadata};
 use eframe::egui;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
     #[default]
     Pending,
+    Queued,
     Processing,
     Generated,
     Saved,
     Error,
 }
 
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Pending => "Pending",
+            Status::Queued => "In queue",
+            Status::Processing => "Processing",
+            Status::Generated => "Generated",
+            Status::Saved => "Saved",
+            Status::Error => "Failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ImageItem {
     pub path: PathBuf,
     pub status: Status,
@@ -59,6 +76,7 @@ impl ImageItem {
         !self.title.trim().is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn is_pending(&self) -> bool {
         matches!(self.status, Status::Pending | Status::Error)
     }
@@ -81,6 +99,178 @@ impl BatchProgress {
     }
 }
 
+/// Mouse modifiers for grid selection, kept independent from egui for testing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
+/// Multi-image selection state for the ACDSee-style grid.
+///
+/// `selected` uses paths rather than indices so selection survives folder
+/// reloads and status updates. `active` is the primary focus (the image shown
+/// in the preview/viewer); `anchor` is the Shift-click anchor.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    selected: HashSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    active: Option<PathBuf>,
+}
+
+impl Selection {
+    pub fn contains(&self, path: &Path) -> bool {
+        self.selected.contains(path)
+    }
+
+    pub fn count(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
+    pub fn active(&self) -> Option<&Path> {
+        self.active.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn anchor(&self) -> Option<&Path> {
+        self.anchor.as_deref()
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+        self.active = None;
+    }
+
+    pub fn select_only(&mut self, path: &Path) {
+        self.selected.clear();
+        self.selected.insert(path.to_path_buf());
+        self.anchor = Some(path.to_path_buf());
+        self.active = Some(path.to_path_buf());
+    }
+
+    pub fn select_all(&mut self, ordered: &[PathBuf]) {
+        self.selected = ordered.iter().cloned().collect();
+        self.anchor = ordered.first().cloned();
+        if self
+            .active
+            .as_ref()
+            .map(|active| !self.selected.contains(active))
+            .unwrap_or(true)
+        {
+            self.active = ordered.first().cloned();
+        }
+    }
+
+    pub fn retain_existing(&mut self, ordered: &[PathBuf]) {
+        let existing: HashSet<&PathBuf> = ordered.iter().collect();
+        self.selected.retain(|path| existing.contains(path));
+        if self
+            .anchor
+            .as_ref()
+            .map(|anchor| !existing.contains(anchor))
+            .unwrap_or(true)
+        {
+            self.anchor = ordered.first().cloned();
+        }
+        if self
+            .active
+            .as_ref()
+            .map(|active| !existing.contains(active))
+            .unwrap_or(true)
+        {
+            self.active = self
+                .first_selected_in_order(ordered);
+        }
+    }
+
+    /// Apply a click from the grid, following ACDSee/Explorer conventions.
+    pub fn click(&mut self, ordered: &[PathBuf], path: &Path, modifiers: SelectModifiers) {
+        let path_buf = path.to_path_buf();
+
+        if modifiers.shift {
+            let anchor = self
+                .anchor
+                .clone()
+                .or_else(|| self.active.clone())
+                .or_else(|| ordered.first().cloned());
+            let anchor_index = anchor
+                .as_ref()
+                .and_then(|anchor| ordered.iter().position(|item| item == anchor));
+            let target_index = ordered.iter().position(|item| item == path);
+
+            if let (Some(anchor_index), Some(target_index)) = (anchor_index, target_index) {
+                if !modifiers.ctrl {
+                    self.selected.clear();
+                }
+                let start = anchor_index.min(target_index);
+                let end = anchor_index.max(target_index);
+                for item in &ordered[start..=end] {
+                    self.selected.insert(item.clone());
+                }
+            } else {
+                self.selected.insert(path_buf.clone());
+            }
+            if self.anchor.is_none() {
+                self.anchor = Some(path_buf.clone());
+            }
+            self.active = Some(path_buf);
+            return;
+        }
+
+        if modifiers.ctrl {
+            if self.selected.contains(&path_buf) {
+                self.selected.remove(&path_buf);
+                if self.active.as_deref() == Some(path) {
+                    self.active = self.first_selected_in_order(ordered);
+                }
+            } else {
+                self.selected.insert(path_buf.clone());
+                self.active = Some(path_buf.clone());
+            }
+            self.anchor = Some(path_buf);
+            return;
+        }
+
+        self.select_only(path);
+    }
+
+    /// Toggle a checkbox without clearing any other selection.
+    pub fn toggle(&mut self, ordered: &[PathBuf], path: &Path) {
+        let path_buf = path.to_path_buf();
+        if self.selected.remove(&path_buf) {
+            if self.active.as_deref() == Some(path) {
+                self.active = self.first_selected_in_order(ordered);
+            }
+        } else {
+            self.selected.insert(path_buf.clone());
+            self.active = Some(path_buf.clone());
+        }
+        self.anchor = Some(path_buf);
+    }
+
+    /// The image that should be shown in the preview/viewer.
+    pub fn primary(&self, ordered: &[PathBuf]) -> Option<PathBuf> {
+        if let Some(active) = &self.active {
+            if self.selected.contains(active) {
+                return Some(active.clone());
+            }
+        }
+        self.first_selected_in_order(ordered)
+    }
+
+    fn first_selected_in_order(&self, ordered: &[PathBuf]) -> Option<PathBuf> {
+        ordered
+            .iter()
+            .find(|path| self.selected.contains(*path))
+            .cloned()
+    }
+}
+
 /// Messages sent from tokio tasks back to the UI thread.
 pub enum WorkerEvent {
     Thumbnail {
@@ -94,6 +284,9 @@ pub enum WorkerEvent {
     ImageFailed {
         path: PathBuf,
         error: String,
+    },
+    AiStarted {
+        path: PathBuf,
     },
     AiDone {
         path: PathBuf,
@@ -114,6 +307,11 @@ pub enum WorkerEvent {
     MetaLoaded {
         path: PathBuf,
         meta: ExistingMetadata,
+    },
+    ModelsLoaded {
+        provider: Provider,
+        endpoint: String,
+        result: Result<Vec<String>, String>,
     },
     ExifToolReady {
         tool: Option<ExifTool>,
@@ -160,6 +358,27 @@ pub fn collect_jpegs(path: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// JPEGs directly inside a folder (no recursion), sorted case-insensitively.
+/// This is what the ACDSee-style folder grid displays.
+pub fn collect_folder_jpegs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_jpeg(path))
+        .collect();
+
+    files.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+    files
+}
+
 /// Clamp a selection step to the queue bounds.
 pub fn stepped_index(selected: Option<usize>, len: usize, delta: isize) -> Option<usize> {
     if len == 0 {
@@ -173,6 +392,7 @@ pub fn stepped_index(selected: Option<usize>, len: usize, delta: isize) -> Optio
 }
 
 /// Selection index after removing `removed` from a queue of `remaining` items.
+#[allow(dead_code)]
 pub fn index_after_removal(
     selected: Option<usize>,
     removed: usize,
@@ -188,6 +408,44 @@ pub fn index_after_removal(
         None => 0,
     };
     Some(index.min(remaining - 1))
+}
+
+/// Return the common value for a batch field, or `<Multiple values>`.
+pub fn aggregate_common<I, S>(values: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return String::new();
+    };
+    let first = first.as_ref().to_string();
+    for value in values {
+        if value.as_ref() != first {
+            return "<Multiple values>".to_string();
+        }
+    }
+    first
+}
+
+/// Append unique keywords, preserving order and enforcing the 50-word limit.
+pub fn append_keywords(existing: &mut Vec<String>, additions: &[String]) {
+    for keyword in additions {
+        if existing.len() >= crate::ai::prompt::KEYWORD_TARGET {
+            break;
+        }
+        let keyword = keyword.trim();
+        if keyword.is_empty() {
+            continue;
+        }
+        if !existing
+            .iter()
+            .any(|current| current.eq_ignore_ascii_case(keyword))
+        {
+            existing.push(keyword.to_string());
+        }
+    }
 }
 
 /// Decode a JPEG downscaled for display, returning the texture image and original size.
@@ -216,8 +474,8 @@ pub fn decode(path: &Path, max_dim: u32) -> anyhow::Result<(egui::ColorImage, (u
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use super::*;
+    use std::collections::HashSet;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -232,6 +490,10 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("jpeg dir");
         let image = image::RgbImage::from_pixel(width, height, image::Rgb([200, 100, 50]));
         image.save(path).expect("write jpeg");
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
     }
 
     #[test]
@@ -271,6 +533,24 @@ mod tests {
             ])
         );
         assert!(found.iter().all(|path| path.is_absolute()));
+    }
+
+    #[test]
+    fn collect_folder_jpegs_is_non_recursive_and_sorted() {
+        let root = temp_dir("folder-only");
+        std::fs::write(root.join("b.JPG"), b"jpeg").unwrap();
+        std::fs::write(root.join("a.jpg"), b"jpeg").unwrap();
+        std::fs::write(root.join("c.png"), b"png").unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested").join("d.jpg"), b"jpeg").unwrap();
+
+        let found = collect_folder_jpegs(&root);
+        let names: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.jpg", "b.JPG"]);
+        assert!(collect_folder_jpegs(&root.join("missing")).is_empty());
     }
 
     #[test]
@@ -344,7 +624,7 @@ mod tests {
 
         item.status = Status::Error;
         assert!(item.is_pending());
-        for status in [Status::Processing, Status::Generated, Status::Saved] {
+        for status in [Status::Queued, Status::Processing, Status::Generated, Status::Saved] {
             item.status = status;
             assert!(!item.is_pending());
         }
@@ -385,5 +665,146 @@ mod tests {
         assert_eq!(index_after_removal(Some(3), 2, 3), Some(2));
         assert_eq!(index_after_removal(None, 1, 3), Some(0));
         assert_eq!(index_after_removal(Some(9), 0, 3), Some(2));
+    }
+
+    #[test]
+    fn plain_click_selects_one_and_sets_focus() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut selection = Selection::default();
+        selection.click(&ordered, Path::new("b.jpg"), SelectModifiers::default());
+        assert_eq!(selection.count(), 1);
+        assert!(selection.contains(Path::new("b.jpg")));
+        assert_eq!(selection.active(), Some(Path::new("b.jpg")));
+        assert_eq!(selection.anchor(), Some(Path::new("b.jpg")));
+        assert_eq!(selection.primary(&ordered).as_deref(), Some(Path::new("b.jpg")));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_without_clearing() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut selection = Selection::default();
+        selection.click(&ordered, Path::new("a.jpg"), SelectModifiers::default());
+        selection.click(
+            &ordered,
+            Path::new("c.jpg"),
+            SelectModifiers { ctrl: true, shift: false },
+        );
+        assert_eq!(selection.count(), 2);
+        assert!(selection.contains(Path::new("a.jpg")));
+        assert!(selection.contains(Path::new("c.jpg")));
+        assert_eq!(selection.active(), Some(Path::new("c.jpg")));
+
+        selection.click(
+            &ordered,
+            Path::new("c.jpg"),
+            SelectModifiers { ctrl: true, shift: false },
+        );
+        assert_eq!(selection.count(), 1);
+        assert!(!selection.contains(Path::new("c.jpg")));
+        assert_eq!(selection.active(), Some(Path::new("a.jpg")));
+    }
+
+    #[test]
+    fn shift_click_selects_contiguous_range_from_anchor() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let mut selection = Selection::default();
+        selection.click(&ordered, Path::new("b.jpg"), SelectModifiers::default());
+        selection.click(
+            &ordered,
+            Path::new("d.jpg"),
+            SelectModifiers { ctrl: false, shift: true },
+        );
+        assert_eq!(selection.count(), 3);
+        assert!(selection.contains(Path::new("b.jpg")));
+        assert!(selection.contains(Path::new("c.jpg")));
+        assert!(selection.contains(Path::new("d.jpg")));
+        assert_eq!(selection.active(), Some(Path::new("d.jpg")));
+        assert_eq!(selection.anchor(), Some(Path::new("b.jpg")));
+    }
+
+    #[test]
+    fn ctrl_shift_click_extends_the_existing_selection() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let mut selection = Selection::default();
+        selection.click(&ordered, Path::new("a.jpg"), SelectModifiers::default());
+        selection.click(
+            &ordered,
+            Path::new("b.jpg"),
+            SelectModifiers { ctrl: false, shift: true },
+        );
+        assert_eq!(selection.count(), 2);
+        selection.click(
+            &ordered,
+            Path::new("d.jpg"),
+            SelectModifiers { ctrl: true, shift: true },
+        );
+        assert_eq!(selection.count(), 4);
+        assert!(selection.contains(Path::new("a.jpg")));
+        assert!(selection.contains(Path::new("d.jpg")));
+    }
+
+    #[test]
+    fn checkbox_toggle_keeps_other_items_selected() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut selection = Selection::default();
+        selection.click(&ordered, Path::new("a.jpg"), SelectModifiers::default());
+        selection.toggle(&ordered, Path::new("c.jpg"));
+        assert_eq!(selection.count(), 2);
+        assert_eq!(selection.active(), Some(Path::new("c.jpg")));
+
+        selection.toggle(&ordered, Path::new("c.jpg"));
+        assert_eq!(selection.count(), 1);
+        assert_eq!(selection.active(), Some(Path::new("a.jpg")));
+    }
+
+    #[test]
+    fn select_all_retain_and_primary_handle_folder_changes() {
+        let ordered = paths(&["a.jpg", "b.jpg", "c.jpg"]);
+        let mut selection = Selection::default();
+        selection.select_all(&ordered);
+        assert_eq!(selection.count(), 3);
+        assert_eq!(selection.active(), Some(Path::new("a.jpg")));
+        assert_eq!(selection.primary(&ordered).as_deref(), Some(Path::new("a.jpg")));
+
+        selection.click(
+            &ordered,
+            Path::new("c.jpg"),
+            SelectModifiers { ctrl: true, shift: false },
+        );
+        selection.retain_existing(&paths(&["b.jpg", "x.jpg"]));
+        assert_eq!(selection.count(), 1);
+        assert!(selection.contains(Path::new("b.jpg")));
+        assert_eq!(selection.active(), Some(Path::new("b.jpg")));
+
+        selection.retain_existing(&paths(&["x.jpg"]));
+        assert!(selection.is_empty());
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn aggregate_common_reports_mixed_values() {
+        assert_eq!(aggregate_common(std::iter::empty::<&str>()), "");
+        assert_eq!(aggregate_common(["Same", "Same"]), "Same");
+        assert_eq!(aggregate_common(["Same", "Different"]), "<Multiple values>");
+        assert_eq!(aggregate_common([""]), "");
+    }
+
+    #[test]
+    fn append_keywords_deduplicates_and_caps() {
+        let mut existing = vec!["sunset".to_string(), "Bay".to_string()];
+        append_keywords(
+            &mut existing,
+            &[
+                "bay".to_string(),
+                "fog".to_string(),
+                "  ".to_string(),
+                "FOG".to_string(),
+            ],
+        );
+        assert_eq!(existing, vec!["sunset", "Bay", "fog"]);
+
+        let mut full: Vec<String> = (0..50).map(|index| format!("kw{index}")).collect();
+        append_keywords(&mut full, &["extra".to_string()]);
+        assert_eq!(full.len(), 50);
     }
 }

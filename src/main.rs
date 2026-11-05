@@ -2,6 +2,7 @@
 
 mod ai;
 mod app;
+mod cache;
 mod config;
 mod metadata;
 mod state;

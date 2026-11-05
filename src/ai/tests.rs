@@ -1,5 +1,6 @@
 use super::*;
-use crate::ai::{anthropic, lmstudio, ollama, openai};
+use crate::ai::{anthropic, lmstudio, models, ollama, openai};
+use crate::config::{Provider, ProviderSettings};
 use base64::Engine as _;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -488,4 +489,153 @@ async fn anthropic_reports_missing_content_and_http_errors() {
     assert!(error.contains("Anthropic returned 429"), "got: {error}");
     assert!(error.contains("rate limited"), "got: {error}");
     server.finish();
+}
+
+// ----------------------------------------------------------- model lists
+
+#[test]
+fn model_list_endpoints_are_provider_specific() {
+    assert_eq!(
+        models::models_endpoint(Provider::Ollama, "http://localhost:11434"),
+        "http://localhost:11434/api/tags"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::Ollama, "http://localhost:11434/api"),
+        "http://localhost:11434/api/tags"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::Ollama, "http://localhost:11434/api/chat"),
+        "http://localhost:11434/api/tags"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::LmStudio, "http://localhost:1234"),
+        "http://localhost:1234/v1/models"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::LmStudio, "http://localhost:1234/v1"),
+        "http://localhost:1234/v1/models"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::LmStudio, "http://localhost:1234/v1/chat/completions"),
+        "http://localhost:1234/v1/models"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::OpenAi, "https://api.openai.com/v1"),
+        "https://api.openai.com/v1/models"
+    );
+    assert_eq!(
+        models::models_endpoint(Provider::Anthropic, "https://api.anthropic.com/v1"),
+        "https://api.anthropic.com/v1/models"
+    );
+}
+
+#[tokio::test]
+async fn ollama_model_list_uses_tags_and_sorts_names() {
+    let server = mock_server(
+        "200 OK",
+        r#"{"models":[{"name":"qwen2-vl:latest"},{"name":"llava:7b"}]}"#,
+    );
+    let settings = ProviderSettings {
+        base_url: format!("{}/api", server.url()),
+        model: String::new(),
+        api_key: String::new(),
+    };
+
+    let names = models::list_models(Provider::Ollama, &settings)
+        .await
+        .expect("ollama models");
+    assert_eq!(names, vec!["llava:7b", "qwen2-vl:latest"]);
+
+    let request = server.finish();
+    assert!(
+        request.starts_with("GET /api/tags HTTP/1.1"),
+        "got: {request}"
+    );
+}
+
+#[tokio::test]
+async fn lmstudio_model_list_uses_v1_models_without_auth() {
+    let server = mock_server(
+        "200 OK",
+        r#"{"data":[{"id":"qwen2-vl-7b-instruct"},{"id":"llava-v1.6"}]}"#,
+    );
+    let settings = ProviderSettings {
+        base_url: server.url().to_string(),
+        model: String::new(),
+        api_key: String::new(),
+    };
+
+    let names = models::list_models(Provider::LmStudio, &settings)
+        .await
+        .expect("lm studio models");
+    assert_eq!(names, vec!["llava-v1.6", "qwen2-vl-7b-instruct"]);
+
+    let request = server.finish();
+    let lower = request.to_ascii_lowercase();
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
+    assert!(!lower.contains("authorization:"), "no auth header expected");
+}
+
+#[tokio::test]
+async fn openai_model_list_sends_bearer_and_parses_ids() {
+    let server = mock_server(
+        "200 OK",
+        r#"{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4o"}]}"#,
+    );
+    let settings = ProviderSettings {
+        base_url: format!("{}/v1", server.url()),
+        model: String::new(),
+        api_key: "sk-test".to_string(),
+    };
+
+    let names = models::list_models(Provider::OpenAi, &settings)
+        .await
+        .expect("openai models");
+    assert_eq!(names, vec!["gpt-4o", "gpt-4o-mini"]);
+
+    let request = server.finish();
+    let lower = request.to_ascii_lowercase();
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
+    assert!(lower.contains("authorization: bearer sk-test"), "got: {lower}");
+}
+
+#[tokio::test]
+async fn anthropic_model_list_sends_key_and_version_headers() {
+    let server = mock_server(
+        "200 OK",
+        r#"{"data":[{"id":"claude-sonnet-4-20250514"}]}"#,
+    );
+    let settings = ProviderSettings {
+        base_url: format!("{}/v1", server.url()),
+        model: String::new(),
+        api_key: "test-key".to_string(),
+    };
+
+    let names = models::list_models(Provider::Anthropic, &settings)
+        .await
+        .expect("anthropic models");
+    assert_eq!(names, vec!["claude-sonnet-4-20250514"]);
+
+    let request = server.finish();
+    let lower = request.to_ascii_lowercase();
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
+    assert!(lower.contains("x-api-key: test-key"), "got: {lower}");
+    assert!(lower.contains("anthropic-version: 2023-06-01"), "got: {lower}");
+}
+
+#[tokio::test]
+async fn cloud_model_lists_require_an_api_key() {
+    let settings = ProviderSettings {
+        base_url: "http://127.0.0.1:9".to_string(),
+        model: String::new(),
+        api_key: String::new(),
+    };
+
+    for provider in [Provider::OpenAi, Provider::Anthropic] {
+        let error = models::list_models(provider, &settings)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("API key"), "got: {error}");
+    }
 }

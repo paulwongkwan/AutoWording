@@ -103,7 +103,7 @@ impl App {
             selection: Selection::default(),
             current_folder: None,
             folder_root: None,
-            folders: FolderTree::default(),
+            folders: FolderTree::system(),
             thumbs: ThumbnailCache::default(),
             preview: None,
             loading_preview: HashSet::new(),
@@ -251,8 +251,8 @@ impl App {
             self.notify(format!("Could not open {}", path.display()), true);
             return;
         };
-        self.folder_root = Some(dir.clone());
-        self.folders.set_root(&dir);
+        self.folder_root = dir.ancestors().last().map(Path::to_path_buf);
+        self.folders.reveal(&dir);
         self.cfg.last_folder = dir.to_string_lossy().to_string();
         self.cfg_dirty = Some(Instant::now());
         self.open_folder(ctx, dir);
@@ -267,14 +267,12 @@ impl App {
             .map(Path::to_path_buf)
     }
 
-    /// Move the browser up one level and make that directory the tree root.
+    /// Move the browser up one level without changing the system tree roots.
     pub fn open_parent_folder(&mut self, ctx: &egui::Context) {
         let Some(parent) = self.parent_folder() else {
-            self.notify("Already at the top of this folder tree", true);
+            self.notify("Already at the drive root", true);
             return;
         };
-        self.folder_root = Some(parent.clone());
-        self.folders.set_root(&parent);
         self.open_folder(ctx, parent);
     }
 
@@ -283,6 +281,7 @@ impl App {
             self.notify(format!("Could not open {}", path.display()), true);
             return;
         };
+        self.folders.reveal(&dir);
         if self.current_folder.as_deref() == Some(dir.as_path()) {
             self.refresh_folder(ctx);
             return;
@@ -319,6 +318,12 @@ impl App {
         self.after_selection_change(ctx);
     }
 
+    /// Refresh the grid and rescan mounted drives without discarding tree expansion.
+    pub fn refresh_browser(&mut self, ctx: &egui::Context) {
+        self.folders.rescan_roots();
+        self.refresh_folder(ctx);
+    }
+
     pub fn add_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         let mut added = Vec::new();
         let mut opened_folder = false;
@@ -346,9 +351,10 @@ impl App {
 
         if self.current_folder.is_none() {
             if let Some(parent) = added[0].parent() {
-                self.current_folder = Some(parent.to_path_buf());
-                self.folder_root = Some(parent.to_path_buf());
-                self.folders.set_root(parent);
+                let parent = parent.to_path_buf();
+                self.folder_root = parent.ancestors().last().map(Path::to_path_buf);
+                self.folders.reveal(&parent);
+                self.current_folder = Some(parent);
             }
         }
 
@@ -553,7 +559,7 @@ impl App {
             UiAction::GenerateSelected => self.generate_selected(ctx),
             UiAction::SelectAll => self.select_all(ctx),
             UiAction::ClearSelection => self.clear_selection(),
-            UiAction::Refresh => self.refresh_folder(ctx),
+            UiAction::Refresh => self.refresh_browser(ctx),
             UiAction::CheckExif => {
                 self.exiftool = None;
                 let preferred = self.cfg.exiftool_path.clone();
@@ -1123,7 +1129,7 @@ impl eframe::App for App {
             self.select_all(ctx);
         }
         if shortcuts.refresh {
-            self.refresh_folder(ctx);
+            self.refresh_browser(ctx);
         }
         if shortcuts.parent {
             self.open_parent_folder(ctx);

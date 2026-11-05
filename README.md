@@ -6,14 +6,14 @@
 | --- | --- |
 | Language | Rust 2021, minimum `rust-version = 1.85` (verified with 1.99.1) |
 | GUI | `eframe` / `egui` 0.28.1, OpenGL (`glow`), Windows 11 light theme, Segoe UI |
-| Workspace | ACDSee Classic dual-mode: **Browser** (folder tree + thumbnail grid + preview) and **Viewer** (single image + filmstrip) |
+| Workspace | ACDSee Classic dual-mode: **Browser** (This PC folder tree + thumbnail grid + preview) and **Viewer** (single image + filmstrip) |
 | Selection | Path-based multi-selection with Ctrl+Click, Shift+Click, Ctrl+Shift+Click, Ctrl+A, and checkbox overlays |
 | AI transport | `reqwest` 0.12 + `tokio` multi-thread runtime, `native-tls` (Windows Schannel) |
 | Batch engine | 1–4 concurrent AI workers, live `Queued`/`Processing`/`Generated`/`Saved`/`Error` badges |
 | Metadata engine | ExifTool command-line executable (external dependency) |
 | Platform | Windows 10/11 (build and runtime are Windows-specific) |
 | Binary | `target\release\autowording.exe` (~21 MB, Windows subsystem, no console window) |
-| Tests | **98** unit/integration tests, all passing as of 2026-11-05 |
+| Tests | **99** unit/integration tests, all passing as of 2026-11-05 |
 | State | Single crate, no workspace, no CI, no installer, no license file |
 
 This README is the operating manual for another LLM or developer. It records the exact prompt, wire formats, tag mappings, selection rules, batch semantics, filesystem contracts, and pitfalls that are easy to regress.
@@ -44,7 +44,7 @@ This README is the operating manual for another LLM or developer. It records the
 
 AutoWording is a batch keywording workspace for microstock photographers. The workflow follows ACDSee Photo Studio's Browser/Viewer model:
 
-1. Open a stock folder. The left tree browses subfolders; the center grid shows that folder's JPEGs.
+1. Browse This PC in the left system folder tree, then open a stock folder. The center grid shows that folder's direct JPEGs.
 2. Select one image (single inspector) or many (batch inspector).
 3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt to a vision model.
 4. Review/edit Title, Editorial status, Caption, and keyword chips. In batch mode, inspect common/mixed values and apply title/caption/keyword changes across the selection.
@@ -59,7 +59,7 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 ## 3. Feature summary
 
 - ACDSee-style menu bar: **File / Edit / View / Tools / Help**, plus **Browser | Viewer** mode toggle.
-- Three-pane Browser: lazy folder browser (276 px) with parent navigation and path display, responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
+- Three-pane Browser: lazy Windows-style system folder browser (276 px) with Quick access, mounted drive roots, parent navigation, and path display; responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
 - Selection: plain click, Ctrl+Click toggle, Shift+Click contiguous range, Ctrl+Shift+Click additive range, Ctrl+A, and per-card checkbox overlays.
 - Visual states: selected accent border, active focus ring, status badges, checkbox checkmarks, hover feedback.
 - Single inspector: editable title/caption/editorial/keywords, live compliance chips, add/remove/normalize keywords.
@@ -67,13 +67,13 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 - Concurrent batch AI: configurable 1–4 workers, per-image live status, partial-failure reporting, retry-failed action.
 - Batch save: selected items with titles written sequentially, progress bar, per-file errors.
 - Viewer mode: large active image, previous/next, filmstrip, error overlay, Escape returns to Browser.
-- Folder browser is lazy/cached, sorts directories, skips dot-directories and common junk folders, and supports **Up** / `Alt+Up` parent navigation.
+- Folder browser is a lazy/cached **This PC** tree of mounted drives and their folders, plus Quick access shortcuts; it auto-expands to the current folder and supports **Up** / `Alt+Up` parent navigation.
 - Four providers: Ollama, LM Studio, OpenAI, Anthropic.
 - Endpoint model discovery: fetch/refresh a model dropdown from Ollama `/api/tags`, LM Studio and OpenAI `/v1/models`, and Anthropic `/v1/models` with provider authentication.
 - ExifTool auto-detection, manual path override, version display, re-check, Unicode-safe argfile execution.
 - Config persistence: `%APPDATA%\AutoWording\config\config.toml`.
 - Keyboard shortcuts: `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+A`, `Ctrl+S`, `Ctrl+Enter`, `F5`, `Alt+Up`, arrows, `Esc`.
-- 98 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags, real ExifTool round-trips, selection math, folder tree, cache lifecycle, config.
+- 99 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags, real ExifTool round-trips, selection math, system folder tree, cache lifecycle, config.
 
 ---
 
@@ -156,12 +156,12 @@ cargo run --release
 
 ### 6.1 Open and browse
 
-1. Launch `autowording.exe`. The last folder from config is reopened automatically if it still exists.
-2. **File → Open Folder…** (`Ctrl+O`) or the folder panel's **Open Folder…** button chooses a root.
-3. Expand folders in the tree. Clicking a folder loads its direct JPEGs into the grid.
+1. Launch `autowording.exe`. The left panel shows **This PC**, mounted drives, and Quick access folders. The last folder from config is reopened and revealed automatically if it still exists.
+2. Expand a drive or folder, or use a Quick access shortcut. Clicking a folder loads its direct JPEGs into the grid.
+3. **File → Open Folder…** (`Ctrl+O`) or the folder panel's **Open…** button jumps directly to any folder.
 4. Use **Up** or `Alt+Up` to browse the parent directory; the current path is shown above the tree.
 5. **Add images…** (`Ctrl+Shift+O`) appends arbitrary JPEGs; dropped folders are scanned recursively.
-6. **F5** refreshes the current folder, thumbnails, metadata cache, and tree children.
+6. **F5** rescans drives, refreshes the current folder, and clears cached tree children while preserving expansion.
 
 ### 6.2 Select
 
@@ -251,13 +251,16 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 ├──────────────────┬─────────────────────────────────────────┬───────────────────┤
 │ FOLDER BROWSER   │  FOLDER HEADER  [n] [selected]  Refresh │ METADATA          │
 │  [Up] [Open…] [Refresh]                                  │  single / batch   │
-│  C:\Photos       │  ┌──────┬──────┬──────┬──────┐         │  Title            │
-│  ▾ C:\Photos     │  │ card │ card │ card │ card │         │  Editorial        │
-│    ▸ 2026_Stock  │  └──────┴──────┴──────┴──────┘         │  Caption          │
-│    ▸ Portraits   │  ACTIVE PREVIEW                         │  Keywords         │
-│  [Add images…]   │  ┌───────────────────────────────┐      │  AI Generator     │
-│                  │  │      large primary image      │      │  [Batch Run AI]   │
-│                  │  └───────────────────────────────┘      │  AI Settings ▸    │
+│  C:\Photos\2026_Stock                                     │  Title            │
+│  Quick access    │  ┌──────┬──────┬──────┬──────┐         │  Editorial        │
+│   Desktop        │  │ card │ card │ card │ card │         │  Caption          │
+│   Pictures       │  └──────┴──────┴──────┴──────┘         │  Keywords         │
+│  This PC         │  ACTIVE PREVIEW                         │  AI Generator     │
+│   ▾ C:\          │  ┌───────────────────────────────┐      │  [Batch Run AI]   │
+│     ▾ Photos     │  │      large primary image      │      │  AI Settings ▸    │
+│       ▸ 2026_Stock│ └───────────────────────────────┘      │                   │
+│   ▸ D:\          │                                        │                   │
+│  [Add images…]   │                                        │                   │
 ├──────────────────┴─────────────────────────────────────────┴───────────────────┤
 │ Status: 24 images loaded | 3 selected          Ollama (Connected: qwen2-vl)     │
 └────────────────────────────────────────────────────────────────────────────────┘
@@ -325,15 +328,17 @@ Shortcuts use `consume_key`, so they do not also reach text fields.
 - Tooltip shows full path, status, and keyword count.
 - Hover does not load metadata; selection does.
 
-### 7.6 Folder browser
+### 7.6 System folder browser
 
-- Root is expanded on open; children load lazily and cache per directory.
-- Directories sorted case-insensitively.
-- Skips names starting with `.`, plus `target`, `node_modules`, `$RECYCLE.BIN`, `System Volume Information`.
+- **Quick access** lists Desktop, Downloads, Documents, and Pictures when those system folders exist.
+- **This PC** lists mounted drive roots (`C:\`, `D:\`, …); drives are lazy and can be expanded in place.
+- Directory children load only when a folder is expanded and are cached per directory.
+- Directories sort case-insensitively; `$RECYCLE.BIN` and `System Volume Information` are omitted.
+- Opening a folder reveals and expands its whole ancestor chain inside the system tree instead of replacing the tree root.
 - Current folder is highlighted and shows its direct-image count.
 - Opening a folder clears selection, preview, and metadata-request cache.
-- Refreshing a folder clears the tree cache while preserving expansion state.
-- **Up** / `Alt+Up` moves to the parent and re-roots the tree there; the full current path is shown below the navigation buttons.
+- **Refresh** / `F5` rescans mounted drives, clears tree caches, and preserves expansion state.
+- **Up** / `Alt+Up` moves to the parent; the full current path is shown below the navigation buttons.
 - The grid always shows only the current folder's direct JPEGs, not images from its subfolders.
 
 ---
@@ -510,7 +515,7 @@ src/ui/mod.rs                  menu bar, mode toggle, status bar, widgets, about
 src/ui/browser.rs              folder panel + multi-select grid + active preview
 src/ui/viewer.rs               large viewer + navigation + filmstrip
 src/ui/metadata_panel.rs       single inspector, batch inspector, AI/EXIF settings
-src/ui/tree.rs                 lazy cached folder tree with expansion tests
+src/ui/tree.rs                 lazy system folder tree: drives, Quick access, reveal, expansion tests
 
 src/ai/mod.rs                  AiRequest, prepare_image, provider dispatch, endpoint, snippet
 src/ai/prompt.rs               exact prompt, tolerant parser, keyword normalizer, validation
@@ -960,7 +965,7 @@ export PATH="$PWD/.tools/gnu-bin:$SELF:$PATH"
 cargo +stable-x86_64-pc-windows-gnu test
 ```
 
-Expected: **98 passed; 0 failed; 0 ignored**.
+Expected: **99 passed; 0 failed; 0 ignored**.
 
 List: `cargo test -- --list`.
 
@@ -976,7 +981,7 @@ List: `cargo test -- --list`.
 | `metadata::tests` | 8 | real ExifTool round-trip, overwrite semantics, 50 keywords, Unicode values, Unicode file names, missing files, explicit/directory detection, argfile formatting |
 | `state::tests` | 19 | extension/folder scans, decode resize/corrupt, item conversion, progress, selection math, Ctrl/Shift/checkbox/toggle/retain, aggregate common/mixed, keyword append |
 | `cache::thumbnails::tests` | 1 | request lifecycle blocks duplicates/failures |
-| `ui::tree::tests` | 2 | sorted children/expansion/depth; refresh preserves expansion and rereads children |
+| `ui::tree::tests` | 3 | sorted children/expansion/depth; refresh preserves expansion and rereads children; reveal expands only the ancestor chain |
 
 ExifTool integration tests skip with `exiftool not available; skipping test` if detection fails. This keeps the suite runnable without ExifTool, but those eight only prove metadata correctness when ExifTool is installed. On this machine they run.
 
@@ -1024,8 +1029,8 @@ Temporary artifacts: `%TEMP%\autowording-tests`, `autowording-state-tests`, `aut
 23. **Unicode keywords pass validation** (`is_alphabetic`), despite the prompt asking for alphabetic characters.
 24. **Editorial toggle does not rewrite the caption.**
 25. **Folder scans are non-recursive for the grid**, recursive for dropped folders/add paths.
-26. **The tree skips dot-directories and common junk dirs**, but not Windows hidden attributes.
-27. **`folder_root` is separate from `current_folder`**: the root is the tree root; the current folder is selected.
+26. **The left tree is rooted at the system, not the opened folder.** Mounted drives and Quick access stay available; opening a folder only reveals its ancestor chain.
+27. **`folder_root` is separate from `current_folder`**: `folder_root` is the opened folder's volume root; the current folder is the selection.
 28. **Refreshing re-selects the first image if selection became empty**, even after Clear.
 29. **`meta_requested` is cleared on folder open/refresh/ExifTool-ready**, causing re-reads.
 30. **The app is not code-signed**; SmartScreen may warn.
@@ -1154,7 +1159,7 @@ exiftool -a -G1 -s "path\to\image.jpg"
 
 Last verified on the development machine (Windows 11, 2026-11-05):
 
-- `cargo +stable-x86_64-pc-windows-gnu test` → **98 passed, 0 failed** (includes real ExifTool round-trips).
+- `cargo +stable-x86_64-pc-windows-gnu test` → **99 passed, 0 failed** (includes real ExifTool round-trips).
 - `cargo +stable-x86_64-pc-windows-gnu build --release` → success, no warnings; `target/release/autowording.exe` ~21 MB.
 - The redesigned release was smoke-launched; the native window `AutoWording` was created and responding.
 - The UI was **not** visually inspected or driven through folder/grid/batch interactions in this pass; selection/tree logic is covered by unit tests, but layout and click behavior remain visually unverified.

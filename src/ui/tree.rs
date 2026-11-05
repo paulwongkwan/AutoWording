@@ -1,5 +1,6 @@
 use crate::app::App;
 use crate::ui::{ghost_button, tiny_button};
+use directories::UserDirs;
 use eframe::egui::{self, ScrollArea};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,30 +14,86 @@ pub struct FolderRow {
     pub has_children: bool,
 }
 
-/// Lazy folder tree: children are read only when a folder is expanded.
+#[derive(Debug, Clone)]
+struct FolderShortcut {
+    name: &'static str,
+    path: PathBuf,
+}
+
+/// Windows-style system folder tree. Mounted drives are the roots; expansion,
+/// directory reads, and quick-access shortcuts are all lazy.
 #[derive(Debug, Default)]
 pub struct FolderTree {
-    root: Option<PathBuf>,
-    expanded: HashSet<PathBuf>,
-    cache: HashMap<PathBuf, Vec<PathBuf>>,
+    roots: Vec<PathBuf>,
+    expanded: HashSet<String>,
+    cache: HashMap<String, Vec<PathBuf>>,
 }
 
 impl FolderTree {
-    pub fn set_root(&mut self, root: &Path) {
-        self.root = Some(root.to_path_buf());
-        self.expanded.clear();
-        self.cache.clear();
-        self.expanded.insert(root.to_path_buf());
+    pub fn system() -> Self {
+        let mut tree = Self::default();
+        tree.roots = system_roots();
+        tree.sort_roots();
+        tree
     }
 
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    /// Rescan mounted drives while retaining any still-valid custom roots,
+    /// such as an opened UNC share.
+    pub fn rescan_roots(&mut self) {
+        let mut roots = system_roots();
+        for existing in &self.roots {
+            if existing.is_dir()
+                && !roots
+                    .iter()
+                    .any(|root| path_key(root) == path_key(existing))
+            {
+                roots.push(existing.clone());
+            }
+        }
+        self.roots = roots;
+        self.sort_roots();
+        self.cache.clear();
+    }
+
+    /// Expand every folder from the nearest existing root down to `folder`.
+    /// If the folder belongs to no known root, add its volume root.
+    pub fn reveal(&mut self, folder: &Path) {
+        let existing_root = self
+            .roots
+            .iter()
+            .find(|root| path_is_within(folder, root))
+            .cloned();
+
+        let anchor = if let Some(root) = existing_root {
+            root
+        } else {
+            let Some(volume) = volume_root(folder) else {
+                return;
+            };
+            let volume = volume.to_path_buf();
+            if !self
+                .roots
+                .iter()
+                .any(|root| path_key(root) == path_key(&volume))
+            {
+                self.roots.push(volume.clone());
+                self.sort_roots();
+            }
+            volume
+        };
+
+        for ancestor in folder.ancestors() {
+            self.expanded.insert(path_key(ancestor));
+            if path_key(ancestor) == path_key(&anchor) {
+                break;
+            }
+        }
     }
 
     pub fn toggle(&mut self, path: &Path) {
-        let path = path.to_path_buf();
-        if !self.expanded.remove(&path) {
-            self.expanded.insert(path);
+        let key = path_key(path);
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
         }
     }
 
@@ -45,26 +102,27 @@ impl FolderTree {
     }
 
     pub fn rows(&mut self) -> Vec<FolderRow> {
-        let Some(root) = self.root.clone() else {
-            return Vec::new();
-        };
+        let roots = self.roots.clone();
         let mut rows = Vec::new();
-        self.push_rows(&root, 0, &mut rows);
+        for root in roots {
+            self.push_rows(&root, 0, &mut rows);
+        }
         rows
     }
 
     fn push_rows(&mut self, dir: &Path, depth: usize, rows: &mut Vec<FolderRow>) {
         let children = self.children(dir);
-        let has_children = !children.is_empty();
+        let key = path_key(dir);
+        let expanded = self.expanded.contains(&key);
         rows.push(FolderRow {
             path: dir.to_path_buf(),
             name: display_name(dir),
             depth,
-            expanded: self.expanded.contains(dir),
-            has_children,
+            expanded,
+            has_children: !children.is_empty(),
         });
 
-        if self.expanded.contains(dir) {
+        if expanded {
             for child in children {
                 self.push_rows(&child, depth + 1, rows);
             }
@@ -72,7 +130,8 @@ impl FolderTree {
     }
 
     fn children(&mut self, dir: &Path) -> Vec<PathBuf> {
-        if let Some(children) = self.cache.get(dir) {
+        let key = path_key(dir);
+        if let Some(children) = self.cache.get(&key) {
             return children.clone();
         }
 
@@ -86,14 +145,8 @@ impl FolderTree {
                 path.file_name()
                     .map(|name| {
                         let name = name.to_string_lossy();
-                        !name.starts_with('.')
-                            && !matches!(
-                                name.as_ref(),
-                                "target"
-                                    | "node_modules"
-                                    | "$RECYCLE.BIN"
-                                    | "System Volume Information"
-                            )
+                        !name.eq_ignore_ascii_case("$RECYCLE.BIN")
+                            && !name.eq_ignore_ascii_case("System Volume Information")
                     })
                     .unwrap_or(false)
             })
@@ -104,9 +157,88 @@ impl FolderTree {
                 .map(|name| name.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default()
         });
-        self.cache.insert(dir.to_path_buf(), children.clone());
+        self.cache.insert(key, children.clone());
         children
     }
+
+    fn sort_roots(&mut self) {
+        self.roots.sort_by_key(|path| path_key(path));
+        self.roots
+            .dedup_by(|left, right| path_key(left) == path_key(right));
+    }
+
+    #[cfg(test)]
+    fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.roots = roots;
+        self.sort_roots();
+        self.cache.clear();
+        self.expanded.clear();
+        for root in &self.roots {
+            self.expanded.insert(path_key(root));
+        }
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+fn volume_root(path: &Path) -> Option<&Path> {
+    path.ancestors().last()
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    let path = path_key(path);
+    let root = path_key(root);
+    let root = root.trim_end_matches(['\\', '/']);
+    path == root || path.starts_with(&format!("{root}\\")) || path.starts_with(&format!("{root}/"))
+}
+
+fn system_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if root.is_dir() {
+            roots.push(root);
+        }
+    }
+
+    if roots.is_empty() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Some(root) = volume_root(&cwd) {
+                roots.push(root.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
+fn quick_access() -> Vec<FolderShortcut> {
+    let Some(user_dirs) = UserDirs::new() else {
+        return Vec::new();
+    };
+
+    let candidates = [
+        ("Desktop", user_dirs.desktop_dir()),
+        ("Downloads", user_dirs.download_dir()),
+        ("Documents", user_dirs.document_dir()),
+        ("Pictures", user_dirs.picture_dir()),
+    ];
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let path = path?;
+            if !path.is_dir() || !seen.insert(path_key(path)) {
+                return None;
+            }
+            Some(FolderShortcut {
+                name,
+                path: path.to_path_buf(),
+            })
+        })
+        .collect()
 }
 
 fn display_name(path: &Path) -> String {
@@ -133,7 +265,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             app.open_folder_dialog(ctx);
         }
         if ui.add(ghost_button("Refresh")).clicked() {
-            app.refresh_folder(ctx);
+            app.refresh_browser(ctx);
         }
     });
 
@@ -153,67 +285,99 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
 
     ui.add_space(6.0);
 
-    if app.folders.root().is_none() {
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "No folder open. Choose a stock folder to populate the grid.",
-                )
-                .size(11.0)
-                .color(crate::theme::TEXT_MUTED),
-            )
-            .wrap(),
-        );
-    } else {
-        let rows = app.folders.rows();
-        let available = (ui.available_height() - 76.0).max(120.0);
-        ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .max_height(available)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for row in rows {
-                    ui.horizontal(|ui| {
-                        ui.add_space((row.depth as f32) * 13.0);
-                        if row.has_children {
-                            let glyph = if row.expanded { "▾" } else { "▸" };
-                            if ui
-                                .add(tiny_button(glyph))
-                                .on_hover_text(if row.expanded {
-                                    "Collapse folder"
-                                } else {
-                                    "Expand folder"
-                                })
-                                .clicked()
-                            {
-                                app.folders.toggle(&row.path);
-                            }
-                        } else {
-                            ui.add_space(13.0);
-                        }
+    let shortcuts = quick_access();
+    let rows = app.folders.rows();
+    let available = (ui.available_height() - 42.0).max(150.0);
+    ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .max_height(available)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
 
-                        let current = app.current_folder.as_deref() == Some(row.path.as_path());
+            if !shortcuts.is_empty() {
+                ui.add(egui::Label::new(
+                    egui::RichText::new("Quick access")
+                        .size(10.0)
+                        .strong()
+                        .color(crate::theme::TEXT_MUTED),
+                ));
+                ui.add_space(2.0);
+                for shortcut in shortcuts {
+                    let current = app.current_folder.as_deref() == Some(shortcut.path.as_path());
+                    if ui
+                        .selectable_label(
+                            current,
+                            egui::RichText::new(shortcut.name).size(11.5),
+                        )
+                        .on_hover_text(shortcut.path.display().to_string())
+                        .clicked()
+                    {
+                        app.open_folder(ctx, shortcut.path);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+            }
+
+            ui.add(egui::Label::new(
+                egui::RichText::new("This PC")
+                    .size(10.0)
+                    .strong()
+                    .color(crate::theme::TEXT_MUTED),
+            ));
+            ui.add_space(2.0);
+
+            if rows.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("No mounted drives were found.")
+                            .size(11.0)
+                            .color(crate::theme::TEXT_MUTED),
+                    )
+                    .wrap(),
+                );
+                return;
+            }
+
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.add_space((row.depth as f32) * 13.0);
+                    if row.has_children {
+                        let glyph = if row.expanded { "▾" } else { "▸" };
                         if ui
-                            .selectable_label(
-                                current,
-                                egui::RichText::new(&row.name).size(12.0),
-                            )
+                            .add(tiny_button(glyph))
+                            .on_hover_text(if row.expanded {
+                                "Collapse folder"
+                            } else {
+                                "Expand folder"
+                            })
                             .clicked()
                         {
-                            app.open_folder(ctx, row.path.clone());
+                            app.folders.toggle(&row.path);
                         }
+                    } else {
+                        ui.add_space(13.0);
+                    }
 
-                        if current {
-                            crate::ui::count_chip(
-                                ui,
-                                &format!("{}", app.folder_images.len()),
-                                true,
-                            );
-                        }
-                    });
-                }
-            });
-    }
+                    let current = app.current_folder.as_deref() == Some(row.path.as_path());
+                    if ui
+                        .selectable_label(current, egui::RichText::new(&row.name).size(12.0))
+                        .clicked()
+                    {
+                        app.open_folder(ctx, row.path.clone());
+                    }
+
+                    if current {
+                        crate::ui::count_chip(
+                            ui,
+                            &format!("{}", app.folder_images.len()),
+                            true,
+                        );
+                    }
+                });
+            }
+        });
 
     ui.add_space(6.0);
     if ui.add(ghost_button("Add images…")).clicked() {
@@ -243,25 +407,26 @@ mod tests {
         std::fs::create_dir_all(root.join(".hidden")).unwrap();
 
         let mut tree = FolderTree::default();
-        tree.set_root(&root);
+        tree.set_roots(vec![root.clone()]);
         let rows = tree.rows();
-        assert_eq!(rows.len(), 3, "root + two visible children");
+        assert_eq!(rows.len(), 4, "root + three visible children");
         assert_eq!(rows[0].name, root.file_name().unwrap().to_string_lossy());
-        assert_eq!(rows[1].name, "a_folder");
-        assert_eq!(rows[2].name, "z_folder");
+        assert_eq!(rows[1].name, ".hidden");
+        assert_eq!(rows[2].name, "a_folder");
+        assert_eq!(rows[3].name, "z_folder");
         assert!(rows[0].expanded);
-        assert!(rows[1].has_children);
-        assert!(!rows[2].has_children);
+        assert!(rows[2].has_children);
+        assert!(!rows[3].has_children);
 
         let a_folder = root.join("a_folder");
         tree.toggle(&a_folder);
         let rows = tree.rows();
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[2].name, "nested");
-        assert_eq!(rows[2].depth, 2);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3].name, "nested");
+        assert_eq!(rows[3].depth, 2);
 
         tree.toggle(&a_folder);
-        assert_eq!(tree.rows().len(), 3);
+        assert_eq!(tree.rows().len(), 4);
     }
 
     #[test]
@@ -270,7 +435,7 @@ mod tests {
         let child = root.join("first");
         std::fs::create_dir_all(&child).unwrap();
         let mut tree = FolderTree::default();
-        tree.set_root(&root);
+        tree.set_roots(vec![root]);
         tree.toggle(&child);
         assert_eq!(tree.rows().len(), 2);
 
@@ -279,5 +444,25 @@ mod tests {
         let rows = tree.rows();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2].name, "second");
+    }
+
+    #[test]
+    fn reveal_expands_every_ancestor_to_the_folder() {
+        let root = temp_dir("reveal");
+        let child = root.join("child");
+        let grandchild = child.join("grandchild");
+        std::fs::create_dir_all(&grandchild).unwrap();
+
+        let mut tree = FolderTree::default();
+        tree.set_roots(vec![root.clone()]);
+        tree.reveal(&grandchild);
+
+        let rows = tree.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].path, root);
+        assert_eq!(rows[1].path, child);
+        assert_eq!(rows[2].path, grandchild);
+        assert!(rows.iter().all(|row| row.expanded));
+        assert_eq!(tree.roots.len(), 1, "no extra volume root was added");
     }
 }

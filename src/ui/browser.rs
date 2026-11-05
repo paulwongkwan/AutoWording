@@ -6,7 +6,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Layout, Margin, Rect, RichText, ScrollArea, Sense,
     Stroke, Vec2,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     left_panel(app, ctx);
@@ -75,7 +75,7 @@ fn welcome(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Browse folders on the left, select one or many images, then run AI and write the metadata to EXIF/IPTC/XMP.",
+                        "Browse This PC or a folder on the left, select one or many images, then run AI and write the metadata to EXIF/IPTC/XMP.",
                     )
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
@@ -109,9 +109,8 @@ fn welcome(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
 fn folder_header(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     let folder_label = app
         .current_folder
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().to_string())
+        .as_deref()
+        .map(folder_name)
         .unwrap_or_else(|| "Images".to_string());
 
     ui.horizontal(|ui| {
@@ -123,7 +122,7 @@ fn folder_header(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.add(ghost_button("Refresh")).clicked() {
-                app.refresh_folder(ctx);
+                app.refresh_browser(ctx);
             }
             if ui.add(ghost_button("Clear")).clicked() {
                 app.clear_selection();
@@ -463,6 +462,13 @@ fn preview(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {

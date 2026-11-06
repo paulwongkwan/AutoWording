@@ -1,10 +1,12 @@
 use crate::ai::prompt;
 use crate::app::App;
 use crate::config::{
-    Provider, CAPTION_CHARS_MAX, CAPTION_CHARS_MIN, KEYWORD_TARGET_MAX, KEYWORD_TARGET_MIN,
-    TITLE_WORDS_MAX, TITLE_WORDS_MIN,
+    Marketplace, Provider, CAPTION_CHARS_MAX, CAPTION_CHARS_MIN, KEYWORD_TARGET_MAX,
+    KEYWORD_TARGET_MIN, TITLE_WORDS_MAX, TITLE_WORDS_MIN,
 };
-use crate::state::{aggregate_common, append_keywords_with_target, ImageItem, Status};
+use crate::state::{
+    aggregate_common, append_keywords_with_target, FieldLocks, ImageItem, Status,
+};
 use crate::theme;
 use crate::ui::{
     count_chip, ghost_button, primary_button, section_title, segmented_button, status_pill,
@@ -95,6 +97,7 @@ fn single(
     let mut caption = item.caption.clone();
     let mut keywords = item.keywords.clone();
     let mut editorial = item.editorial;
+    let mut locks = item.locks;
     let mut generate = false;
     let mut save = false;
     let keyword_target = app.cfg.keyword_target();
@@ -294,6 +297,13 @@ fn single(
         );
     }
 
+    gap(ui, compact, 5.0, 4.0);
+    if lock_controls(ui, &mut locks, compact) {
+        if let Some(entry) = app.items.get_mut(path) {
+            entry.locks = locks;
+        }
+    }
+
     gap(ui, compact, 8.0, 6.0);
     let busy = app.batch.is_some();
     let action_height = if compact { 28.0 } else { 30.0 };
@@ -463,6 +473,19 @@ fn batch(
                     });
             }
         });
+    }
+
+    let mut locks = FieldLocks {
+        title: items.iter().all(|item| item.locks.title),
+        caption: items.iter().all(|item| item.locks.caption),
+        keywords: items.iter().all(|item| item.locks.keywords),
+    };
+    if lock_controls(ui, &mut locks, compact) {
+        for path in paths {
+            if let Some(item) = app.items.get_mut(path) {
+                item.locks = locks;
+            }
+        }
     }
 
     let busy = app.batch.is_some();
@@ -848,21 +871,47 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
             );
 
             gap(ui, compact, 4.0, 3.0);
-            let workers = ui.add(
-                egui::Slider::new(&mut app.cfg.concurrency, 1..=4)
-                    .text("Parallel AI workers"),
-            );
-            if workers.changed() {
+            ui.add(egui::Label::new(
+                RichText::new("Marketplace profile")
+                    .size(10.0)
+                    .color(theme::text_muted()),
+            ));
+            let mut marketplace = app.cfg.marketplace;
+            egui::ComboBox::from_id_source("marketplace_profile")
+                .width(ui.available_width())
+                .selected_text(marketplace.label())
+                .show_ui(ui, |ui| {
+                    for profile in Marketplace::ALL {
+                        if ui
+                            .selectable_label(marketplace == profile, profile.label())
+                            .clicked()
+                        {
+                            marketplace = profile;
+                        }
+                    }
+                });
+            if marketplace != app.cfg.marketplace {
+                app.cfg.apply_marketplace(marketplace);
                 app.cfg_dirty = Some(Instant::now());
             }
+            let keyword_cap = KEYWORD_TARGET_MAX.min(app.cfg.marketplace.keyword_max());
+            let title_cap = TITLE_WORDS_MAX.min(app.cfg.marketplace.title_words_max());
+            let caption_cap = CAPTION_CHARS_MAX.min(app.cfg.marketplace.caption_chars_max());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Caps: {keyword_cap} keywords · {title_cap} title words · {caption_cap} caption characters"
+                    ))
+                    .size(9.5)
+                    .color(theme::text_muted()),
+                )
+                .wrap(),
+            );
 
             let mut keyword_target = app.cfg.keyword_target();
             let target = ui.add(
-                egui::Slider::new(
-                    &mut keyword_target,
-                    KEYWORD_TARGET_MIN..=KEYWORD_TARGET_MAX,
-                )
-                .text("Keywords per image"),
+                egui::Slider::new(&mut keyword_target, KEYWORD_TARGET_MIN..=keyword_cap)
+                    .text("Keywords per image"),
             );
             if target.changed() {
                 app.cfg.keyword_target = keyword_target;
@@ -876,7 +925,7 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                 &mut title_min,
                 &mut title_max,
                 TITLE_WORDS_MIN,
-                TITLE_WORDS_MAX,
+                title_cap,
             ) {
                 app.cfg.title_min_words = title_min;
                 app.cfg.title_max_words = title_max;
@@ -890,7 +939,7 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                 &mut caption_min,
                 &mut caption_max,
                 CAPTION_CHARS_MIN,
-                CAPTION_CHARS_MAX,
+                caption_cap,
             ) {
                 app.cfg.caption_min_chars = caption_min;
                 app.cfg.caption_max_chars = caption_max;
@@ -991,6 +1040,25 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                             app.check_exiftool(ctx, "");
                         }
                     });
+
+                    let mut backup = app.cfg.backup_originals;
+                    if ui
+                        .checkbox(&mut backup, "Back up originals before writing")
+                        .on_hover_text("Copies each JPEG to .autowording-backups before its first write.")
+                        .changed()
+                    {
+                        app.cfg.backup_originals = backup;
+                        app.cfg_dirty = Some(Instant::now());
+                    }
+                    let mut verify = app.cfg.verify_writes;
+                    if ui
+                        .checkbox(&mut verify, "Verify saved metadata")
+                        .on_hover_text("Reads the file back after writing and fails the save on a mismatch.")
+                        .changed()
+                    {
+                        app.cfg.verify_writes = verify;
+                        app.cfg_dirty = Some(Instant::now());
+                    }
                 });
 
             gap(ui, compact, 6.0, 4.0);
@@ -1003,6 +1071,29 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                 .wrap(),
             );
         });
+}
+
+fn lock_controls(ui: &mut egui::Ui, locks: &mut FieldLocks, compact: bool) -> bool {
+    let label = if locks.all() {
+        "AI locks · all protected"
+    } else {
+        "AI locks"
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(label)
+                    .size(if compact { 9.5 } else { 10.0 })
+                    .color(theme::text_muted()),
+            ),
+        )
+        .on_hover_text("Locked fields are preserved when AI results arrive.");
+        let title = ui.checkbox(&mut locks.title, "Title");
+        let caption = ui.checkbox(&mut locks.caption, "Caption");
+        let keywords = ui.checkbox(&mut locks.keywords, "Keywords");
+        title.changed() || caption.changed() || keywords.changed()
+    })
+    .inner
 }
 
 fn range_editor(

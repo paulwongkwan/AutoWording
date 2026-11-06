@@ -306,6 +306,73 @@ async fn generate_retries_out_of_range_title_and_caption() {
     assert!(requests.contains("Keep the keywords unchanged"));
 }
 
+#[tokio::test]
+async fn generate_retries_an_unparsable_reply() {
+    let bad = r#"{"choices":[{"message":{"content":"I am sorry, I cannot describe this image."}}]}"#;
+    let good = r#"{"choices":[{"message":{"content":"Title: Golden Gate Sunrise\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", bad), ("200 OK", good)]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("generate should retry a reply without labels");
+
+    assert_eq!(result.title, "Golden Gate Sunrise");
+    assert_eq!(result.keywords, vec!["apple", "banana", "cherry"]);
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert!(requests.contains("Previous reply:"));
+    assert!(requests.contains("I am sorry, I cannot describe this image."));
+}
+
+#[tokio::test]
+async fn generate_gives_up_after_three_parse_retries() {
+    let bad = r#"{"choices":[{"message":{"content":"Here is a description without any labels."}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", bad); MAX_ATTEMPTS]);
+
+    let error = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect_err("every reply is missing the labels");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("failed after 4 attempts"), "got: {message}");
+    assert!(message.contains("missing Title, Caption"), "got: {message}");
+    let requests = server.finish();
+    assert_eq!(
+        requests.matches("POST /v1/chat/completions").count(),
+        MAX_ATTEMPTS
+    );
+}
+
 // ----------------------------------------------------------------- Ollama
 
 #[tokio::test]

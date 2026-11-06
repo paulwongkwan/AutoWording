@@ -15,13 +15,17 @@ use crate::config::{
     ProviderSettings,
 };
 use crate::metadata::ExistingMetadata;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use std::path::Path;
 use std::time::Duration;
 
 const MAX_IMAGE_DIM: u32 = 1600;
 const JPEG_QUALITY: u8 = 85;
+/// One initial request plus three retries before an image is marked failed.
+const MAX_ATTEMPTS: usize = 4;
+/// Extra wait per attempt, so a busy local server is not hammered.
+const RETRY_DELAY: Duration = Duration::from_millis(300);
 
 pub struct AiRequest {
     pub provider: Provider,
@@ -99,13 +103,49 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         .build()
         .context("Could not build the HTTP client")?;
 
-    let raw = chat(&client, &req, &system, &user).await?;
-    let mut result = prompt::parse_response_allow_empty_keywords(&raw, keyword_target).with_context(|| {
-        format!(
-            "{} returned a reply that could not be parsed",
-            req.provider.label()
-        )
-    })?;
+    // A malformed reply (missing labels) or a transport error is retried a few
+    // times before the image is marked failed. After a parse failure the model
+    // is shown its own reply and asked for the four labelled lines again.
+    let mut parsed: Option<prompt::GeneratedMetadata> = None;
+    let mut last_reply: Option<String> = None;
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let attempt_user = match &last_reply {
+            Some(raw) => prompt::unparsable_reply_prompt(&user, raw),
+            None => user.clone(),
+        };
+
+        match chat(&client, &req, &system, &attempt_user).await {
+            Ok(raw) => match prompt::parse_response_allow_empty_keywords(&raw, keyword_target) {
+                Ok(result) => {
+                    parsed = Some(result);
+                    break;
+                }
+                Err(error) => {
+                    last_reply = Some(raw);
+                    last_error = Some(error);
+                }
+            },
+            Err(error) => {
+                last_reply = None;
+                last_error = Some(error);
+            }
+        }
+
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(RETRY_DELAY * attempt as u32).await;
+        }
+    }
+
+    let Some(mut result) = parsed else {
+        return Err(last_error
+            .unwrap_or_else(|| anyhow!("{} returned an empty reply", req.provider.label()))
+            .context(format!(
+                "{} failed after {MAX_ATTEMPTS} attempts",
+                req.provider.label()
+            )));
+    };
 
     // One corrective pass covers all recoverable misses. A valid retry replaces
     // out-of-range title/caption values; keywords are always appended so the

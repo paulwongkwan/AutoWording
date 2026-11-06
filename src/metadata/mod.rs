@@ -5,6 +5,7 @@ pub use tags::ExistingMetadata;
 pub use writer::Metadata;
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,6 +105,95 @@ impl ExifTool {
 
         Ok(())
     }
+}
+
+pub const BACKUP_DIR: &str = ".autowording-backups";
+
+/// Copy the JPEG into a sibling backup directory. Repeated saves keep the
+/// first backup, so the pre-AutoWording file remains recoverable.
+pub fn backup_original(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("Could not find the parent folder of {}", path.display()))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("Could not determine the file name of {}", path.display()))?;
+    let backup_dir = parent.join(BACKUP_DIR);
+    std::fs::create_dir_all(&backup_dir)
+        .with_context(|| format!("Could not create {}", backup_dir.display()))?;
+    let backup = backup_dir.join(name);
+    if !backup.exists() {
+        std::fs::copy(path, &backup).with_context(|| {
+            format!(
+                "Could not back up {} to {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    }
+    Ok(backup)
+}
+
+/// Verify the values ExifTool reads back after a write. Caption verification
+/// accounts for the writer's title fallback when the caption is empty.
+pub fn verify_written(md: &Metadata, read: &ExistingMetadata) -> Result<()> {
+    let title = md.title.trim();
+    let read_title = read
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| "Saved title could not be read back")?;
+    if read_title != title {
+        bail!(
+            "Saved title did not verify: expected {:?}, found {:?}",
+            title,
+            read_title
+        );
+    }
+
+    let expected_caption = if md.caption.trim().is_empty() {
+        title
+    } else {
+        md.caption.trim()
+    };
+    let read_caption = read
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| "Saved caption could not be read back")?;
+    if read_caption != expected_caption {
+        bail!(
+            "Saved caption did not verify: expected {:?}, found {:?}",
+            expected_caption,
+            read_caption
+        );
+    }
+
+    let expected_keywords: HashSet<String> = md
+        .keywords
+        .iter()
+        .map(|keyword| keyword.trim().to_lowercase())
+        .filter(|keyword| !keyword.is_empty())
+        .collect();
+    let read_keywords: HashSet<String> = read
+        .keywords
+        .iter()
+        .map(|keyword| keyword.trim().to_lowercase())
+        .filter(|keyword| !keyword.is_empty())
+        .collect();
+    // The writer leaves existing keywords in place when the list is empty, so
+    // there is nothing to compare in that case.
+    if !expected_keywords.is_empty() && read_keywords != expected_keywords {
+        bail!(
+            "Saved keywords did not verify: expected {} keyword(s), found {}",
+            expected_keywords.len(),
+            read_keywords.len()
+        );
+    }
+
+    Ok(())
 }
 
 fn command_for(program: &Path) -> Command {
@@ -210,6 +300,7 @@ mod tests {
 
         tool.write(&path, &metadata).expect("metadata write");
         let read = tool.read(&path).expect("metadata read");
+        verify_written(&metadata, &read).expect("metadata verification");
 
         assert_eq!(read.title.as_deref(), Some("Golden Gate Sunrise"));
         assert_eq!(
@@ -237,6 +328,41 @@ mod tests {
             eprintln!("exiftool not available; skipping test");
         }
         tool
+    }
+
+    #[test]
+    fn backup_original_keeps_the_first_copy() {
+        let path = temp_jpeg("backup", 16, 16);
+        let original = std::fs::read(&path).expect("read original");
+        let backup = backup_original(&path).expect("first backup");
+        assert_eq!(std::fs::read(&backup).expect("read backup"), original);
+
+        std::fs::write(&path, b"changed after backup").expect("change original");
+        let backup_again = backup_original(&path).expect("second backup");
+        assert_eq!(backup_again, backup);
+        assert_eq!(std::fs::read(&backup_again).expect("read backup again"), original);
+    }
+
+    #[test]
+    fn verify_written_accepts_caption_fallback_and_case_insensitive_keywords() {
+        let metadata = Metadata {
+            title: "Golden Gate Sunrise".into(),
+            caption: String::new(),
+            keywords: vec!["bridge".into(), "Sunrise".into()],
+        };
+        let read = ExistingMetadata {
+            title: Some("Golden Gate Sunrise".into()),
+            caption: Some("Golden Gate Sunrise".into()),
+            keywords: vec!["bridge".into(), "sunrise".into()],
+            ..ExistingMetadata::default()
+        };
+        verify_written(&metadata, &read).expect("fallback caption and keyword case should verify");
+
+        let bad = ExistingMetadata {
+            title: Some("Different Title".into()),
+            ..read
+        };
+        assert!(verify_written(&metadata, &bad).is_err());
     }
 
     #[test]

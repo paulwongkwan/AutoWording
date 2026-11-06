@@ -351,6 +351,22 @@ fn status_bar(app: &mut App, ctx: &egui::Context) {
                                     .color(theme::accent_text()),
                                 ));
                             });
+                        if !batch.saving {
+                            if app.batch_paused {
+                                if ui.small_button("Resume").clicked() {
+                                    app.set_batch_paused(false);
+                                }
+                            } else if ui
+                                .small_button("Pause")
+                                .on_hover_text("Pause after the current image")
+                                .clicked()
+                            {
+                                app.set_batch_paused(true);
+                            }
+                            if ui.small_button("Cancel").clicked() {
+                                app.cancel_batch();
+                            }
+                        }
                     }
                     ui.add(egui::Label::new(
                         RichText::new(exiftool).size(10.5).color(theme::text_muted()),

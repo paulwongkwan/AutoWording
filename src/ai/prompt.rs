@@ -207,6 +207,18 @@ pub fn retry_prompt(
     prompt
 }
 
+/// Prompt used when a reply could not be parsed at all. It repeats the original
+/// request, restates the four labelled lines, and shows the model its previous
+/// reply so a formatting mistake can be corrected instead of failing the image.
+pub fn unparsable_reply_prompt(base: &str, previous_raw: &str) -> String {
+    let mut prompt = String::from(base);
+    prompt.push_str(
+        "\n\nYour previous reply could not be read because it was missing one or more of the four labelled fields. Reply again with only these lines, each label followed by a colon:\nTitle: ...\nEditorial Status: ...\nCaption: ...\nKeywords: ...\n\nPrevious reply:\n",
+    );
+    prompt.push_str(&super::snippet(previous_raw));
+    prompt
+}
+
 fn existing_metadata_block(existing: &ExistingMetadata) -> String {
     let mut lines = Vec::new();
     if let Some(gps) = existing
@@ -962,6 +974,20 @@ mod tests {
         assert!(prompt.contains("must have 50–180 characters"));
         assert!(prompt.contains("Rewrite the title"));
         assert!(prompt.contains("Rewrite the caption"));
+    }
+
+    #[test]
+    fn unparsable_reply_prompt_restates_labels_and_previous_reply() {
+        let prompt = unparsable_reply_prompt(
+            "Analyze the attached image and return the four labelled fields exactly as specified.",
+            "Sure! Here is a photo of a bridge.\nIt looks nice.",
+        );
+        assert!(prompt.starts_with("Analyze the attached image"));
+        assert!(prompt.contains("Title: ..."));
+        assert!(prompt.contains("Editorial Status: ..."));
+        assert!(prompt.contains("Caption: ..."));
+        assert!(prompt.contains("Keywords: ..."));
+        assert!(prompt.contains("Sure! Here is a photo of a bridge. It looks nice."));
     }
 
     #[test]

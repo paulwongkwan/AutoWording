@@ -3,7 +3,8 @@ use crate::cache::ThumbnailCache;
 use crate::config::{Config, LayoutDensity, Provider, ProviderSettings, ThemePreference};
 use crate::metadata::{ExistingMetadata, ExifTool, Metadata};
 use crate::state::{
-    self, BatchProgress, ImageItem, SelectModifiers, Selection, Status, WorkerEvent,
+    self, apply_generated_metadata, BatchProgress, ImageItem, SelectModifiers, Selection, SortMode,
+    Status, StatusFilter, WorkerEvent,
 };
 use crate::theme;
 use crate::ui::{self, tree::FolderTree, UiAction};
@@ -11,10 +12,9 @@ use chrono::Datelike;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
 const THUMB_MAX: u32 = 160;
 const PREVIEW_MAX: u32 = 2200;
@@ -51,6 +51,10 @@ pub struct App {
     pub mode: WorkspaceMode,
     pub items: HashMap<PathBuf, ImageItem>,
     pub folder_images: Vec<PathBuf>,
+    pub browser_query: String,
+    pub status_filter: StatusFilter,
+    pub sort_mode: SortMode,
+    pub sort_descending: bool,
     pub selection: Selection,
     pub current_folder: Option<PathBuf>,
     pub folder_root: Option<PathBuf>,
@@ -62,6 +66,9 @@ pub struct App {
     pub decode_failed: HashSet<PathBuf>,
     pub context: String,
     pub batch: Option<BatchProgress>,
+    pub batch_paused: bool,
+    batch_cancel: Arc<AtomicBool>,
+    batch_pause: Arc<AtomicBool>,
     pub exiftool: Option<ExifTool>,
     pub exiftool_status: String,
     pub exiftool_checking: bool,
@@ -119,6 +126,10 @@ impl App {
             mode: WorkspaceMode::Browser,
             items: HashMap::new(),
             folder_images: Vec::new(),
+            browser_query: String::new(),
+            status_filter: StatusFilter::default(),
+            sort_mode: SortMode::default(),
+            sort_descending: false,
             selection: Selection::default(),
             current_folder: None,
             folder_root: None,
@@ -130,6 +141,9 @@ impl App {
             decode_failed: HashSet::new(),
             context: String::new(),
             batch: None,
+            batch_paused: false,
+            batch_cancel: Arc::new(AtomicBool::new(false)),
+            batch_pause: Arc::new(AtomicBool::new(false)),
             exiftool: None,
             exiftool_status: "Checking ExifTool…".to_string(),
             exiftool_checking: false,
@@ -439,6 +453,66 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------- browser view
+
+    /// True when the grid is showing a narrowed subset of the folder.
+    pub fn filters_active(&self) -> bool {
+        !self.browser_query.trim().is_empty() || self.status_filter != StatusFilter::All
+    }
+
+    /// Folder images that pass the text/status filters, in the chosen sort order.
+    pub fn visible_images(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .folder_images
+            .iter()
+            .filter(|path| {
+                self.items
+                    .get(*path)
+                    .map(|item| state::image_matches(item, &self.browser_query, self.status_filter))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        state::sort_image_paths(&mut paths, &self.items, self.sort_mode, self.sort_descending);
+        paths
+    }
+
+    pub fn clear_browser_filter(&mut self) {
+        self.browser_query.clear();
+        self.status_filter = StatusFilter::All;
+    }
+
+    /// Select every image in the current filtered view.
+    pub fn select_visible(&mut self, ctx: &egui::Context) {
+        let paths = self.visible_images();
+        if paths.is_empty() {
+            self.notify("No images match the current filter", true);
+            return;
+        }
+        self.selection.select_all(&paths);
+        self.after_selection_change(ctx);
+    }
+
+    /// Narrow the grid to one status and select everything that remains.
+    pub fn select_by_status(&mut self, ctx: &egui::Context, status: StatusFilter) {
+        self.status_filter = status;
+        let paths = self.visible_images();
+        if paths.is_empty() {
+            self.notify(format!("No images with status {}", status.label()), true);
+            return;
+        }
+        self.selection.select_all(&paths);
+        self.after_selection_change(ctx);
+        self.notify(
+            format!(
+                "Selected {} image(s) matching “{}”",
+                paths.len(),
+                status.label()
+            ),
+            false,
+        );
+    }
+
     // ------------------------------------------------------------- selection
 
     pub fn select_single(&mut self, ctx: &egui::Context, path: &Path) {
@@ -447,7 +521,8 @@ impl App {
     }
 
     pub fn toggle_selection(&mut self, ctx: &egui::Context, path: &Path) {
-        self.selection.toggle(&self.folder_images, path);
+        let visible = self.visible_images();
+        self.selection.toggle(&visible, path);
         self.after_selection_change(ctx);
     }
 
@@ -457,13 +532,18 @@ impl App {
         path: &Path,
         modifiers: SelectModifiers,
     ) {
-        self.selection
-            .click(&self.folder_images, path, modifiers);
+        let visible = self.visible_images();
+        self.selection.click(&visible, path, modifiers);
         self.after_selection_change(ctx);
     }
 
+    /// Select all: the current filtered view, not hidden images.
     pub fn select_all(&mut self, ctx: &egui::Context) {
-        self.selection.select_all(&self.folder_images);
+        let visible = self.visible_images();
+        if visible.is_empty() {
+            return;
+        }
+        self.selection.select_all(&visible);
         self.after_selection_change(ctx);
     }
 
@@ -472,17 +552,18 @@ impl App {
     }
 
     pub fn step_active(&mut self, ctx: &egui::Context, delta: isize) {
+        let visible = self.visible_images();
         let Some(active) = self.active_path() else {
-            if let Some(first) = self.folder_images.first().cloned() {
+            if let Some(first) = visible.first().cloned() {
                 self.select_single(ctx, &first);
             }
             return;
         };
-        let index = self.folder_images.iter().position(|path| path == &active);
-        let Some(next) = state::stepped_index(index, self.folder_images.len(), delta) else {
+        let index = visible.iter().position(|path| path == &active);
+        let Some(next) = state::stepped_index(index, visible.len(), delta) else {
             return;
         };
-        let path = self.folder_images[next].clone();
+        let path = visible[next].clone();
         self.select_single(ctx, &path);
     }
 
@@ -686,6 +767,11 @@ impl App {
             done: 0,
             saving: false,
         });
+        self.batch_paused = false;
+        self.batch_cancel.store(false, Ordering::Relaxed);
+        self.batch_pause.store(false, Ordering::Relaxed);
+        let cancel = self.batch_cancel.clone();
+        let pause = self.batch_pause.clone();
 
         let global_prompt = self.cfg.global_prompt.clone();
         let context =
@@ -695,92 +781,87 @@ impl App {
         let keyword_target = self.cfg.keyword_target();
         let title_range = self.cfg.title_word_range();
         let caption_range = self.cfg.caption_char_range();
-        let concurrency = self.cfg.concurrency.clamp(1, 4);
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
 
         self.rt.spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(concurrency));
-            let mut tasks: JoinSet<(PathBuf, Result<crate::ai::GeneratedMetadata, String>)> =
-                JoinSet::new();
-
-            for (path, existing) in jobs {
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("worker semaphore is open");
-                let tx = tx.clone();
-                let ctx = ctx2.clone();
-                let settings = settings.clone();
-                let global_prompt = global_prompt.clone();
-                let context = context.clone();
-                let date = date.clone();
-                let keyword_target = keyword_target;
-                let title_range = title_range;
-                let caption_range = caption_range;
-
-                tasks.spawn(async move {
-                    let _ = tx.send(WorkerEvent::AiStarted { path: path.clone() });
-                    ctx.request_repaint();
-
-                    let prepare_path = path.clone();
-                    let prepared = tokio::task::spawn_blocking(move || {
-                        ai::prepare_image(&prepare_path)
-                    })
-                    .await;
-
-                    let request = match prepared {
-                        Ok(Ok(image_base64)) => Ok(AiRequest {
-                            provider,
-                            settings,
-                            image_base64,
-                            context,
-                            existing,
-                            global_prompt,
-                            date,
-                            keyword_target,
-                            title_range,
-                            caption_range,
-                        }),
-                        Ok(Err(err)) => Err(format!("{err:#}")),
-                        Err(err) => Err(format!("Image preparation failed: {err}")),
-                    };
-
-                    let result = match request {
-                        Ok(request) => ai::generate(request)
-                            .await
-                            .map_err(|err| format!("{err:#}")),
-                        Err(err) => Err(err),
-                    };
-
-                    drop(permit);
-                    (path, result)
-                });
-            }
-
             let mut ok = 0usize;
             let mut failed = 0usize;
-            while let Some(joined) = tasks.join_next().await {
-                match joined {
-                    Ok((path, result)) => {
-                        if result.is_ok() {
-                            ok += 1;
-                        } else {
-                            failed += 1;
-                        }
-                        let _ = tx.send(WorkerEvent::AiDone { path, result });
-                        ctx2.request_repaint();
-                    }
-                    Err(err) => {
-                        failed += 1;
-                        eprintln!("AI worker failed: {err}");
-                    }
+
+            for (path, existing) in jobs {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
                 }
+                while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = tx.send(WorkerEvent::AiStarted { path: path.clone() });
+                ctx2.request_repaint();
+
+                let prepare_path = path.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    ai::prepare_image(&prepare_path)
+                })
+                .await;
+
+                let request = match prepared {
+                    Ok(Ok(image_base64)) => Ok(AiRequest {
+                        provider,
+                        settings: settings.clone(),
+                        image_base64,
+                        context: context.clone(),
+                        existing,
+                        global_prompt: global_prompt.clone(),
+                        date: date.clone(),
+                        keyword_target,
+                        title_range,
+                        caption_range,
+                    }),
+                    Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(err) => Err(format!("Image preparation failed: {err}")),
+                };
+
+                let result = match request {
+                    Ok(request) => ai::generate(request)
+                        .await
+                        .map_err(|err| format!("{err:#}")),
+                    Err(err) => Err(err),
+                };
+
+                if result.is_ok() {
+                    ok += 1;
+                } else {
+                    failed += 1;
+                }
+                let _ = tx.send(WorkerEvent::AiDone { path, result });
+                ctx2.request_repaint();
             }
+
             let _ = tx.send(WorkerEvent::BatchFinished { ok, failed });
             ctx2.request_repaint();
         });
+    }
+
+    pub fn set_batch_paused(&mut self, paused: bool) {
+        if self.batch.is_none() {
+            self.batch_paused = false;
+            return;
+        }
+        self.batch_paused = paused;
+        self.batch_pause.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn cancel_batch(&mut self) {
+        if self.batch.is_none() {
+            return;
+        }
+        self.batch_cancel.store(true, Ordering::Relaxed);
+        self.batch_pause.store(false, Ordering::Relaxed);
+        self.batch_paused = false;
+        self.notify("Cancelling after the current image…", false);
     }
 
     pub fn retry_failed(&mut self, ctx: &egui::Context) {
@@ -846,6 +927,8 @@ impl App {
             saving: true,
         });
 
+        let backup_originals = self.cfg.backup_originals;
+        let verify_writes = self.cfg.verify_writes;
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.rt.spawn(async move {
@@ -855,7 +938,15 @@ impl App {
                 let tool = tool.clone();
                 let task_path = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    tool.write(&task_path, &metadata)
+                    if backup_originals {
+                        crate::metadata::backup_original(&task_path)?;
+                    }
+                    tool.write(&task_path, &metadata)?;
+                    if verify_writes {
+                        let read = tool.read(&task_path)?;
+                        crate::metadata::verify_written(&metadata, &read)?;
+                    }
+                    Ok::<(), anyhow::Error>(())
                 })
                 .await
                 .map_err(|err| format!("Write task failed: {err}"))
@@ -979,11 +1070,7 @@ impl App {
                     if let Some(item) = self.items.get_mut(&path) {
                         match result {
                             Ok(generated) => {
-                                // AI results replace the editable title, caption and keywords.
-                                item.title = generated.title;
-                                item.caption = generated.caption;
-                                item.keywords = generated.keywords;
-                                item.editorial = generated.editorial;
+                                apply_generated_metadata(item, generated);
                                 item.status = Status::Generated;
                                 item.dirty = true;
                                 item.message = None;
@@ -1011,6 +1098,12 @@ impl App {
                 WorkerEvent::BatchFinished { ok, failed } => {
                     let generated = std::mem::take(&mut self.auto_save_paths);
                     self.batch = None;
+                    self.batch_paused = false;
+                    for item in self.items.values_mut() {
+                        if item.status == Status::Queued {
+                            item.status = Status::Pending;
+                        }
+                    }
                     let summary = if failed == 0 {
                         format!("AI finished for {ok} image(s)")
                     } else {

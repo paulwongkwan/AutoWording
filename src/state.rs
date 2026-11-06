@@ -2,8 +2,9 @@ use crate::ai::prompt::GeneratedMetadata;
 use crate::config::Provider;
 use crate::metadata::{ExistingMetadata, ExifTool, Metadata};
 use eframe::egui;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -27,6 +28,125 @@ impl Status {
             Status::Error => "Failed",
         }
     }
+
+    fn sort_rank(self) -> u8 {
+        match self {
+            Status::Pending => 0,
+            Status::Queued => 1,
+            Status::Processing => 2,
+            Status::Error => 3,
+            Status::Generated => 4,
+            Status::Saved => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    Pending,
+    Queued,
+    Processing,
+    Generated,
+    Saved,
+    Failed,
+    Modified,
+}
+
+impl StatusFilter {
+    pub const ALL: [StatusFilter; 8] = [
+        StatusFilter::All,
+        StatusFilter::Pending,
+        StatusFilter::Queued,
+        StatusFilter::Processing,
+        StatusFilter::Generated,
+        StatusFilter::Saved,
+        StatusFilter::Failed,
+        StatusFilter::Modified,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "All statuses",
+            StatusFilter::Pending => "Pending",
+            StatusFilter::Queued => "Queued",
+            StatusFilter::Processing => "Processing",
+            StatusFilter::Generated => "Generated",
+            StatusFilter::Saved => "Saved",
+            StatusFilter::Failed => "Failed",
+            StatusFilter::Modified => "Modified",
+        }
+    }
+
+    pub fn matches(self, item: &ImageItem) -> bool {
+        match self {
+            StatusFilter::All => true,
+            StatusFilter::Pending => item.status == Status::Pending,
+            StatusFilter::Queued => item.status == Status::Queued,
+            StatusFilter::Processing => item.status == Status::Processing,
+            StatusFilter::Generated => item.status == Status::Generated,
+            StatusFilter::Saved => item.status == Status::Saved,
+            StatusFilter::Failed => item.status == Status::Error,
+            StatusFilter::Modified => {
+                item.dirty && matches!(item.status, Status::Generated | Status::Saved)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Status,
+    Keywords,
+    Modified,
+}
+
+impl SortMode {
+    pub const ALL: [SortMode; 4] = [
+        SortMode::Name,
+        SortMode::Status,
+        SortMode::Keywords,
+        SortMode::Modified,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "Name",
+            SortMode::Status => "Status",
+            SortMode::Keywords => "Keywords",
+            SortMode::Modified => "Modified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldLocks {
+    pub title: bool,
+    pub caption: bool,
+    pub keywords: bool,
+}
+
+impl FieldLocks {
+    pub fn all(self) -> bool {
+        self.title && self.caption && self.keywords
+    }
+}
+
+/// Merge a generated result into an item while preserving locked fields.
+pub fn apply_generated_metadata(item: &mut ImageItem, generated: GeneratedMetadata) {
+    if !item.locks.title {
+        item.title = generated.title;
+    }
+    if !item.locks.caption {
+        item.caption = generated.caption;
+        item.editorial = generated.editorial;
+    }
+    if !item.locks.keywords {
+        item.keywords = generated.keywords;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +158,7 @@ pub struct ImageItem {
     pub keywords: Vec<String>,
     pub editorial: bool,
     pub dirty: bool,
+    pub locks: FieldLocks,
     pub message: Option<String>,
     pub dims: Option<(u32, u32)>,
     pub gps: Option<String>,
@@ -56,6 +177,7 @@ impl ImageItem {
             keywords: Vec::new(),
             editorial: false,
             dirty: false,
+            locks: FieldLocks::default(),
             message: None,
             dims: None,
             gps: None,
@@ -87,6 +209,78 @@ impl ImageItem {
     #[allow(dead_code)]
     pub fn is_pending(&self) -> bool {
         matches!(self.status, Status::Pending | Status::Error)
+    }
+}
+
+/// Match the browser's text and status filters. The query is trimmed and
+/// matched case-insensitively against filename, title, caption and keywords.
+pub fn image_matches(item: &ImageItem, query: &str, status: StatusFilter) -> bool {
+    if !status.matches(item) {
+        return false;
+    }
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    item.file_name().to_lowercase().contains(&query)
+        || item.title.to_lowercase().contains(&query)
+        || item.caption.to_lowercase().contains(&query)
+        || item
+            .keywords
+            .iter()
+            .any(|keyword| keyword.to_lowercase().contains(&query))
+}
+
+fn modified_time(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn file_name_key(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Sort a filtered browser list in place. The name key is always the stable
+/// tie-breaker so the direction toggle cannot reorder equal values randomly.
+pub fn sort_image_paths(
+    paths: &mut [PathBuf],
+    items: &HashMap<PathBuf, ImageItem>,
+    mode: SortMode,
+    descending: bool,
+) {
+    match mode {
+        SortMode::Name => paths.sort_by_key(|path| file_name_key(path)),
+        SortMode::Status => paths.sort_by(|a, b| {
+            let a_key = items
+                .get(a)
+                .map(|item| (item.status.sort_rank(), item.dirty))
+                .unwrap_or((u8::MAX, false));
+            let b_key = items
+                .get(b)
+                .map(|item| (item.status.sort_rank(), item.dirty))
+                .unwrap_or((u8::MAX, false));
+            a_key
+                .cmp(&b_key)
+                .then_with(|| file_name_key(a).cmp(&file_name_key(b)))
+        }),
+        SortMode::Keywords => paths.sort_by(|a, b| {
+            let a_count = items.get(a).map(|item| item.keywords.len()).unwrap_or(0);
+            let b_count = items.get(b).map(|item| item.keywords.len()).unwrap_or(0);
+            a_count
+                .cmp(&b_count)
+                .then_with(|| file_name_key(a).cmp(&file_name_key(b)))
+        }),
+        SortMode::Modified => paths.sort_by(|a, b| {
+            modified_time(a)
+                .cmp(&modified_time(b))
+                .then_with(|| file_name_key(a).cmp(&file_name_key(b)))
+        }),
+    }
+    if descending {
+        paths.reverse();
     }
 }
 
@@ -641,6 +835,100 @@ mod tests {
         std::fs::write(&path, b"not an image").unwrap();
         assert!(decode(&path, 500).is_err());
         assert!(decode(&root.join("missing.jpg"), 500).is_err());
+    }
+
+    #[test]
+    fn browser_filters_match_text_and_status() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Golden Gate.jpg"));
+        item.title = "Sunrise over the bay".into();
+        item.caption = "Fog drifts under the bridge.".into();
+        item.keywords = vec!["bridge".into(), "sunrise".into()];
+
+        assert!(image_matches(&item, "golden", StatusFilter::Pending));
+        assert!(image_matches(&item, "BRIDGE", StatusFilter::Pending));
+        assert!(image_matches(&item, "fog", StatusFilter::Pending));
+        assert!(!image_matches(&item, "not-present", StatusFilter::Pending));
+
+        item.status = Status::Error;
+        assert!(image_matches(&item, "", StatusFilter::Failed));
+        assert!(!image_matches(&item, "", StatusFilter::Pending));
+
+        item.status = Status::Saved;
+        item.dirty = true;
+        assert!(image_matches(&item, "", StatusFilter::Modified));
+        assert!(
+            image_matches(&item, "", StatusFilter::Saved),
+            "a modified image is still in the Saved status filter"
+        );
+    }
+
+    #[test]
+    fn browser_sort_orders_names_statuses_and_keyword_counts() {
+        let ordered = paths(&["b.jpg", "a.jpg", "c.jpg"]);
+        let mut items = HashMap::new();
+        for path in &ordered {
+            items.insert(path.clone(), ImageItem::new(path.clone()));
+        }
+        items.get_mut(Path::new("a.jpg")).unwrap().status = Status::Saved;
+        items.get_mut(Path::new("b.jpg")).unwrap().status = Status::Error;
+        items.get_mut(Path::new("c.jpg")).unwrap().status = Status::Generated;
+        items.get_mut(Path::new("a.jpg")).unwrap().keywords = vec!["one".into()];
+        items.get_mut(Path::new("c.jpg")).unwrap().keywords =
+            vec!["one".into(), "two".into()];
+
+        let mut sorted = ordered.clone();
+        sort_image_paths(&mut sorted, &items, SortMode::Name, false);
+        assert_eq!(sorted, paths(&["a.jpg", "b.jpg", "c.jpg"]));
+
+        sort_image_paths(&mut sorted, &items, SortMode::Status, false);
+        assert_eq!(sorted, paths(&["b.jpg", "c.jpg", "a.jpg"]));
+
+        sort_image_paths(&mut sorted, &items, SortMode::Keywords, true);
+        assert_eq!(sorted, paths(&["c.jpg", "a.jpg", "b.jpg"]));
+    }
+
+    #[test]
+    fn field_locks_preserve_existing_values_during_ai_merge() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Locked.jpg"));
+        item.title = "Manual Title".into();
+        item.caption = "Manual caption that should stay put.".into();
+        item.keywords = vec!["manual".into()];
+        item.editorial = true;
+        item.locks = FieldLocks {
+            title: true,
+            caption: true,
+            keywords: true,
+        };
+
+        apply_generated_metadata(
+            &mut item,
+            GeneratedMetadata {
+                title: "Generated Title".into(),
+                caption: "Generated caption.".into(),
+                keywords: vec!["generated".into()],
+                editorial: false,
+            },
+        );
+
+        assert_eq!(item.title, "Manual Title");
+        assert_eq!(item.caption, "Manual caption that should stay put.");
+        assert_eq!(item.keywords, vec!["manual"]);
+        assert!(item.editorial);
+
+        item.locks = FieldLocks::default();
+        apply_generated_metadata(
+            &mut item,
+            GeneratedMetadata {
+                title: "Generated Title".into(),
+                caption: "Generated caption.".into(),
+                keywords: vec!["generated".into()],
+                editorial: false,
+            },
+        );
+        assert_eq!(item.title, "Generated Title");
+        assert_eq!(item.caption, "Generated caption.");
+        assert_eq!(item.keywords, vec!["generated"]);
+        assert!(!item.editorial);
     }
 
     #[test]

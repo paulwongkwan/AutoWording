@@ -1,6 +1,6 @@
 # AutoWording
 
-**A native Windows 11 ACDSee-style desktop application that uses a vision LLM to generate microstock metadata (Title, Caption, 50 keywords) for one image or a multi-selection, then writes it directly into JPEG EXIF / IPTC / XMP tags.**
+**A native Windows 11 ACDSee-style desktop application that uses a vision LLM to generate microstock metadata (Title, Caption, adjustable title-word and caption-character ranges, and an adjustable keyword target defaulting to 50) for one image or a multi-selection, then writes it directly into JPEG EXIF / IPTC / XMP tags.**
 
 | Item | Value |
 | --- | --- |
@@ -13,7 +13,7 @@
 | Metadata engine | ExifTool command-line executable (external dependency) |
 | Platform | Windows 10/11 (build and runtime are Windows-specific) |
 | Binary | `target\release\autowording.exe` (~21 MB, Windows subsystem, no console window) |
-| Tests | **106** unit/integration tests, all passing as of 2026-11-06 |
+| Tests | **117** unit/integration tests, all passing as of 2026-11-06 |
 | State | Single crate, no workspace, no CI, no installer, no license file |
 
 This README is the operating manual for another LLM or developer. It records the exact prompt, wire formats, tag mappings, selection rules, batch semantics, filesystem contracts, and pitfalls that are easy to regress.
@@ -28,14 +28,14 @@ This README is the operating manual for another LLM or developer. It records the
 4. **Every ExifTool argument goes through a UTF-8 argfile.** Windows `argv` code-page conversion mangles `Café` to `Cafe`. Do not "simplify" `ExifTool::run` back to direct tag/path arguments.
 5. **Saving overwrites the original JPEG.** `-overwrite_original` is always used. There are no `_original` backups and no undo.
 6. **The prompt and tag mapping are product requirements.** The exact system prompt is in §11.3; tests assert substrings and parsed outputs. Do not reword casually.
-7. **The advisory validation does not block saving.** Title word count, caption length, and 50-keyword count only produce warning labels.
+7. **The advisory validation does not block saving.** Title-word and caption-character range checks and the configured keyword target only produce warning labels.
 8. **Selection is path-based.** `Selection` stores `HashSet<PathBuf>` plus `active` and `anchor`. Do not replace it with grid indices; statuses must survive folder reloads and reordering.
 9. **The grid shows the current folder's direct JPEGs**, plus any explicitly added files, sorted case-insensitively. Folder scanning is non-recursive; adding a dropped folder is recursive.
 10. **Metadata loading never clobbers generated/edited content.** `MetaLoaded` fills only an empty item whose status is `Pending`.
 11. **Only one batch runs at a time.** Generation and saving share `App::batch`; all batch buttons are disabled while it is `Some`.
 12. **AI batches may run concurrently, saves are sequential.** `Config::concurrency` is clamped to `1..=4`. Statuses go `Queued → Processing` as each worker starts.
 13. **Saving requires a non-empty title.** Selected items without a title are skipped and counted in a toast.
-14. **Config auto-saves; metadata does not.** Provider/prompt/ExifTool/folder/theme/density/concurrency settings persist after a 500 ms debounce. Image metadata is written only on Save.
+14. **AI generation auto-saves metadata.** After an AI batch finishes, every successful result is written through ExifTool; the app still supports explicit **Save** after manual edits. Provider/prompt/ExifTool/folder/theme/density/keyword-target/concurrency settings persist after a 500 ms debounce.
 15. **API keys are plaintext** in `config.toml`. Never commit, print, or log that file.
 
 ---
@@ -46,9 +46,9 @@ AutoWording is a batch keywording workspace for microstock photographers. The wo
 
 1. Browse This PC in the left system folder tree, then open a stock folder. The center grid shows that folder's direct JPEGs.
 2. Select one image (single inspector) or many (batch inspector).
-3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt and the image's existing metadata (title, caption, keywords, GPS location, capture date) and session context.
-4. Review/edit Title, Editorial status, Caption, and keyword chips. In batch mode, inspect common/mixed values and apply title/caption/keyword changes across the selection.
-5. Save one or many files through ExifTool into EXIF, IPTC, and XMP simultaneously.
+3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt and the image's existing metadata (title, caption, keywords, GPS location, capture date) and session context. The configured title range, caption range, and keyword target are embedded in the prompt.
+4. Successful AI results are written to the JPEG automatically through ExifTool (title, caption, keywords into EXIF/IPTC/XMP). Review/edit Title, Editorial status, Caption, and keyword chips. In batch mode, inspect common/mixed values and apply title/caption/keyword changes across the selection.
+5. After manual edits, use **Save** to write the updated metadata. Successful generation results are already on disk.
 6. Thumbnails show `Pending`, `In queue`, `Processing`, `Generated`, `Saved`, `Failed`, or `Modified` badges.
 7. Switch to Viewer for a large single-image view with previous/next navigation and a filmstrip.
 
@@ -59,25 +59,26 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 ## 3. Feature summary
 
 - ACDSee-style menu bar: **File / Edit / View / Theme / Tools / Help**, plus **Browser | Viewer** mode toggle.
-- Three-pane Browser: lazy Windows-style system folder browser (276 px) with Quick access, mounted drive roots, parent navigation, and path display; responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
+- Three-pane Browser: lazy Windows-style system folder browser (276 px) with Quick access, mounted drive roots, clickable breadcrumb navigation, and a compact refresh control; responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
 - Selection: plain click, Ctrl+Click toggle, Shift+Click contiguous range, Ctrl+Shift+Click additive range, Ctrl+A, and per-card checkbox overlays.
 - Visual states: selected accent border, active focus ring, status badges, checkbox checkmarks, hover feedback.
 - Appearance: **Follow Windows**, **Light**, or **Dark** from the Theme menu. The choice persists in config; System mode re-checks the Windows app theme when the window regains focus.
 - Density: **Comfortable / Compact** in the top bar. Compact uses 126×146 cards, a taller grid area, and tighter metadata spacing and field heights. The choice persists in config.
-- Browser selection summary: selected count, total keyword tags, coverage against the 50-keyword-per-image target, and the number/percentage of selected images with keywords. Coverage waits for selected metadata reads, showing loading, ExifTool-waiting, or unavailable states, and flags unreadable images.
+- Browser selection summary: selected count, total keyword tags, coverage against the configured keyword target, and the number/percentage of selected images with keywords. Coverage waits for selected metadata reads, showing loading, ExifTool-waiting, or unavailable states, and flags unreadable images.
 - Single inspector: editable title/caption/editorial/keywords, live compliance chips, add/remove/normalize keywords.
 - Batch inspector: selection count, common/mixed fields (`<Multiple values>`), keyword cloud with occurrence counts, batch title/caption overwrite, keyword append/replace.
 - Concurrent batch AI: configurable 1–4 workers, per-image live status, partial-failure reporting, retry-failed action.
 - AI context: requests include the loaded title, caption, keywords, GPS location, capture date, and session context; generated title, caption, and keywords replace the existing editable values.
+- Output limits in AI Settings: keyword target **1–50**, title **1–20 words**, caption **10–1000 characters**. Title and caption are min–max ranges. A reply outside either range or short on keywords triggers one corrective request. A valid retry replaces an out-of-range title/caption; keywords are merged so the first result is kept and only new unique terms are appended.
 - Batch save: selected items with titles written sequentially, progress bar, per-file errors.
 - Viewer mode: large active image, previous/next, filmstrip, error overlay, Escape returns to Browser.
-- Folder browser is a lazy/cached **This PC** tree of mounted drives and their folders, plus Quick access shortcuts; it auto-expands to the current folder and supports **Up** / `Alt+Up` parent navigation.
+- Folder browser is a lazy/cached **This PC** tree of mounted drives and their folders, plus Quick access shortcuts; it auto-expands to the current folder and supports clickable breadcrumbs and `Alt+Up` parent navigation.
 - Four providers: Ollama, LM Studio, OpenAI, Anthropic.
 - Endpoint model discovery: fetch/refresh a model dropdown from Ollama `/api/tags`, LM Studio and OpenAI `/v1/models`, and Anthropic `/v1/models` with provider authentication.
 - ExifTool auto-detection, manual path override, version display, re-check, Unicode-safe argfile execution.
-- Config persistence: `%APPDATA%\AutoWording\config\config.toml`, including appearance and density preferences.
+- Config persistence: `%APPDATA%\AutoWording\config\config.toml`, including appearance, density, title/caption ranges, and keyword-target preferences.
 - Keyboard shortcuts: `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+A`, `Ctrl+S`, `Ctrl+Enter`, `F5`, `Alt+Up`, arrows, `Esc`.
-- 106 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags including GPS/date, real ExifTool round-trips, selection math, system folder tree, cache lifecycle, config, Windows theme detection, palette application, density preferences, and selection coverage math.
+- 117 tests: prompt/parser, range-aware prompt and validation, target-aware normalization, singular/plural de-duplication, title/caption and keyword retry, all providers and model-list endpoints via mock HTTP, metadata tags including GPS/date, real ExifTool round-trips, selection math, system folder tree and breadcrumbs, cache lifecycle, config, Windows theme detection, palette application, density preferences, and selection coverage math.
 
 ---
 
@@ -162,8 +163,8 @@ cargo run --release
 
 1. Launch `autowording.exe`. The left panel shows **This PC**, mounted drives, and Quick access folders. The last folder from config is reopened and revealed automatically if it still exists.
 2. Expand a drive or folder, or use a Quick access shortcut. Clicking a folder loads its direct JPEGs into the grid.
-3. **File → Open Folder…** (`Ctrl+O`) or the folder panel's **Open…** button jumps directly to any folder.
-4. Use **Up** or `Alt+Up` to browse the parent directory; the current path is shown above the tree.
+3. **File → Open Folder…** (`Ctrl+O`) jumps directly to any folder.
+4. Click a breadcrumb above the tree or press `Alt+Up` to browse a parent directory.
 5. **Add images…** (`Ctrl+Shift+O`) appends arbitrary JPEGs; dropped folders are scanned recursively.
 6. **F5** rescans drives, refreshes the current folder, and clears cached tree children while preserving expansion.
 
@@ -186,13 +187,13 @@ The **active** image is the primary focus, shown in the center preview/Viewer an
 With exactly one selected image, the right panel shows:
 
 - File name, status badge, dimensions.
-- Title field + 3–5 word chip.
+- Title field + configured word-range chip.
 - Commercial/Editorial toggle.
-- Caption field + 50–180 character chip.
+- Caption field + configured character-range chip.
 - Keyword chips (click `×` to remove), count chip, **Normalize**.
 - Keyword add field (Enter or **Add**).
 - Advisory validation bullets.
-- **Generate** (`Ctrl+Enter`) and **Save to file** (`Ctrl+S`).
+- **Generate** (`Ctrl+Enter`, saves the successful result automatically) and **Save to file** (`Ctrl+S`) for manual edits.
 - **Clear fields** clears the three metadata fields locally.
 
 Editing a `Generated` or `Saved` image sets `dirty` and changes the badge to **Modified**. Editing a `Pending`/`Error` image leaves the status but makes it saveable once a title exists.
@@ -209,20 +210,22 @@ With 2+ images selected, the inspector shows:
   - Title field + **Apply title to all** (overwrites every selected title).
   - Caption field + **Apply caption to all**.
   - Keywords field + **Append keywords** (dedupe, cap 50) or **Replace keywords**.
-- **Batch Run AI (N)**: processes all selected images, including saved ones.
+- **Batch Run AI (N)**: processes all selected images, including saved ones; successful results are saved automatically when the batch finishes.
 - **Save Selected to EXIF (N)**: writes all selected images with non-empty titles.
 - **Retry failed (K)**: reprocesses selected `Error` items.
 - Status summary and batch progress bar.
 
 Batch fields are not a live merged editor; they are explicit apply operations. A blank title/caption cannot be applied. Keywords use the same normalizer as the AI parser (alphabetic words, dedupe, max 50).
 
-### 6.5 Save
+### 6.5 Save and auto-save
 
+- AI generation auto-saves every successful result after the AI batch completes. The write is sequential through ExifTool and uses `-overwrite_original`.
+- If ExifTool is unavailable, generation still completes, but the result stays `Generated` and the app reports that it was not saved.
 - Single: **Save to file** writes the active image.
 - Batch: **Save Selected to EXIF** writes every selected image with a non-empty title.
 - Items without a title are skipped; the toast reports the skipped count.
 - Success sets `Saved` and clears `dirty`; failure keeps the previous status and shows `Save failed: …`.
-- Metadata is never auto-saved. Closing the app with unsaved edits loses them.
+- Manual edits made after generation are not auto-saved; use Save before closing.
 
 ### 6.6 Viewer
 
@@ -254,8 +257,8 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 │ File  Edit  View  Theme  Tools  Help                   [Browser | Viewer]      │
 ├──────────────────┬─────────────────────────────────────────┬───────────────────┤
 │ FOLDER BROWSER   │  FOLDER HEADER  [n] [selected]  Refresh │ METADATA          │
-│  [Up] [Open…] [Refresh]                                  │  single / batch   │
-│  C:\Photos\2026_Stock                                     │  Title            │
+│  Refresh                                                 │  single / batch   │
+│  C:\ › Photos › 2026_Stock                                │  Title            │
 │  Quick access    │  ┌──────┬──────┬──────┬──────┐         │  Editorial        │
 │   Desktop        │  │ card │ card │ card │ card │         │  Caption          │
 │   Pictures       │  └──────┴──────┴──────┴──────┘         │  Keywords         │
@@ -264,7 +267,7 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 │     ▾ Photos     │  │      large primary image      │      │  AI Settings ▸    │
 │       ▸ 2026_Stock│ └───────────────────────────────┘      │                   │
 │   ▸ D:\          │                                        │                   │
-│  [Add images…]   │                                        │                   │
+│                  │                                        │                   │
 ├──────────────────┴─────────────────────────────────────────┴───────────────────┤
 │ Status: 24 images loaded | 3 selected          Ollama (Connected: qwen2-vl)     │
 └────────────────────────────────────────────────────────────────────────────────┘
@@ -276,7 +279,7 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 - Grid max height: 55% of center height, clamped 180–560 px (Compact: 60%, clamped 150–560 px).
 - Grid card: Comfortable 156×180 px, 7 px padding; Compact 126×146 px, 5 px padding. Dimensions appear in a dark overlay on the thumbnail.
 - Compact metadata inspector: 9×6 px frame margin, 4.5 px line spacing, 25 px field height, reduced section gaps, and a 2-line caption field.
-- Browser header summary (when a selection exists): `N selected · N keyword tags · N% of target · N/N images keyworded (N%)`. Tag coverage compares total keywords with 50 per selected image; image coverage counts selected images with at least one keyword. The summary waits for selected metadata reads before showing percentages, displays loading/ExifTool-unavailable states, and flags unreadable images.
+- Browser header summary (when a selection exists): `N selected · N keyword tags · N% of target · N/N images keyworded (N%)`. Tag coverage compares total keywords with the configured target per selected image; image coverage counts selected images with at least one keyword. The summary waits for selected metadata reads before showing percentages, displays loading/ExifTool-unavailable states, and flags unreadable images.
 - Thumbnails: max 160 px decode. Preview: max 2200 px decode.
 - Viewer filmstrip: 58 px squares, 82 px strip height.
 - Light and dark palettes cover panels, cards, menus, inputs, status badges, preview letterboxing, and custom-painted cards. Segoe UI from `C:\Windows\Fonts\segoeui.ttf`; default egui font if absent.
@@ -344,8 +347,8 @@ Shortcuts use `consume_key`, so they do not also reach text fields.
 - Opening a folder reveals and expands its whole ancestor chain inside the system tree instead of replacing the tree root.
 - Current folder is highlighted and shows its direct-image count.
 - Opening a folder clears selection, preview, and metadata-request cache.
-- **Refresh** / `F5` rescans mounted drives, clears tree caches, and preserves expansion state.
-- **Up** / `Alt+Up` moves to the parent; the full current path is shown below the navigation buttons.
+- **Refresh** / `F5` is available in the sidebar header and rescans mounted drives, clears tree caches, and preserves expansion state.
+- Click any breadcrumb above the tree to jump to an ancestor folder; `Alt+Up` also moves to the parent.
 - The grid always shows only the current folder's direct JPEGs, not images from its subfolders.
 
 ---
@@ -392,11 +395,10 @@ open_root(path)
        ├─ ensure ImageItem for each file
        ├─ thumbs.retain(current paths)
        ├─ selection.retain_existing(...)
-       ├─ select first image if selection became empty
        └─ request preview + metadata for selected images
 ```
 
-`add_paths` instead uses `collect_jpegs` (recursive) and appends new paths to the grid; if no folder is open, the first file's parent becomes the root.
+Changing folders clears the image selection. Refreshing the same folder keeps selections whose files still exist, but an empty selection stays empty; the app does not auto-select the first image. `add_paths` instead uses `collect_jpegs` (recursive) and appends new paths to the grid; if no folder is open, the first file's parent becomes the root.
 
 ### 8.3 AI batch flow
 
@@ -416,14 +418,15 @@ generate_paths(paths)
             then send BatchFinished
 ```
 
-`AiDone` replaces the existing Title/Caption/Keywords with the generated values plus Editorial, sets `Generated` and `dirty`, and increments `batch.done`. Failed results set `Error` and a message. `BatchFinished` clears the batch slot and shows a success/partial-failure toast.
+`AiDone` replaces the existing Title/Caption/Keywords with the generated values plus Editorial, sets `Generated` and `dirty`, records the path for auto-save, and increments `batch.done`. Failed results set `Error` and a message. `BatchFinished` clears the AI batch slot, then immediately starts the sequential save for every successful path when ExifTool is available; otherwise it reports that metadata was not saved.
 
 ### 8.4 Save flow
 
 ```
-save_selected()
+save_paths(paths)
+  ├─ used by Save Selected and by automatic post-AI saving
   ├─ reject if batch active / no ExifTool
-  ├─ selected items with has_metadata() (title non-empty)
+  ├─ items with has_metadata() (title non-empty)
   ├─ BatchProgress { saving: true }
   └─ spawn sequential loop
        ├─ spawn_blocking(ExifTool::write)
@@ -431,7 +434,7 @@ save_selected()
        └─ send BatchSaved; clear batch slot
 ```
 
-Saves are deliberately sequential to avoid launching many ExifTool processes over the same folder.
+Saves are deliberately sequential to avoid launching many ExifTool processes over the same folder. Automatic post-AI saving reuses this exact loop.
 
 ### 8.5 Metadata load flow
 
@@ -458,7 +461,7 @@ selection change / open folder / ExifTool ready
 | `ImageFailed` | path, error | mark cache failure + item message |
 | `AiStarted` | path | `Queued → Processing` |
 | `AiDone` | path, `Result<GeneratedMetadata, String>` | fill fields or set `Error`; progress++ |
-| `BatchFinished` | ok, failed | clear batch; toast |
+| `BatchFinished` | ok, failed | clear AI batch; auto-save successful paths or toast |
 | `SaveDone` | path, `Result<(), String>` | `Saved`/message; progress++ |
 | `BatchSaved` | ok, failed | clear batch; toast |
 | `MetaLoaded` | path, `ExistingMetadata` | fill empty pending item |
@@ -601,6 +604,9 @@ struct AiRequest {
     context: Option<String>,    // trimmed; omitted when empty
     global_prompt: String,      // extra system instructions
     date: String,               // e.g. "November 5, 2026"
+    keyword_target: usize,      // desired keywords per image, clamped 1..=50
+    title_range: (usize, usize), // configured min/max words, clamped 1..=20
+    caption_range: (usize, usize), // configured min/max characters, clamped 10..=1000
 }
 ```
 
@@ -611,9 +617,11 @@ Validation order:
 3. Image base64 non-empty.
 4. Build `reqwest::Client` with **300-second timeout**.
 5. Dispatch to provider.
-6. Parse with `prompt::parse_response`, adding provider context on failure.
+6. Parse with `prompt::parse_response_with_target`; normalization removes exact duplicates and singular/plural pairs (keeping the singular), then trims to the target.
+7. If the title/caption are outside their configured ranges, or the first reply has fewer than the target keywords, make one corrective request.
+8. If the retry satisfies both title and caption ranges, replace the first title/caption (and editorial flag). Always merge retry keywords into the first list, preserving order and dropping duplicates/singular-plural pairs before capping at the target.
 
-No retries, backoff, streaming, or cancellation.
+No backoff, streaming, or cancellation. Excess keywords are trimmed before the result reaches the UI.
 
 ### 11.2 Image preparation
 
@@ -626,7 +634,7 @@ No retries, backoff, streaming, or cancellation.
 
 ### 11.3 Exact system prompt
 
-`SYSTEM_TEMPLATE` in `src/ai/prompt.rs`; `{DATE}` is replaced with `Month D, YYYY` (English month, no leading zero). If `global_prompt` is non-empty:
+`SYSTEM_TEMPLATE` in `src/ai/prompt.rs`; `{DATE}` is replaced with `Month D, YYYY` (English month, no leading zero), `{KEYWORD_TARGET}` with the configured 1–50 target, `{TITLE_MIN_WORDS}`/`{TITLE_MAX_WORDS}` with the configured title range, and `{CAPTION_MIN_CHARS}`/`{CAPTION_MAX_CHARS}` with the configured caption range. If `global_prompt` is non-empty:
 
 ```
 \n\nAdditional instructions from the photographer (follow these too):\n<trimmed global_prompt>
@@ -654,24 +662,25 @@ Today's date: {DATE}
 Output Formatting Constraints:
 
 1. Title:
-   - Length: Exactly 3 to 5 words.
+   - Length: Between {TITLE_MIN_WORDS} and {TITLE_MAX_WORDS} words.
    - Content: Clear, descriptive summary of the primary subject.
 
 2. Caption:
-   - Length: Strict limit of 50 to 180 characters (including spaces).
+   - Length: Strict limit of {CAPTION_MIN_CHARS} to {CAPTION_MAX_CHARS} characters (including spaces).
    - Content: Factual description of the scene (or Shutterstock editorial format if applicable).
 
 3. Keywords:
-   - Quantity: Exactly 50 keywords.
+   - Quantity: Exactly {KEYWORD_TARGET} keywords.
    - Format: Single words only (no multi-word phrases/keyphrases).
    - Separator: Comma-separated.
    - Rules: Alphabetic characters only. No numbers, punctuation, or special characters.
+   - Duplicates: Do not include a plural when its singular form is also present. Keep the singular (for example, keep "apple" and omit "apples").
 
 Required Output Schema:
-Title: [3-5 words]
+Title: [{TITLE_MIN_WORDS}-{TITLE_MAX_WORDS} words]
 Editorial Status: [Commercial / Editorial]
-Caption: [50-180 characters]
-Keywords: [word1, word2, word3, ... word50]
+Caption: [{CAPTION_MIN_CHARS}-{CAPTION_MAX_CHARS} characters]
+Keywords: [word1, word2, word3, ... word{KEYWORD_TARGET}]
 
 Reply with the four labelled lines above and nothing else. Do not use markdown.
 ```
@@ -707,6 +716,12 @@ Analyze the attached image and return the four labelled fields exactly as specif
 ```
 
 Without metadata or context, the prompt is only the final analyze line.
+
+If normalization leaves fewer than the target keywords, a second request appends:
+
+```text
+The previous reply contained only N usable keywords, but exactly TARGET are required. Return the four labelled fields again, keeping the same title and caption. Provide exactly TARGET unique single-word keywords. Do not include both a singular and its plural; keep the singular. Previous keywords: ...
+```
 
 ### 11.5 Provider wire formats
 
@@ -744,15 +759,15 @@ Shared by AI parsing, the single inspector's **Normalize**, and batch append/rep
 3. Keep only alphabetic characters (`char::is_alphabetic`; Unicode letters survive).
 4. Drop results shorter than 2 characters.
 5. Deduplicate case-insensitively, preserving first spelling/order.
-6. Cap at exactly 50.
+6. Cap at the configured target (default 50).
 
 Examples: `2024` → dropped; `3d` → dropped; `blue-sky` → `bluesky`; `New York` → `New`, `York`; `Café`/`北京` preserved.
 
 ### 11.8 Validation (advisory)
 
-- Title word count outside 3–5.
-- Caption character count outside 50–180 (`chars().count()`).
-- Keyword count not exactly 50.
+- Title word count outside the configured range (default 3–5).
+- Caption character count outside the configured range (default 50–180, `chars().count()`).
+- Keyword count not exactly the configured target (default 50).
 - First keyword under 2 characters or containing non-alphabetic characters.
 
 Warnings never block generation or saving.
@@ -912,6 +927,11 @@ struct Config {
     last_folder,        // reopened at startup
     theme,              // system | light | dark
     density,            // comfortable | compact
+    keyword_target,     // desired keywords per image, clamped 1..=50 at use
+    title_min_words,    // title minimum words, clamped 1..=20 at use
+    title_max_words,    // title maximum words, clamped 1..=20 at use
+    caption_min_chars,  // caption minimum characters, clamped 10..=1000 at use
+    caption_max_chars,  // caption maximum characters, clamped 10..=1000 at use
     concurrency,        // AI workers, clamped 1..=4 at use
     #[serde(skip)] path,
 }
@@ -930,6 +950,9 @@ struct Config {
 | `last_folder` | empty |
 | `theme` | `system` (follows the Windows app theme) |
 | `density` | `comfortable` |
+| `keyword_target` | `50` |
+| `title_min_words` / `title_max_words` | `3` / `5` |
+| `caption_min_chars` / `caption_max_chars` | `50` / `180` |
 | `concurrency` | `1` |
 
 TOML provider values: `ollama`, `lm_studio`, `open_ai`, `anthropic`; theme values: `system`, `light`, `dark`; density values: `comfortable`, `compact`. Unknown values fail the whole parse and fall back to defaults. `#[serde(default)]` fills missing fields/sections.
@@ -941,6 +964,11 @@ exiftool_path = ""
 last_folder = "C:\\Photos\\2026_Stock"
 theme = "system"
 density = "comfortable"
+keyword_target = 50
+title_min_words = 3
+title_max_words = 5
+caption_min_chars = 50
+caption_max_chars = 180
 concurrency = 2
 
 [ollama]
@@ -992,7 +1020,7 @@ export PATH="$PWD/.tools/gnu-bin:$SELF:$PATH"
 cargo +stable-x86_64-pc-windows-gnu test
 ```
 
-Expected: **106 passed; 0 failed; 0 ignored**.
+Expected: **117 passed; 0 failed; 0 ignored**.
 
 List: `cargo test -- --list`.
 
@@ -1000,20 +1028,21 @@ List: `cargo test -- --list`.
 
 | Module | Count | Coverage |
 | --- | --- | --- |
-| `ai::prompt::tests` | 25 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, validation boundaries, exact editorial caption, existing metadata/context prompt |
-| `ai::tests` | 23 | mock HTTP server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation |
-| `config::tests` | 8 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`theme`/`density`/`concurrency`, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
+| `ai::prompt::tests` | 29 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, singular/plural de-duplication, range-aware prompt/validation/trimming, retry prompt, validation boundaries, exact editorial caption, existing metadata/context prompt |
+| `ai::tests` | 25 | mock HTTP sequence server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation; short-keyword and title/caption retries |
+| `config::tests` | 11 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`theme`/`density`/`keyword_target`/ranges/`concurrency`, target and range clamping, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
 | `metadata::tags::tests` | 8 | read precedence/fallbacks/merge/dedupe/invalid payloads/string keywords, GPS and capture-date parsing |
-| `metadata::writer::tests` | 7 | all tags, title fallback, empty metadata, no `+=`, Unicode, 50-keyword cap |
+| `metadata::writer::tests` | 7 | all tags, title fallback, empty metadata, no `+=`, Unicode, 50-keyword safety cap |
 | `metadata::tests` | 8 | real ExifTool round-trip, overwrite semantics, 50 keywords, Unicode values, Unicode file names, missing files, explicit/directory detection, argfile formatting |
-| `state::tests` | 19 | extension/folder scans, decode resize/corrupt, item conversion, progress, selection math, Ctrl/Shift/checkbox/toggle/retain, aggregate common/mixed, keyword append |
+| `state::tests` | 21 | extension/folder scans, decode resize/corrupt, item conversion, progress, selection math, Ctrl/Shift/checkbox/toggle/retain/clear, aggregate common/mixed, keyword append, singular/plural append |
 | `cache::thumbnails::tests` | 1 | request lifecycle blocks duplicates/failures |
-| `ui::tree::tests` | 3 | sorted children/expansion/depth; refresh preserves expansion and rereads children; reveal expands only the ancestor chain |
+| `theme::tests` | 2 | Windows theme registry parsing, palette application |
+| `ui::tree::tests` | 4 | sorted children/expansion/depth; refresh preserves expansion and rereads children; reveal expands only the ancestor chain; breadcrumb path segments |
 | `ui::browser::tests` | 1 | selection-summary percentages for empty, partial, full, and over-target selections |
 
 ExifTool integration tests skip with `exiftool not available; skipping test` if detection fails. This keeps the suite runnable without ExifTool, but those eight only prove metadata correctness when ExifTool is installed. On this machine they run.
 
-Provider tests make no real API calls. `src/ai/tests.rs` has a single-request TCP HTTP server on `127.0.0.1:0`; it reads the request, asserts method/path/headers/body, and returns canned JSON.
+Provider tests make no real API calls. `src/ai/tests.rs` has a TCP HTTP server on `127.0.0.1:0` that can return a sequence of responses; it reads each request, asserts method/path/headers/body, and returns canned JSON. The keyword and title/caption retry tests use two responses.
 
 Temporary artifacts: `%TEMP%\autowording-tests`, `autowording-state-tests`, `autowording-config-tests`, `autowording-tree-tests`.
 
@@ -1047,23 +1076,24 @@ Temporary artifacts: `%TEMP%\autowording-tests`, `autowording-state-tests`, `aut
 13. **Config parse failure resets everything in memory**, not field-by-field.
 14. **The config path contains an extra `config` directory** on Windows.
 15. **Anthropic uses `x-api-key`; OpenAI uses Bearer;** local providers send no auth.
-16. **LM Studio endpoint normalization** accepts host, `/v1`, or full `/chat/completions`.
-17. **Ollama base ending `/api`** becomes `/api/chat`.
-18. **No automatic retry.** `Error` items can be retried via **Retry failed** or by rerunning the selected batch.
-19. **The model sees a re-encoded JPEG**, quality 85, max 1600 px; fine detail may be lost.
-20. **No EXIF orientation correction.**
-21. **Keywords are single words by design**; multi-word concepts split.
-22. **Keyword dedupe preserves first spelling**, case-insensitive.
-23. **Unicode keywords pass validation** (`is_alphabetic`), despite the prompt asking for alphabetic characters.
-24. **Editorial toggle does not rewrite the caption.**
-25. **Folder scans are non-recursive for the grid**, recursive for dropped folders/add paths.
-26. **The left tree is rooted at the system, not the opened folder.** Mounted drives and Quick access stay available; opening a folder only reveals its ancestor chain.
-27. **`folder_root` is separate from `current_folder`**: `folder_root` is the opened folder's volume root; the current folder is the selection.
-28. **Refreshing re-selects the first image if selection became empty**, even after Clear.
-29. **`meta_requested` is cleared on folder open/refresh/ExifTool-ready**, causing re-reads.
-30. **The app is not code-signed**; SmartScreen may warn.
-31. **No installer, auto-update, single-instance enforcement, or tray icon.**
-32. **The UI does not auto-save metadata.**
+16. **Successful generation auto-saves after the AI batch.** ExifTool is required; without it, results remain `Generated` and are not written.
+17. **LM Studio endpoint normalization** accepts host, `/v1`, or full `/chat/completions`.
+18. **Ollama base ending `/api`** becomes `/api/chat`.
+19. **No automatic retry on provider errors.** `Error` items can be retried via **Retry failed** or by rerunning the selected batch; the one corrective metadata retry is separate.
+20. **The model sees a re-encoded JPEG**, quality 85, max 1600 px; fine detail may be lost.
+21. **No EXIF orientation correction.**
+22. **Keywords are single words by design**; multi-word concepts split.
+23. **Keyword dedupe preserves first spelling**, case-insensitive.
+24. **Unicode keywords pass validation** (`is_alphabetic`), despite the prompt asking for alphabetic characters.
+25. **Editorial toggle does not rewrite the caption.**
+26. **Folder scans are non-recursive for the grid**, recursive for dropped folders/add paths.
+27. **The left tree is rooted at the system, not the opened folder.** Mounted drives and Quick access stay available; opening a folder only reveals its ancestor chain.
+28. **`folder_root` is separate from `current_folder`**: `folder_root` is the opened folder's volume root; the current folder is the selection.
+29. **Refresh keeps existing selections and leaves an empty selection empty.**
+30. **`meta_requested` is cleared on folder open/refresh/ExifTool-ready**, causing re-reads.
+31. **The app is not code-signed**; SmartScreen may warn.
+32. **No installer, auto-update, single-instance enforcement, or tray icon.**
+33. **Manual edits made after generation are not auto-saved**; generation auto-saves once.
 
 ---
 
@@ -1187,7 +1217,7 @@ exiftool -a -G1 -s "path\to\image.jpg"
 
 Last verified on the development machine (Windows 11, 2026-11-06):
 
-- `cargo +stable-x86_64-pc-windows-gnu test` → **106 passed, 0 failed** (includes real ExifTool round-trips).
+- `cargo +stable-x86_64-pc-windows-gnu test` → **117 passed, 0 failed** (includes real ExifTool round-trips).
 - `cargo +stable-x86_64-pc-windows-gnu build --release` → success, no warnings; `target/release/autowording.exe` ~21 MB.
 - The redesigned release was smoke-launched; the native window `AutoWording` was created and responding.
 - The UI was **not** visually inspected or driven through folder/grid/batch interactions in this pass; selection/tree logic is covered by unit tests, but layout and click behavior remain visually unverified.

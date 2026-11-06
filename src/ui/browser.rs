@@ -1,4 +1,3 @@
-use crate::ai::prompt;
 use crate::app::{App, WorkspaceMode};
 use crate::state::SelectModifiers;
 use crate::theme;
@@ -150,7 +149,12 @@ fn folder_header(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         });
     });
 
-    selection_summary_row(ui, summary, app.cfg.density.is_compact());
+    selection_summary_row(
+        ui,
+        summary,
+        app.cfg.keyword_target(),
+        app.cfg.density.is_compact(),
+    );
 }
 
 #[derive(Default, Clone, Copy)]
@@ -165,11 +169,11 @@ struct SelectionSummary {
 }
 
 impl SelectionSummary {
-    fn target_percent(self) -> usize {
+    fn target_percent(self, keyword_target: usize) -> usize {
         if self.selected == 0 {
             return 0;
         }
-        let target = self.selected.saturating_mul(prompt::KEYWORD_TARGET);
+        let target = self.selected.saturating_mul(keyword_target);
         if target == 0 {
             0
         } else {
@@ -217,7 +221,12 @@ fn selection_summary(app: &App) -> SelectionSummary {
     summary
 }
 
-fn selection_summary_row(ui: &mut egui::Ui, summary: SelectionSummary, compact: bool) {
+fn selection_summary_row(
+    ui: &mut egui::Ui,
+    summary: SelectionSummary,
+    keyword_target: usize,
+    compact: bool,
+) {
     if summary.selected == 0 {
         return;
     }
@@ -280,9 +289,9 @@ fn selection_summary_row(ui: &mut egui::Ui, summary: SelectionSummary, compact: 
         return;
     }
 
-    let target_color = if summary.target_percent() >= 100 {
+    let target_color = if summary.target_percent(keyword_target) >= 100 {
         theme::success()
-    } else if summary.target_percent() >= 50 {
+    } else if summary.target_percent(keyword_target) >= 50 {
         theme::accent_text()
     } else {
         theme::warning()
@@ -329,7 +338,10 @@ fn selection_summary_row(ui: &mut egui::Ui, summary: SelectionSummary, compact: 
                         .color(theme::border_strong()),
                 ));
                 ui.add(egui::Label::new(
-                    RichText::new(format!("{}% of target", summary.target_percent()))
+                    RichText::new(format!(
+                        "{}% of target",
+                        summary.target_percent(keyword_target)
+                    ))
                         .size(text_size)
                         .color(target_color),
                 ));
@@ -364,7 +376,7 @@ fn selection_summary_row(ui: &mut egui::Ui, summary: SelectionSummary, compact: 
         });
     row.response.on_hover_text(format!(
         "Tag coverage compares total keywords with the {} keywords-per-image target. Image coverage counts selected images with at least one keyword; images whose metadata could not be read are counted as having no keywords.",
-        prompt::KEYWORD_TARGET
+        keyword_target
     ));
 }
 
@@ -774,7 +786,7 @@ mod tests {
     #[test]
     fn selection_summary_percentages_handle_empty_partial_and_full_sets() {
         let empty = SelectionSummary::default();
-        assert_eq!(empty.target_percent(), 0);
+        assert_eq!(empty.target_percent(50), 0);
         assert_eq!(empty.coverage_percent(), 0);
 
         let partial = SelectionSummary {
@@ -783,7 +795,7 @@ mod tests {
             covered: 2,
             ..SelectionSummary::default()
         };
-        assert_eq!(partial.target_percent(), 50);
+        assert_eq!(partial.target_percent(50), 50);
         assert_eq!(partial.coverage_percent(), 50);
 
         let full = SelectionSummary {
@@ -792,7 +804,7 @@ mod tests {
             covered: 2,
             ..SelectionSummary::default()
         };
-        assert_eq!(full.target_percent(), 100);
+        assert_eq!(full.target_percent(50), 100);
         assert_eq!(full.coverage_percent(), 100);
 
         let over_target = SelectionSummary {
@@ -801,7 +813,7 @@ mod tests {
             covered: 5,
             ..SelectionSummary::default()
         };
-        assert_eq!(over_target.target_percent(), 100);
+        assert_eq!(over_target.target_percent(50), 100);
         assert_eq!(over_target.coverage_percent(), 100);
     }
 }

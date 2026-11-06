@@ -441,19 +441,49 @@ where
 }
 
 /// Append unique keywords, preserving order and enforcing the 50-word limit.
+#[cfg(test)]
 pub fn append_keywords(existing: &mut Vec<String>, additions: &[String]) {
+    append_keywords_with_target(existing, additions, crate::ai::prompt::KEYWORD_TARGET);
+}
+
+/// Append unique keywords using the user's target, dropping singular/plural
+/// duplicates and capping the final list after de-duplication.
+pub fn append_keywords_with_target(
+    existing: &mut Vec<String>,
+    additions: &[String],
+    keyword_target: usize,
+) {
+    let target = crate::config::clamp_keyword_target(keyword_target);
     for keyword in additions {
-        if existing.len() >= crate::ai::prompt::KEYWORD_TARGET {
+        if existing.len() >= target {
             break;
         }
         let keyword = keyword.trim();
         if keyword.is_empty() {
             continue;
         }
-        if !existing
+        if existing
             .iter()
             .any(|current| current.eq_ignore_ascii_case(keyword))
         {
+            continue;
+        }
+
+        // If the existing list has the plural, replace it with this singular.
+        if let Some(index) = existing
+            .iter()
+            .position(|current| crate::ai::prompt::is_plural_of(current, keyword))
+        {
+            existing.remove(index);
+        } else if existing
+            .iter()
+            .any(|current| crate::ai::prompt::is_plural_of(keyword, current))
+        {
+            // The new word is the plural; keep the singular already there.
+            continue;
+        }
+
+        if existing.len() < target {
             existing.push(keyword.to_string());
         }
     }
@@ -769,6 +799,20 @@ mod tests {
     }
 
     #[test]
+    fn clear_removes_selection_and_primary() {
+        let ordered = paths(&["a.jpg", "b.jpg"]);
+        let mut selection = Selection::default();
+        selection.select_all(&ordered);
+        selection.clear();
+
+        assert!(selection.is_empty());
+        assert_eq!(selection.count(), 0);
+        assert_eq!(selection.active(), None);
+        assert_eq!(selection.anchor(), None);
+        assert_eq!(selection.primary(&ordered), None);
+    }
+
+    #[test]
     fn select_all_retain_and_primary_handle_folder_changes() {
         let ordered = paths(&["a.jpg", "b.jpg", "c.jpg"]);
         let mut selection = Selection::default();
@@ -817,5 +861,19 @@ mod tests {
         let mut full: Vec<String> = (0..50).map(|index| format!("kw{index}")).collect();
         append_keywords(&mut full, &["extra".to_string()]);
         assert_eq!(full.len(), 50);
+    }
+
+    #[test]
+    fn append_keywords_keeps_the_singular_form() {
+        let mut existing = vec!["apples".to_string(), "boxes".to_string()];
+        append_keywords(
+            &mut existing,
+            &["apple".to_string(), "box".to_string()],
+        );
+        assert_eq!(existing, vec!["apple", "box"]);
+
+        let mut existing = vec!["apple".to_string()];
+        append_keywords(&mut existing, &["apples".to_string()]);
+        assert_eq!(existing, vec!["apple"]);
     }
 }

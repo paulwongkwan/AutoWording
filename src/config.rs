@@ -1,6 +1,45 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Default and safe bounds for the user-selectable keyword target.
+pub const KEYWORD_TARGET_DEFAULT: usize = 50;
+pub const KEYWORD_TARGET_MIN: usize = 1;
+pub const KEYWORD_TARGET_MAX: usize = 50;
+
+/// Default and safe bounds for the configurable title word range.
+pub const TITLE_WORDS_DEFAULT_MIN: usize = 3;
+pub const TITLE_WORDS_DEFAULT_MAX: usize = 5;
+pub const TITLE_WORDS_MIN: usize = 1;
+pub const TITLE_WORDS_MAX: usize = 20;
+
+/// Default and safe bounds for the configurable caption character range.
+pub const CAPTION_CHARS_DEFAULT_MIN: usize = 50;
+pub const CAPTION_CHARS_DEFAULT_MAX: usize = 180;
+pub const CAPTION_CHARS_MIN: usize = 10;
+pub const CAPTION_CHARS_MAX: usize = 1000;
+
+pub fn clamp_keyword_target(target: usize) -> usize {
+    target.clamp(KEYWORD_TARGET_MIN, KEYWORD_TARGET_MAX)
+}
+
+fn clamp_range(min: usize, max: usize, floor: usize, ceiling: usize) -> (usize, usize) {
+    let min = min.clamp(floor, ceiling);
+    let max = max.clamp(floor, ceiling);
+    if min <= max {
+        (min, max)
+    } else {
+        (max, min)
+    }
+}
+
+pub fn clamp_title_word_range(min: usize, max: usize) -> (usize, usize) {
+    clamp_range(min, max, TITLE_WORDS_MIN, TITLE_WORDS_MAX)
+}
+
+pub fn clamp_caption_char_range(min: usize, max: usize) -> (usize, usize) {
+    clamp_range(min, max, CAPTION_CHARS_MIN, CAPTION_CHARS_MAX)
+}
+
 /// The vision providers supported by the unified AI layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +242,14 @@ pub struct Config {
     pub theme: ThemePreference,
     /// Browser grid and metadata inspector density.
     pub density: LayoutDensity,
+    /// Desired number of keywords per image (clamped to 1..=50 at use).
+    pub keyword_target: usize,
+    /// Desired title word range (clamped to 1..=20 at use).
+    pub title_min_words: usize,
+    pub title_max_words: usize,
+    /// Desired caption character range (clamped to 10..=1000 at use).
+    pub caption_min_chars: usize,
+    pub caption_max_chars: usize,
     /// Number of concurrent AI workers for a batch (clamped to 1..=4 at use).
     pub concurrency: usize,
     /// Where this config was loaded from / will be saved to.
@@ -223,6 +270,11 @@ impl Default for Config {
             last_folder: String::new(),
             theme: ThemePreference::System,
             density: LayoutDensity::Comfortable,
+            keyword_target: KEYWORD_TARGET_DEFAULT,
+            title_min_words: TITLE_WORDS_DEFAULT_MIN,
+            title_max_words: TITLE_WORDS_DEFAULT_MAX,
+            caption_min_chars: CAPTION_CHARS_DEFAULT_MIN,
+            caption_max_chars: CAPTION_CHARS_DEFAULT_MAX,
             concurrency: 1,
             path: None,
         }
@@ -300,6 +352,23 @@ impl Config {
             Provider::OpenAi => &mut self.openai,
             Provider::Anthropic => &mut self.anthropic,
         }
+    }
+
+    /// The persisted target, clamped in case an old or hand-edited config is invalid.
+    pub fn keyword_target(&self) -> usize {
+        clamp_keyword_target(self.keyword_target)
+    }
+
+    /// The persisted title range, clamped and ordered in case an old or
+    /// hand-edited config is invalid.
+    pub fn title_word_range(&self) -> (usize, usize) {
+        clamp_title_word_range(self.title_min_words, self.title_max_words)
+    }
+
+    /// The persisted caption range, clamped and ordered in case an old or
+    /// hand-edited config is invalid.
+    pub fn caption_char_range(&self) -> (usize, usize) {
+        clamp_caption_char_range(self.caption_min_chars, self.caption_max_chars)
     }
 }
 
@@ -384,6 +453,14 @@ mod tests {
         assert!(cfg.last_folder.is_empty());
         assert_eq!(cfg.theme, ThemePreference::System);
         assert_eq!(cfg.density, LayoutDensity::Comfortable);
+        assert_eq!(cfg.keyword_target, KEYWORD_TARGET_DEFAULT);
+        assert_eq!(cfg.keyword_target(), KEYWORD_TARGET_DEFAULT);
+        assert_eq!(cfg.title_min_words, TITLE_WORDS_DEFAULT_MIN);
+        assert_eq!(cfg.title_max_words, TITLE_WORDS_DEFAULT_MAX);
+        assert_eq!(cfg.caption_min_chars, CAPTION_CHARS_DEFAULT_MIN);
+        assert_eq!(cfg.caption_max_chars, CAPTION_CHARS_DEFAULT_MAX);
+        assert_eq!(cfg.title_word_range(), (3, 5));
+        assert_eq!(cfg.caption_char_range(), (50, 180));
         assert_eq!(cfg.concurrency, 1);
     }
 
@@ -422,6 +499,43 @@ mod tests {
     }
 
     #[test]
+    fn keyword_target_is_clamped_to_supported_range() {
+        assert_eq!(clamp_keyword_target(0), KEYWORD_TARGET_MIN);
+        assert_eq!(clamp_keyword_target(1), 1);
+        assert_eq!(clamp_keyword_target(37), 37);
+        assert_eq!(clamp_keyword_target(50), 50);
+        assert_eq!(clamp_keyword_target(99), KEYWORD_TARGET_MAX);
+
+        let mut cfg = Config::default();
+        cfg.keyword_target = 0;
+        assert_eq!(cfg.keyword_target(), KEYWORD_TARGET_MIN);
+        cfg.keyword_target = 99;
+        assert_eq!(cfg.keyword_target(), KEYWORD_TARGET_MAX);
+    }
+
+    #[test]
+    fn title_and_caption_ranges_are_clamped_and_ordered() {
+        assert_eq!(clamp_title_word_range(0, 0), (TITLE_WORDS_MIN, TITLE_WORDS_MIN));
+        assert_eq!(clamp_title_word_range(2, 8), (2, 8));
+        assert_eq!(clamp_title_word_range(8, 2), (2, 8));
+        assert_eq!(clamp_title_word_range(99, 2), (2, TITLE_WORDS_MAX));
+
+        assert_eq!(
+            clamp_caption_char_range(1, 2000),
+            (CAPTION_CHARS_MIN, CAPTION_CHARS_MAX)
+        );
+        assert_eq!(clamp_caption_char_range(180, 50), (50, 180));
+
+        let mut cfg = Config::default();
+        cfg.title_min_words = 12;
+        cfg.title_max_words = 4;
+        cfg.caption_min_chars = 400;
+        cfg.caption_max_chars = 80;
+        assert_eq!(cfg.title_word_range(), (4, 12));
+        assert_eq!(cfg.caption_char_range(), (80, 400));
+    }
+
+    #[test]
     fn settings_accessors_map_every_provider() {
         let mut cfg = Config::default();
         assert_eq!(cfg.settings(Provider::Ollama), &cfg.ollama);
@@ -450,6 +564,11 @@ mod tests {
         cfg.global_prompt = "Prefer British spelling.".into();
         cfg.exiftool_path = "C:\\tools\\exiftool.exe".into();
         cfg.last_folder = "C:\\Photos\\2026_Stock".into();
+        cfg.keyword_target = 37;
+        cfg.title_min_words = 4;
+        cfg.title_max_words = 9;
+        cfg.caption_min_chars = 70;
+        cfg.caption_max_chars = 240;
         cfg.concurrency = 3;
 
         cfg.save().expect("save config");
@@ -467,6 +586,9 @@ mod tests {
         assert_eq!(reloaded.global_prompt, "Prefer British spelling.");
         assert_eq!(reloaded.exiftool_path, "C:\\tools\\exiftool.exe");
         assert_eq!(reloaded.last_folder, "C:\\Photos\\2026_Stock");
+        assert_eq!(reloaded.keyword_target, 37);
+        assert_eq!(reloaded.title_word_range(), (4, 9));
+        assert_eq!(reloaded.caption_char_range(), (70, 240));
         assert_eq!(reloaded.concurrency, 3);
         assert!(reloaded.path.is_none(), "path is not serialized");
 

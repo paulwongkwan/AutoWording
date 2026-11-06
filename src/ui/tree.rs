@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::ui::{ghost_button, tiny_button};
+use crate::ui::{text_button, tiny_button};
 use directories::UserDirs;
 use eframe::egui::{self, ScrollArea};
 use std::collections::{HashMap, HashSet};
@@ -248,30 +248,41 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Build clickable path segments from the volume root down to the folder.
+fn breadcrumbs(path: &Path) -> Vec<(String, PathBuf)> {
+    path.ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|ancestor| {
+            let label = ancestor
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| ancestor.display().to_string());
+            (label, ancestor.to_path_buf())
+        })
+        .collect()
+}
+
 pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
-    crate::ui::section_title(ui, "Folder Browser");
+    ui.horizontal(|ui| {
+        crate::ui::section_title(ui, "Folder Browser");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(text_button("Refresh"))
+                .on_hover_text("Rescan this PC and the current folder (F5)")
+                .clicked()
+            {
+                app.refresh_browser(ctx);
+            }
+        });
+    });
     ui.add_space(5.0);
 
-    let parent = app.parent_folder();
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(parent.is_some(), ghost_button("Up"))
-            .on_hover_text("Open the parent folder (Alt+Up)")
-            .clicked()
-        {
-            app.open_parent_folder(ctx);
-        }
-        if ui.add(ghost_button("Open…")).clicked() {
-            app.open_folder_dialog(ctx);
-        }
-        if ui.add(ghost_button("Refresh")).clicked() {
-            app.refresh_browser(ctx);
-        }
-    });
-
     if let Some(path) = &app.current_folder {
-        let full = path.display().to_string();
-        ui.add_space(5.0);
+        let crumbs = breadcrumbs(path);
+        ui.add_space(2.0);
         egui::Frame::none()
             .fill(crate::theme::chip_bg())
             .stroke(egui::Stroke::new(1.0_f32, crate::theme::border()))
@@ -279,15 +290,31 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             .inner_margin(egui::Margin::symmetric(8.0, 4.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&full)
-                            .size(9.5)
-                            .color(crate::theme::text_muted()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(full);
+                ui.horizontal_wrapped(|ui| {
+                    for (index, (label, crumb_path)) in crumbs.iter().enumerate() {
+                        if index > 0 {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new("›")
+                                    .size(9.5)
+                                    .color(crate::theme::border_strong()),
+                            ));
+                        }
+                        let current = index + 1 == crumbs.len();
+                        let response = ui
+                            .selectable_label(
+                                current,
+                                egui::RichText::new(label).size(9.5).color(if current {
+                                    crate::theme::text()
+                                } else {
+                                    crate::theme::text_muted()
+                                }),
+                            )
+                            .on_hover_text(crumb_path.display().to_string());
+                        if response.clicked() && !current {
+                            app.open_folder(ctx, crumb_path.clone());
+                        }
+                    }
+                });
             });
     }
 
@@ -295,7 +322,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
 
     let shortcuts = quick_access();
     let rows = app.folders.rows();
-    let available = (ui.available_height() - 42.0).max(150.0);
+    let available = (ui.available_height() - 4.0).max(150.0);
     ScrollArea::vertical()
         .auto_shrink([false; 2])
         .max_height(available)
@@ -376,15 +403,6 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                 });
             }
         });
-
-    ui.add_space(8.0);
-    let width = ui.available_width();
-    if ui
-        .add_sized([width, 28.0], ghost_button("Add images…"))
-        .clicked()
-    {
-        app.add_images_dialog(ctx);
-    }
 }
 
 fn group_label(ui: &mut egui::Ui, text: &str) {
@@ -438,6 +456,18 @@ mod tests {
 
         tree.toggle(&a_folder);
         assert_eq!(tree.rows().len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn breadcrumbs_include_drive_and_each_folder() {
+        let crumbs = breadcrumbs(Path::new(r"D:\Photos\2026"));
+        let labels: Vec<&str> = crumbs.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, vec!["D:\\", "Photos", "2026"]);
+        assert_eq!(
+            crumbs.last().map(|(_, path)| path.as_path()),
+            Some(Path::new(r"D:\Photos\2026"))
+        );
     }
 
     #[test]

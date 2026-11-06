@@ -1,11 +1,20 @@
+use crate::config::{
+    clamp_caption_char_range, clamp_keyword_target, clamp_title_word_range,
+    KEYWORD_TARGET_DEFAULT,
+};
+#[cfg(test)]
+use crate::config::{
+    CAPTION_CHARS_DEFAULT_MAX, CAPTION_CHARS_DEFAULT_MIN, TITLE_WORDS_DEFAULT_MAX,
+    TITLE_WORDS_DEFAULT_MIN,
+};
 use crate::metadata::ExistingMetadata;
 use anyhow::{bail, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
-pub const KEYWORD_TARGET: usize = 50;
+pub const KEYWORD_TARGET: usize = KEYWORD_TARGET_DEFAULT;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeneratedMetadata {
@@ -34,29 +43,57 @@ Today's date: {DATE}
 Output Formatting Constraints:
 
 1. Title:
-   - Length: Exactly 3 to 5 words.
+   - Length: Between {TITLE_MIN_WORDS} and {TITLE_MAX_WORDS} words.
    - Content: Clear, descriptive summary of the primary subject.
 
 2. Caption:
-   - Length: Strict limit of 50 to 180 characters (including spaces).
+   - Length: Strict limit of {CAPTION_MIN_CHARS} to {CAPTION_MAX_CHARS} characters (including spaces).
    - Content: Factual description of the scene (or Shutterstock editorial format if applicable).
 
 3. Keywords:
-   - Quantity: Exactly 50 keywords.
+   - Quantity: Exactly {KEYWORD_TARGET} keywords.
    - Format: Single words only (no multi-word phrases/keyphrases).
    - Separator: Comma-separated.
    - Rules: Alphabetic characters only. No numbers, punctuation, or special characters.
+   - Duplicates: Do not include a plural when its singular form is also present. Keep the singular (for example, keep "apple" and omit "apples").
 
 Required Output Schema:
-Title: [3-5 words]
+Title: [{TITLE_MIN_WORDS}-{TITLE_MAX_WORDS} words]
 Editorial Status: [Commercial / Editorial]
-Caption: [50-180 characters]
-Keywords: [word1, word2, word3, ... word50]
+Caption: [{CAPTION_MIN_CHARS}-{CAPTION_MAX_CHARS} characters]
+Keywords: [word1, word2, word3, ... word{KEYWORD_TARGET}]
 
 Reply with the four labelled lines above and nothing else. Do not use markdown."#;
 
+#[cfg(test)]
 pub fn system_prompt(date: &str, extra: &str) -> String {
-    let mut prompt = SYSTEM_TEMPLATE.replace("{DATE}", date);
+    system_prompt_with_constraints(
+        date,
+        extra,
+        KEYWORD_TARGET,
+        (TITLE_WORDS_DEFAULT_MIN, TITLE_WORDS_DEFAULT_MAX),
+        (CAPTION_CHARS_DEFAULT_MIN, CAPTION_CHARS_DEFAULT_MAX),
+    )
+}
+
+pub fn system_prompt_with_constraints(
+    date: &str,
+    extra: &str,
+    keyword_target: usize,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
+) -> String {
+    let target = clamp_keyword_target(keyword_target);
+    let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
+    let (caption_min, caption_max) =
+        clamp_caption_char_range(caption_range.0, caption_range.1);
+    let mut prompt = SYSTEM_TEMPLATE
+        .replace("{DATE}", date)
+        .replace("{KEYWORD_TARGET}", &target.to_string())
+        .replace("{TITLE_MIN_WORDS}", &title_min.to_string())
+        .replace("{TITLE_MAX_WORDS}", &title_max.to_string())
+        .replace("{CAPTION_MIN_CHARS}", &caption_min.to_string())
+        .replace("{CAPTION_MAX_CHARS}", &caption_max.to_string());
     let extra = extra.trim();
     if !extra.is_empty() {
         prompt.push_str("\n\nAdditional instructions from the photographer (follow these too):\n");
@@ -89,6 +126,84 @@ pub fn user_prompt(context: Option<&str>, existing: Option<&ExistingMetadata>) -
     prompt.push_str(
         "Analyze the attached image and return the four labelled fields exactly as specified.",
     );
+    prompt
+}
+
+/// Second-pass prompt used when the first reply missed the title, caption, or
+/// keyword constraints. It repeats the original context and asks for a full
+/// reply so the normal four-field parser can be used again.
+pub fn retry_prompt(
+    context: Option<&str>,
+    existing: Option<&ExistingMetadata>,
+    keyword_target: usize,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
+    previous: &GeneratedMetadata,
+) -> String {
+    let target = clamp_keyword_target(keyword_target);
+    let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
+    let (caption_min, caption_max) =
+        clamp_caption_char_range(caption_range.0, caption_range.1);
+    let words = title_word_count(&previous.title);
+    let chars = caption_char_count(&previous.caption);
+    let title_ok = (title_min..=title_max).contains(&words);
+    let caption_ok = (caption_min..=caption_max).contains(&chars);
+    let keywords_short = previous.keywords.len() < target;
+
+    let mut issues = Vec::new();
+    if !title_ok {
+        issues.push(format!(
+            "The title has {words} words; it must have {title_min}–{title_max}."
+        ));
+    }
+    if !caption_ok {
+        issues.push(format!(
+            "The caption has {chars} characters; it must have {caption_min}–{caption_max} characters."
+        ));
+    }
+    if keywords_short {
+        let verb = if previous.keywords.len() == 1 {
+            "keyword was"
+        } else {
+            "keywords were"
+        };
+        issues.push(format!(
+            "Only {} usable {verb} returned; exactly {target} are required.",
+            previous.keywords.len()
+        ));
+    }
+
+    let mut prompt = user_prompt(context, existing);
+    prompt.push_str("\n\nThe previous reply did not satisfy these constraints:\n");
+    for issue in issues {
+        prompt.push_str("- ");
+        prompt.push_str(&issue);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nReturn the four labelled fields again. ");
+    if title_ok {
+        prompt.push_str("Keep the title unchanged. ");
+    } else {
+        prompt.push_str(&format!(
+            "Rewrite the title to {title_min}–{title_max} words. "
+        ));
+    }
+    if caption_ok {
+        prompt.push_str("Keep the caption unchanged. ");
+    } else {
+        prompt.push_str(&format!(
+            "Rewrite the caption to {caption_min}–{caption_max} characters. "
+        ));
+    }
+    if keywords_short {
+        prompt.push_str(&format!(
+            "Return exactly {target} unique single-word keywords, adding enough new terms that were not in the previous list. Previous keywords: {}. ",
+            previous.keywords.join(", ")
+        ));
+    } else {
+        prompt.push_str("Keep the keywords unchanged. ");
+    }
+    prompt.push_str("Do not repeat any keyword, and do not include both a singular and its plural; keep the singular.");
     prompt
 }
 
@@ -209,7 +324,33 @@ fn parse_fields(text: &str) -> BTreeMap<&'static str, String> {
     fields
 }
 
+#[cfg(test)]
 pub fn parse_response(text: &str) -> Result<GeneratedMetadata> {
+    parse_response_with_target(text, KEYWORD_TARGET)
+}
+
+pub fn parse_response_with_target(
+    text: &str,
+    keyword_target: usize,
+) -> Result<GeneratedMetadata> {
+    parse_response_inner(text, keyword_target, true)
+}
+
+/// Parse a first-pass reply even when it omitted keywords, so the caller can
+/// make the keyword-refresh request instead of failing the whole image.
+pub fn parse_response_allow_empty_keywords(
+    text: &str,
+    keyword_target: usize,
+) -> Result<GeneratedMetadata> {
+    parse_response_inner(text, keyword_target, false)
+}
+
+fn parse_response_inner(
+    text: &str,
+    keyword_target: usize,
+    require_keywords: bool,
+) -> Result<GeneratedMetadata> {
+    let target = clamp_keyword_target(keyword_target);
     let fields = parse_fields(text);
 
     let title = fields.get("title").cloned().unwrap_or_default();
@@ -220,9 +361,10 @@ pub fn parse_response(text: &str) -> Result<GeneratedMetadata> {
         .cloned()
         .unwrap_or_else(|| "Commercial".to_string());
 
-    let keywords = normalize_keywords(&keyword_raw);
+    let keywords = normalize_keywords_with_target(&keyword_raw, target);
 
-    if title.is_empty() || caption.is_empty() || keywords.is_empty() {
+    let missing_keywords = require_keywords && keywords.is_empty();
+    if title.is_empty() || caption.is_empty() || missing_keywords {
         let mut missing = Vec::new();
         if title.is_empty() {
             missing.push("Title");
@@ -230,7 +372,7 @@ pub fn parse_response(text: &str) -> Result<GeneratedMetadata> {
         if caption.is_empty() {
             missing.push("Caption");
         }
-        if keywords.is_empty() {
+        if missing_keywords {
             missing.push("Keywords");
         }
         let snippet: String = text.trim().chars().take(400).collect();
@@ -255,9 +397,18 @@ pub fn parse_response(text: &str) -> Result<GeneratedMetadata> {
 }
 
 /// Strip punctuation/numbers, split multi-word phrases, deduplicate and cap at 50.
+#[cfg(test)]
 pub fn normalize_keywords(raw: &str) -> Vec<String> {
-    let mut keywords: Vec<String> = Vec::with_capacity(KEYWORD_TARGET);
-    let mut seen = std::collections::HashSet::new();
+    normalize_keywords_with_target(raw, KEYWORD_TARGET)
+}
+
+/// Same as [`normalize_keywords`], but uses the user's target. Exact duplicates
+/// and singular/plural pairs are removed before the list is capped, so excess
+/// terms do not crowd out valid alternatives.
+pub fn normalize_keywords_with_target(raw: &str, keyword_target: usize) -> Vec<String> {
+    let target = clamp_keyword_target(keyword_target);
+    let mut keywords: Vec<String> = Vec::with_capacity(target);
+    let mut seen = HashSet::new();
 
     for chunk in raw.split(|c: char| {
         c == ',' || c == ';' || c == '\n' || c == '\r' || c == '|' || c == '/'
@@ -269,36 +420,185 @@ pub fn normalize_keywords(raw: &str) -> Vec<String> {
             }
             if seen.insert(cleaned.to_lowercase()) {
                 keywords.push(cleaned);
-                if keywords.len() == KEYWORD_TARGET {
-                    return keywords;
-                }
             }
         }
     }
 
+    let present: HashSet<String> = keywords.iter().map(|word| word.to_lowercase()).collect();
+    keywords.retain(|word| !is_plural_form(word, &present));
+    keywords.truncate(target);
     keywords
+}
+
+const INVARIANT_PLURALS: &[&str] = &[
+    "series",
+    "species",
+    "news",
+    "means",
+    "sheep",
+    "fish",
+    "deer",
+    "moose",
+    "salmon",
+    "trout",
+    "aircraft",
+    "spacecraft",
+    "offspring",
+    "headquarters",
+    "scissors",
+    "trousers",
+    "clothes",
+    "jeans",
+    "pants",
+    "shorts",
+    "bison",
+    "swine",
+    "cod",
+    "shrimp",
+];
+
+/// Candidate singular forms for a word, used only to detect a pair that is
+/// already present. A plural on its own is left untouched.
+fn singular_candidates(word: &str) -> Vec<String> {
+    let lower = word.to_lowercase();
+    if INVARIANT_PLURALS.contains(&lower.as_str()) {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let irregular: &[&str] = match lower.as_str() {
+        "people" => &["person"],
+        "children" => &["child"],
+        "men" => &["man"],
+        "women" => &["woman"],
+        "feet" => &["foot"],
+        "teeth" => &["tooth"],
+        "mice" => &["mouse"],
+        "geese" => &["goose"],
+        "oxen" => &["ox"],
+        "indices" => &["index"],
+        "matrices" => &["matrix"],
+        "vertices" => &["vertex"],
+        "appendices" => &["appendix"],
+        "analyses" => &["analysis"],
+        "crises" => &["crisis"],
+        "theses" => &["thesis"],
+        "diagnoses" => &["diagnosis"],
+        "axes" => &["axis", "axe"],
+        "bacteria" => &["bacterium"],
+        "criteria" => &["criterion"],
+        "phenomena" => &["phenomenon"],
+        "cacti" => &["cactus"],
+        "fungi" => &["fungus"],
+        "nuclei" => &["nucleus"],
+        "stimuli" => &["stimulus"],
+        "alumni" => &["alumnus"],
+        "radii" => &["radius"],
+        _ => &[],
+    };
+    candidates.extend(irregular.iter().map(|candidate| candidate.to_string()));
+
+    let chars = lower.chars().count();
+    if chars > 3 && lower.ends_with("ies") {
+        candidates.push(format!("{}y", &lower[..lower.len() - 3]));
+    }
+    if chars > 3 && lower.ends_with("ves") {
+        let stem = &lower[..lower.len() - 3];
+        candidates.push(format!("{stem}f"));
+        candidates.push(format!("{stem}fe"));
+    }
+    if chars > 2 && lower.ends_with("es") {
+        candidates.push(lower[..lower.len() - 2].to_string());
+    }
+    if chars > 2
+        && lower.ends_with('s')
+        && !lower.ends_with("ss")
+        && !lower.ends_with("us")
+        && !lower.ends_with("is")
+    {
+        candidates.push(lower[..lower.len() - 1].to_string());
+    }
+
+    candidates.retain(|candidate| {
+        candidate.as_str() != lower
+            && candidate.chars().count() >= 2
+            && candidate.chars().all(char::is_alphabetic)
+    });
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn is_plural_form(word: &str, present: &HashSet<String>) -> bool {
+    singular_candidates(word)
+        .iter()
+        .any(|candidate| present.contains(candidate))
+}
+
+/// True when `plural` is a plural form of `singular`, using the same
+/// conservative candidate rules as normalization.
+pub fn is_plural_of(plural: &str, singular: &str) -> bool {
+    let singular = singular.to_lowercase();
+    singular_candidates(plural)
+        .iter()
+        .any(|candidate| candidate == &singular)
 }
 
 pub fn is_valid_keyword(word: &str) -> bool {
     word.chars().count() >= 2 && word.chars().all(|c| c.is_alphabetic())
 }
 
+pub fn title_word_count(title: &str) -> usize {
+    title.split_whitespace().count()
+}
+
+pub fn caption_char_count(caption: &str) -> usize {
+    caption.chars().count()
+}
+
+#[cfg(test)]
 pub fn validate(title: &str, caption: &str, keywords: &[String]) -> Vec<String> {
+    validate_with_constraints(
+        title,
+        caption,
+        keywords,
+        KEYWORD_TARGET,
+        (TITLE_WORDS_DEFAULT_MIN, TITLE_WORDS_DEFAULT_MAX),
+        (CAPTION_CHARS_DEFAULT_MIN, CAPTION_CHARS_DEFAULT_MAX),
+    )
+}
+
+pub fn validate_with_constraints(
+    title: &str,
+    caption: &str,
+    keywords: &[String],
+    keyword_target: usize,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
+) -> Vec<String> {
+    let target = clamp_keyword_target(keyword_target);
+    let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
+    let (caption_min, caption_max) =
+        clamp_caption_char_range(caption_range.0, caption_range.1);
     let mut warnings = Vec::new();
 
-    let words = title.split_whitespace().count();
-    if !(3..=5).contains(&words) {
-        warnings.push(format!("Title has {words} words (needs 3–5)"));
-    }
-
-    let chars = caption.chars().count();
-    if !(50..=180).contains(&chars) {
-        warnings.push(format!("Caption is {chars} characters (needs 50–180)"));
-    }
-
-    if keywords.len() != KEYWORD_TARGET {
+    let words = title_word_count(title);
+    if !(title_min..=title_max).contains(&words) {
         warnings.push(format!(
-            "{} keywords (needs exactly {KEYWORD_TARGET})",
+            "Title has {words} words (needs {title_min}–{title_max})"
+        ));
+    }
+
+    let chars = caption_char_count(caption);
+    if !(caption_min..=caption_max).contains(&chars) {
+        warnings.push(format!(
+            "Caption is {chars} characters (needs {caption_min}–{caption_max})"
+        ));
+    }
+
+    if keywords.len() != target {
+        warnings.push(format!(
+            "{} keywords (needs exactly {target})",
             keywords.len()
         ));
     }
@@ -595,5 +895,98 @@ mod tests {
         assert!(parsed.editorial);
         assert_eq!(parsed.caption, caption);
         assert!(parsed.caption.contains('–'));
+    }
+
+    #[test]
+    fn singular_and_plural_duplicates_keep_the_singular() {
+        assert_eq!(
+            normalize_keywords("apple, apples, banana"),
+            vec!["apple", "banana"]
+        );
+        assert_eq!(normalize_keywords("apples, apple"), vec!["apple"]);
+        assert_eq!(
+            normalize_keywords("cities, city, boxes, box, knives, knife"),
+            vec!["city", "box", "knife"]
+        );
+        assert_eq!(
+            normalize_keywords("apples, bananas"),
+            vec!["apples", "bananas"],
+            "a plural on its own is valid"
+        );
+        assert_eq!(
+            normalize_keywords("series, sery"),
+            vec!["series", "sery"],
+            "invariant plurals are not rewritten"
+        );
+    }
+
+    #[test]
+    fn target_controls_prompt_and_trimming() {
+        let raw = unique_words(60).join(", ");
+        assert_eq!(normalize_keywords_with_target(&raw, 37).len(), 37);
+
+        let prompt = system_prompt_with_constraints(
+            "November 6, 2026",
+            "",
+            37,
+            (4, 8),
+            (70, 220),
+        );
+        assert!(prompt.contains("Exactly 37 keywords."));
+        assert!(prompt.contains("Between 4 and 8 words."));
+        assert!(prompt.contains("70 to 220 characters"));
+        assert!(prompt.contains("Title: [4-8 words]"));
+        assert!(prompt.contains("Caption: [70-220 characters]"));
+        assert!(!prompt.contains("{TITLE_MIN_WORDS}"));
+        assert!(!prompt.contains("{CAPTION_MAX_CHARS}"));
+        assert!(prompt.contains("word37"));
+        assert!(!prompt.contains("word50"));
+    }
+
+    #[test]
+    fn retry_prompt_records_every_missed_constraint_and_previous_terms() {
+        let previous = GeneratedMetadata {
+            title: "Too Many Words In This Title".to_string(),
+            caption: "short".to_string(),
+            keywords: vec!["apple".to_string()],
+            editorial: false,
+        };
+        let prompt = retry_prompt(None, None, 5, (3, 5), (50, 180), &previous);
+        assert!(prompt.contains("Only 1 usable keyword was returned"));
+        assert!(prompt.contains("exactly 5"));
+        assert!(prompt.contains("apple"));
+        assert!(prompt.contains("keep the singular"));
+        assert!(prompt.contains("title has 6 words"));
+        assert!(prompt.contains("must have 3–5"));
+        assert!(prompt.contains("caption has 5 characters"));
+        assert!(prompt.contains("must have 50–180 characters"));
+        assert!(prompt.contains("Rewrite the title"));
+        assert!(prompt.contains("Rewrite the caption"));
+    }
+
+    #[test]
+    fn custom_ranges_drive_validation() {
+        let keywords = unique_words(5);
+        let warnings = validate_with_constraints(
+            "One Two Three Four",
+            &"a".repeat(70),
+            &keywords,
+            5,
+            (2, 3),
+            (60, 80),
+        );
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("Title has 4 words (needs 2–3)"));
+
+        let warnings = validate_with_constraints(
+            "One Two",
+            &"a".repeat(81),
+            &keywords,
+            5,
+            (2, 3),
+            (60, 80),
+        );
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("Caption is 81 characters (needs 60–80)"));
     }
 }

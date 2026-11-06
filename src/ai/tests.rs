@@ -4,7 +4,7 @@ use crate::config::{Provider, ProviderSettings};
 use base64::Engine as _;
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -55,60 +55,73 @@ fn find_headers_end(buffer: &[u8]) -> Option<usize> {
         .map(|position| position + 4)
 }
 
-/// Accept one HTTP request, capture it and reply with a fixed status/body.
-fn mock_server(status: &'static str, body: &'static str) -> MockServer {
+fn read_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+
+    let mut buffer = Vec::new();
+    let mut header_end = None;
+    while header_end.is_none() {
+        let mut chunk = [0u8; 1024];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                buffer.extend_from_slice(&chunk[..read]);
+                header_end = find_headers_end(&buffer);
+            }
+            Err(_) => break,
+        }
+    }
+
+    if let Some(end) = header_end {
+        let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+        let content_length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < end + content_length {
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                Err(_) => break,
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+/// Accept a sequence of requests, replying with the matching status/body each time.
+fn mock_server_sequence(responses: Vec<(&'static str, &'static str)>) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let port = listener.local_addr().expect("local addr").port();
 
     let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept request");
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-
-        let mut buffer = Vec::new();
-        let mut header_end = None;
-        while header_end.is_none() {
-            let mut chunk = [0u8; 1024];
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => {
-                    buffer.extend_from_slice(&chunk[..read]);
-                    header_end = find_headers_end(&buffer);
-                }
-                Err(_) => break,
-            }
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            requests.push(request);
         }
-
-        if let Some(end) = header_end {
-            let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
-            let content_length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            while buffer.len() < end + content_length {
-                let mut chunk = [0u8; 4096];
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                    Err(_) => break,
-                }
-            }
-        }
-
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-
-        String::from_utf8_lossy(&buffer).to_string()
+        requests.join("\n---\n")
     });
 
     MockServer {
         url: format!("http://127.0.0.1:{port}"),
         handle,
     }
+}
+
+/// Accept one HTTP request, capture it and reply with a fixed status/body.
+fn mock_server(status: &'static str, body: &'static str) -> MockServer {
+    mock_server_sequence(vec![(status, body)])
 }
 
 fn request_body(request: &str) -> Value {
@@ -224,6 +237,73 @@ fn snippet_collapses_whitespace_and_truncates_long_text() {
     assert_eq!(short.chars().count(), 401);
     assert!(short.ends_with('…'));
     assert!(!snippet("short").ends_with('…'));
+}
+
+#[tokio::test]
+async fn generate_retries_when_the_first_keyword_list_is_short() {
+    let first = r#"{"choices":[{"message":{"content":"Title: Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple"}}]}"#;
+    let second = r#"{"choices":[{"message":{"content":"Title: Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, apples, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", first), ("200 OK", second)]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("generate should recover from a short keyword list");
+
+    assert_eq!(result.keywords, vec!["apple", "banana", "cherry"]);
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert!(requests.contains("Only 1 usable keyword was returned"));
+    assert!(requests.contains("title has 2 words"));
+}
+
+#[tokio::test]
+async fn generate_retries_out_of_range_title_and_caption() {
+    let first = r#"{"choices":[{"message":{"content":"Title: Tiny Title\nEditorial Status: Commercial\nCaption: Too short.\nKeywords: apple, banana, cherry"}}]}"#;
+    let second = r#"{"choices":[{"message":{"content":"Title: A Corrected Title\nEditorial Status: Commercial\nCaption: A corrected factual caption about the scene that is long enough to pass.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", first), ("200 OK", second)]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("generate should retry an out-of-range title and caption");
+
+    assert_eq!(result.title, "A Corrected Title");
+    assert!(result.caption.starts_with("A corrected factual caption"));
+    assert_eq!(result.keywords, vec!["apple", "banana", "cherry"]);
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert!(requests.contains("Rewrite the title to 3–5 words"));
+    assert!(requests.contains("Rewrite the caption to 50–180 characters"));
+    assert!(requests.contains("Keep the keywords unchanged"));
 }
 
 // ----------------------------------------------------------------- Ollama

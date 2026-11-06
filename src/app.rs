@@ -77,6 +77,7 @@ pub struct App {
     pub batch_keywords: String,
     pub show_about: bool,
     pub dark: bool,
+    auto_save_paths: Vec<PathBuf>,
 
     system_dark: bool,
     was_focused: bool,
@@ -144,6 +145,7 @@ impl App {
             batch_keywords: String::new(),
             show_about: false,
             dark,
+            auto_save_paths: Vec::new(),
             system_dark,
             was_focused: true,
             rt,
@@ -368,11 +370,9 @@ impl App {
 
         let present: HashSet<PathBuf> = self.folder_images.iter().cloned().collect();
         self.thumbs.retain(&present);
+        // Folder changes clear the selection in `open_folder`; a refresh should
+        // only drop paths that no longer exist, never select a replacement.
         self.selection.retain_existing(&self.folder_images);
-        if self.selection.is_empty() && !self.folder_images.is_empty() {
-            self.selection
-                .select_only(&self.folder_images[0]);
-        }
         self.after_selection_change(ctx);
     }
 
@@ -663,6 +663,7 @@ impl App {
             return;
         }
 
+        self.auto_save_paths.clear();
         let mut seen = HashSet::new();
         let paths: Vec<PathBuf> = paths
             .into_iter()
@@ -691,6 +692,9 @@ impl App {
             Some(self.context.trim().to_string()).filter(|value| !value.is_empty());
         let now = chrono::Local::now();
         let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
+        let keyword_target = self.cfg.keyword_target();
+        let title_range = self.cfg.title_word_range();
+        let caption_range = self.cfg.caption_char_range();
         let concurrency = self.cfg.concurrency.clamp(1, 4);
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
@@ -712,6 +716,9 @@ impl App {
                 let global_prompt = global_prompt.clone();
                 let context = context.clone();
                 let date = date.clone();
+                let keyword_target = keyword_target;
+                let title_range = title_range;
+                let caption_range = caption_range;
 
                 tasks.spawn(async move {
                     let _ = tx.send(WorkerEvent::AiStarted { path: path.clone() });
@@ -732,6 +739,9 @@ impl App {
                             existing,
                             global_prompt,
                             date,
+                            keyword_target,
+                            title_range,
+                            caption_range,
                         }),
                         Ok(Err(err)) => Err(format!("{err:#}")),
                         Err(err) => Err(format!("Image preparation failed: {err}")),
@@ -792,6 +802,11 @@ impl App {
     }
 
     pub fn save_selected(&mut self, ctx: &egui::Context) {
+        let selected = self.selected_paths();
+        self.save_paths(ctx, selected);
+    }
+
+    fn save_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         if self.batch.is_some() {
             self.notify("A batch job is already running", true);
             return;
@@ -801,8 +816,7 @@ impl App {
             return;
         };
 
-        let selected = self.selected_paths();
-        let items: Vec<(PathBuf, Metadata)> = selected
+        let items: Vec<(PathBuf, Metadata)> = paths
             .iter()
             .filter_map(|path| {
                 self.items
@@ -813,11 +827,11 @@ impl App {
             .collect();
 
         if items.is_empty() {
-            self.notify("Select generated images with a title before saving", true);
+            self.notify("No images with a title are ready to save", true);
             return;
         }
 
-        let skipped = selected.len().saturating_sub(items.len());
+        let skipped = paths.len().saturating_sub(items.len());
         if skipped > 0 {
             self.notify(
                 format!("Saving {} image(s); {skipped} without a title were skipped", items.len()),
@@ -883,7 +897,8 @@ impl App {
     }
 
     pub fn append_batch_keywords(&mut self, raw: String) {
-        let additions = crate::ai::prompt::normalize_keywords(&raw);
+        let target = self.cfg.keyword_target();
+        let additions = crate::ai::prompt::normalize_keywords_with_target(&raw, target);
         if additions.is_empty() {
             self.notify("No valid keywords in that input", true);
             return;
@@ -891,7 +906,7 @@ impl App {
         let paths = self.selected_paths();
         for path in &paths {
             if let Some(item) = self.items.get_mut(path) {
-                state::append_keywords(&mut item.keywords, &additions);
+                state::append_keywords_with_target(&mut item.keywords, &additions, target);
                 item.dirty = true;
             }
         }
@@ -902,7 +917,10 @@ impl App {
     }
 
     pub fn replace_batch_keywords(&mut self, raw: String) {
-        let keywords = crate::ai::prompt::normalize_keywords(&raw);
+        let keywords = crate::ai::prompt::normalize_keywords_with_target(
+            &raw,
+            self.cfg.keyword_target(),
+        );
         if keywords.is_empty() {
             self.notify("No valid keywords in that input", true);
             return;
@@ -957,6 +975,7 @@ impl App {
                 }
                 WorkerEvent::AiDone { path, result } => {
                     let mut counted = false;
+                    let mut generated_ok = false;
                     if let Some(item) = self.items.get_mut(&path) {
                         match result {
                             Ok(generated) => {
@@ -969,6 +988,7 @@ impl App {
                                 item.dirty = true;
                                 item.message = None;
                                 counted = true;
+                                generated_ok = true;
                             }
                             Err(error) => {
                                 item.status = Status::Error;
@@ -976,6 +996,9 @@ impl App {
                                 counted = true;
                             }
                         }
+                    }
+                    if generated_ok {
+                        self.auto_save_paths.push(path);
                     }
                     if counted {
                         if let Some(batch) = self.batch.as_mut() {
@@ -986,14 +1009,25 @@ impl App {
                     }
                 }
                 WorkerEvent::BatchFinished { ok, failed } => {
+                    let generated = std::mem::take(&mut self.auto_save_paths);
                     self.batch = None;
-                    if failed == 0 {
-                        self.notify(format!("AI finished for {ok} image(s)"), false);
+                    let summary = if failed == 0 {
+                        format!("AI finished for {ok} image(s)")
                     } else {
+                        format!("AI finished: {ok} succeeded, {failed} failed")
+                    };
+                    if generated.is_empty() {
+                        self.notify(summary, failed > 0);
+                    } else if self.exiftool.is_none() {
                         self.notify(
-                            format!("AI finished: {ok} succeeded, {failed} failed"),
+                            format!(
+                                "{summary}; ExifTool is unavailable, so metadata was not saved"
+                            ),
                             true,
                         );
+                    } else {
+                        self.notify(format!("{summary}; saving metadata…"), failed > 0);
+                        self.save_paths(ctx, generated);
                     }
                 }
                 WorkerEvent::SaveDone { path, result } => {

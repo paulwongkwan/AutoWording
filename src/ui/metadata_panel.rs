@@ -1,7 +1,10 @@
 use crate::ai::prompt;
 use crate::app::App;
-use crate::config::Provider;
-use crate::state::{aggregate_common, append_keywords, ImageItem, Status};
+use crate::config::{
+    Provider, CAPTION_CHARS_MAX, CAPTION_CHARS_MIN, KEYWORD_TARGET_MAX, KEYWORD_TARGET_MIN,
+    TITLE_WORDS_MAX, TITLE_WORDS_MIN,
+};
+use crate::state::{aggregate_common, append_keywords_with_target, ImageItem, Status};
 use crate::theme;
 use crate::ui::{
     count_chip, ghost_button, primary_button, section_title, segmented_button, status_pill,
@@ -94,6 +97,9 @@ fn single(
     let mut editorial = item.editorial;
     let mut generate = false;
     let mut save = false;
+    let keyword_target = app.cfg.keyword_target();
+    let (title_min, title_max) = app.cfg.title_word_range();
+    let (caption_min, caption_max) = app.cfg.caption_char_range();
 
     Frame::none()
         .fill(theme::bg())
@@ -127,15 +133,19 @@ fn single(
         ui.add(egui::Label::new(
             RichText::new("Title").size(11.0).color(theme::text_muted()),
         ));
-        let words = title.split_whitespace().count();
+        let words = prompt::title_word_count(&title);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            count_chip(ui, &format!("{words} words"), (3..=5).contains(&words));
+            count_chip(
+                ui,
+                &format!("{words} words"),
+                (title_min..=title_max).contains(&words),
+            );
         });
     });
     ui.add(
         TextEdit::singleline(&mut title)
             .desired_width(f32::INFINITY)
-            .hint_text("3–5 word descriptive title"),
+            .hint_text(format!("{title_min}–{title_max} word descriptive title")),
     );
 
     gap(ui, compact, 6.0, 4.0);
@@ -168,12 +178,12 @@ fn single(
         ui.add(egui::Label::new(
             RichText::new("Caption").size(11.0).color(theme::text_muted()),
         ));
-        let chars = caption.chars().count();
+        let chars = prompt::caption_char_count(&caption);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             count_chip(
                 ui,
                 &format!("{chars} chars"),
-                (50..=180).contains(&chars),
+                (caption_min..=caption_max).contains(&chars),
             );
         });
     });
@@ -181,7 +191,9 @@ fn single(
         TextEdit::multiline(&mut caption)
             .desired_width(f32::INFINITY)
             .desired_rows(if compact { 2 } else { 3 })
-            .hint_text("Factual caption, 50–180 characters"),
+            .hint_text(format!(
+                "Factual caption, {caption_min}–{caption_max} characters"
+            )),
     );
 
     gap(ui, compact, 5.0, 4.0);
@@ -192,11 +204,14 @@ fn single(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             count_chip(
                 ui,
-                &format!("{} / {}", keywords.len(), prompt::KEYWORD_TARGET),
-                keywords.len() == prompt::KEYWORD_TARGET,
+                &format!("{} / {}", keywords.len(), keyword_target),
+                keywords.len() == keyword_target,
             );
             if ui.add(text_button("Normalize")).clicked() {
-                keywords = prompt::normalize_keywords(&keywords.join(", "));
+                keywords = prompt::normalize_keywords_with_target(
+                    &keywords.join(", "),
+                    keyword_target,
+                );
             }
         });
     });
@@ -244,15 +259,23 @@ fn single(
         let submitted = add.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
         let clicked = ui.add(ghost_button("Add")).clicked();
         if submitted || clicked {
-            for keyword in prompt::normalize_keywords(&keyword_input) {
-                append_keywords(&mut keywords, &[keyword]);
+            for keyword in prompt::normalize_keywords_with_target(&keyword_input, keyword_target)
+            {
+                append_keywords_with_target(&mut keywords, &[keyword], keyword_target);
             }
             keyword_input.clear();
         }
     });
     app.keyword_input = keyword_input;
 
-    let warnings = prompt::validate(&title, &caption, &keywords);
+    let warnings = prompt::validate_with_constraints(
+        &title,
+        &caption,
+        &keywords,
+        keyword_target,
+        (title_min, title_max),
+        (caption_min, caption_max),
+    );
     if !warnings.is_empty() {
         gap(ui, compact, 3.0, 2.0);
         for warning in &warnings {
@@ -833,6 +856,47 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                 app.cfg_dirty = Some(Instant::now());
             }
 
+            let mut keyword_target = app.cfg.keyword_target();
+            let target = ui.add(
+                egui::Slider::new(
+                    &mut keyword_target,
+                    KEYWORD_TARGET_MIN..=KEYWORD_TARGET_MAX,
+                )
+                .text("Keywords per image"),
+            );
+            if target.changed() {
+                app.cfg.keyword_target = keyword_target;
+                app.cfg_dirty = Some(Instant::now());
+            }
+
+            let (mut title_min, mut title_max) = app.cfg.title_word_range();
+            if range_editor(
+                ui,
+                "Title words",
+                &mut title_min,
+                &mut title_max,
+                TITLE_WORDS_MIN,
+                TITLE_WORDS_MAX,
+            ) {
+                app.cfg.title_min_words = title_min;
+                app.cfg.title_max_words = title_max;
+                app.cfg_dirty = Some(Instant::now());
+            }
+
+            let (mut caption_min, mut caption_max) = app.cfg.caption_char_range();
+            if range_editor(
+                ui,
+                "Caption chars",
+                &mut caption_min,
+                &mut caption_max,
+                CAPTION_CHARS_MIN,
+                CAPTION_CHARS_MAX,
+            ) {
+                app.cfg.caption_min_chars = caption_min;
+                app.cfg.caption_max_chars = caption_max;
+                app.cfg_dirty = Some(Instant::now());
+            }
+
             gap(ui, compact, 4.0, 3.0);
             egui::CollapsingHeader::new("Prompt")
                 .default_open(false)
@@ -939,6 +1003,46 @@ fn settings(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool
                 .wrap(),
             );
         });
+}
+
+fn range_editor(
+    ui: &mut egui::Ui,
+    label: &str,
+    min: &mut usize,
+    max: &mut usize,
+    floor: usize,
+    ceiling: usize,
+) -> bool {
+    let mut min_changed = false;
+    let mut max_changed = false;
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(label)
+                    .size(10.0)
+                    .color(theme::text_muted()),
+            ),
+        )
+        .on_hover_text(format!("Allowed range: {floor}–{ceiling}"));
+        min_changed = ui
+            .add(egui::DragValue::new(min).speed(0.2))
+            .on_hover_text("Minimum")
+            .changed();
+        ui.add(egui::Label::new("–"));
+        max_changed = ui
+            .add(egui::DragValue::new(max).speed(0.2))
+            .on_hover_text("Maximum")
+            .changed();
+    });
+
+    *min = (*min).clamp(floor, ceiling);
+    *max = (*max).clamp(floor, ceiling);
+    if min_changed && *min > *max {
+        *max = *min;
+    } else if max_changed && *max < *min {
+        *min = *max;
+    }
+    min_changed || max_changed
 }
 
 fn labelled_field(

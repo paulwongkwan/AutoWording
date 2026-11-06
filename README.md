@@ -155,8 +155,27 @@ cargo run --release
 - `.tools/` — `gcc.exe`, `ld.exe`, `dlltool.exe`, `as.exe`.
 - `.freebuff/` — local agent metadata.
 - `%APPDATA%\AutoWording\config\config.toml` — user settings and API keys.
+- `dist/` — packaged release executables written by `release.ps1`.
 
 `[profile.release] opt-level = 2`; no LTO, stripping, icon, manifest, installer, code signing, or auto-update.
+
+### 5.5 Release
+
+```bat
+release.bat
+release.bat 0.1.1
+release.bat 0.1.1 -DryRun
+```
+
+`release.ps1` builds through `build.bat` (GNU toolchain), copies `target\release\autowording.exe` to `dist\AutoWording-v<version>-windows-x64.exe`, and publishes a GitHub release tagged `v<version>` whose asset is that exe.
+
+- Version defaults to `Cargo.toml`; the tag is `v` plus that version.
+- Release notes default to the commit subjects since the previous tag; pass `-NotesFile notes.md` to supply curated Markdown.
+- Publishing uses the REST API when `GH_TOKEN` or `GITHUB_TOKEN` is set, otherwise the authenticated GitHub CLI (`gh`). Nothing is published without one of those.
+- The current commit must already be pushed: the tag is created at `HEAD`, and the script refuses to run when `origin/<branch>` is missing or behind.
+- `-NoBuild` reuses the existing exe; `-DryRun` prints the tag, asset, and notes without publishing.
+- Uncommitted changes are only a warning (the binary includes them) but the tag and notes describe the pushed commit.
+- The exe is not committed; `dist/` is gitignored.
 
 ---
 
@@ -542,6 +561,8 @@ struct ExistingMetadata {
 Cargo.toml                     crate metadata, dependencies, release profile
 Cargo.lock                     locked dependency graph (committed)
 build.bat                      GNU-toolchain build wrapper
+release.ps1                    release build + GitHub release publishing
+release.bat                    cmd wrapper for release.ps1
 README.md                      this document
 
 src/main.rs                    Windows subsystem attr, egui window setup

@@ -6,6 +6,8 @@ pub struct ExistingMetadata {
     pub title: Option<String>,
     pub caption: Option<String>,
     pub keywords: Vec<String>,
+    pub gps: Option<String>,
+    pub date: Option<String>,
     pub dims: Option<(u32, u32)>,
 }
 
@@ -19,6 +21,12 @@ pub const READ_TAGS: &[&str] = &[
     "-XPTitle",
     "-IPTC:Keywords",
     "-Subject",
+    "-GPSPosition",
+    "-GPSLatitude",
+    "-GPSLongitude",
+    "-DateTimeOriginal",
+    "-CreateDate",
+    "-DateTime",
     "-ImageSize",
 ];
 
@@ -31,6 +39,20 @@ fn first_string(object: &Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+fn gps_location(object: &Value) -> Option<String> {
+    if let Some(position) = first_string(object, &["GPSPosition"]) {
+        return Some(position);
+    }
+    match (
+        first_string(object, &["GPSLatitude"]),
+        first_string(object, &["GPSLongitude"]),
+    ) {
+        (Some(latitude), Some(longitude)) => Some(format!("{latitude}, {longitude}")),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn keyword_list(object: &Value, key: &str) -> Vec<String> {
@@ -76,6 +98,12 @@ pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
         }
     }
 
+    let gps = gps_location(object);
+    let date = first_string(
+        object,
+        &["DateTimeOriginal", "CreateDate", "DateTime"],
+    );
+
     let dims = object
         .get("ImageSize")
         .and_then(Value::as_str)
@@ -88,6 +116,8 @@ pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
         title,
         caption,
         keywords,
+        gps,
+        date,
         dims,
     })
 }
@@ -106,6 +136,8 @@ mod tests {
                 "ImageDescription": "fallback",
                 "Keywords": ["bridge", "sunrise"],
                 "Subject": ["sunrise", "fog"],
+                "GPSPosition": "37 deg 48' 30.00\" N, 122 deg 28' 10.00\" W",
+                "DateTimeOriginal": "2026:10:31 17:42:11",
                 "ImageSize": "6000x4000"
             }
         ]"#;
@@ -113,7 +145,27 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Golden Gate Sunrise"));
         assert_eq!(parsed.caption.as_deref(), Some("Fog drifts under the bridge."));
         assert_eq!(parsed.keywords, vec!["bridge", "sunrise", "fog"]);
+        assert_eq!(
+            parsed.gps.as_deref(),
+            Some("37 deg 48' 30.00\" N, 122 deg 28' 10.00\" W")
+        );
+        assert_eq!(parsed.date.as_deref(), Some("2026:10:31 17:42:11"));
         assert_eq!(parsed.dims, Some((6000, 4000)));
+    }
+
+    #[test]
+    fn parses_gps_lat_lon_and_capture_date_fallbacks() {
+        let json = r#"[{
+            "GPSLatitude": "51 deg 30' 0.00\" N",
+            "GPSLongitude": "0 deg 7' 0.00\" W",
+            "CreateDate": "2025:06:01 08:00:00"
+        }]"#;
+        let parsed = parse_read_json(json).expect("valid json");
+        assert_eq!(
+            parsed.gps.as_deref(),
+            Some("51 deg 30' 0.00\" N, 0 deg 7' 0.00\" W")
+        );
+        assert_eq!(parsed.date.as_deref(), Some("2025:06:01 08:00:00"));
     }
 
     #[test]

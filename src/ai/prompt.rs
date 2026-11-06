@@ -1,3 +1,4 @@
+use crate::metadata::ExistingMetadata;
 use anyhow::{bail, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -64,14 +65,77 @@ pub fn system_prompt(date: &str, extra: &str) -> String {
     prompt
 }
 
-pub fn user_prompt(context: Option<&str>) -> String {
-    match context.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(context) => format!(
-            "Situational context supplied by the photographer (treat it as ground truth):\n{context}\n\nAnalyze the attached image and return the four labelled fields exactly as specified."
-        ),
-        None => "Analyze the attached image and return the four labelled fields exactly as specified."
-            .to_string(),
+pub fn user_prompt(context: Option<&str>, existing: Option<&ExistingMetadata>) -> String {
+    let metadata = existing
+        .map(existing_metadata_block)
+        .filter(|block| !block.is_empty());
+    let context = context.map(str::trim).filter(|c| !c.is_empty());
+    let mut prompt = String::new();
+
+    if let Some(metadata) = metadata {
+        prompt.push_str(
+            "Existing file metadata (reference only; the returned title, caption, and keywords replace these values):\n",
+        );
+        prompt.push_str(&metadata);
+        prompt.push_str("\n\n");
     }
+    if let Some(context) = context {
+        prompt.push_str(
+            "Situational context supplied by the photographer (treat it as ground truth):\n",
+        );
+        prompt.push_str(context);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(
+        "Analyze the attached image and return the four labelled fields exactly as specified.",
+    );
+    prompt
+}
+
+fn existing_metadata_block(existing: &ExistingMetadata) -> String {
+    let mut lines = Vec::new();
+    if let Some(gps) = existing
+        .gps
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("GPS location: {gps}"));
+    }
+    if let Some(date) = existing
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Capture date: {date}"));
+    }
+    if let Some(title) = existing
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Title: {title}"));
+    }
+    if let Some(caption) = existing
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Caption: {caption}"));
+    }
+    if !existing.keywords.is_empty() {
+        lines.push(format!("Keywords: {}", existing.keywords.join(", ")));
+    }
+    if !lines.is_empty() {
+        lines.push(
+            "Use these details as context and return fresh title, caption, and keywords."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 fn field_regex() -> &'static Regex {
@@ -349,14 +413,34 @@ mod tests {
 
     #[test]
     fn user_prompt_includes_context_only_when_present() {
-        assert!(user_prompt(None).contains("Analyze the attached image"));
-        assert!(!user_prompt(None).contains("Situational context"));
-        assert!(!user_prompt(Some("   ")).contains("Situational context"));
+        assert!(user_prompt(None, None).contains("Analyze the attached image"));
+        assert!(!user_prompt(None, None).contains("Situational context"));
+        assert!(!user_prompt(Some("   "), None).contains("Situational context"));
 
-        let prompt = user_prompt(Some("  King's Day in Amsterdam  "));
+        let prompt = user_prompt(Some("  King's Day in Amsterdam  "), None);
         assert!(prompt.contains("King's Day in Amsterdam"));
         assert!(!prompt.contains("  King's Day"));
         assert!(prompt.contains("ground truth"));
+    }
+
+    #[test]
+    fn user_prompt_includes_existing_file_metadata() {
+        let existing = ExistingMetadata {
+            title: Some("Canal Sunset".to_string()),
+            caption: Some("Warm light over the Amsterdam canal.".to_string()),
+            keywords: vec!["canal".to_string(), "sunset".to_string()],
+            gps: Some("52 deg 22' 12.00\" N, 4 deg 53' 24.00\" E".to_string()),
+            date: Some("2026:04:19 20:14:03".to_string()),
+            dims: Some((6000, 4000)),
+        };
+        let prompt = user_prompt(Some("King's Day in Amsterdam"), Some(&existing));
+        assert!(prompt.contains("GPS location: 52 deg 22' 12.00\" N, 4 deg 53' 24.00\" E"));
+        assert!(prompt.contains("Capture date: 2026:04:19 20:14:03"));
+        assert!(prompt.contains("Title: Canal Sunset"));
+        assert!(prompt.contains("Caption: Warm light over the Amsterdam canal."));
+        assert!(prompt.contains("Keywords: canal, sunset"));
+        assert!(prompt.contains("King's Day in Amsterdam"));
+        assert!(prompt.contains("replace these values"));
     }
 
     #[test]

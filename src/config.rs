@@ -127,6 +127,64 @@ impl ProviderSettings {
     }
 }
 
+/// User appearance preference. `System` re-reads the Windows app theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub const ALL: [ThemePreference; 3] = [
+        ThemePreference::System,
+        ThemePreference::Light,
+        ThemePreference::Dark,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePreference::System => "Follow Windows",
+            ThemePreference::Light => "Light",
+            ThemePreference::Dark => "Dark",
+        }
+    }
+
+    pub fn resolve(self, system_dark: bool) -> bool {
+        match self {
+            ThemePreference::System => system_dark,
+            ThemePreference::Light => false,
+            ThemePreference::Dark => true,
+        }
+    }
+}
+
+/// Vertical density for the browser cards and metadata inspector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutDensity {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+impl LayoutDensity {
+    pub const ALL: [LayoutDensity; 2] = [LayoutDensity::Comfortable, LayoutDensity::Compact];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutDensity::Comfortable => "Comfortable",
+            LayoutDensity::Compact => "Compact",
+        }
+    }
+
+    pub fn is_compact(self) -> bool {
+        self == LayoutDensity::Compact
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -141,6 +199,10 @@ pub struct Config {
     pub exiftool_path: String,
     /// Last folder opened in the browser, restored on next launch.
     pub last_folder: String,
+    /// System-following or a persisted light/dark override.
+    pub theme: ThemePreference,
+    /// Browser grid and metadata inspector density.
+    pub density: LayoutDensity,
     /// Number of concurrent AI workers for a batch (clamped to 1..=4 at use).
     pub concurrency: usize,
     /// Where this config was loaded from / will be saved to.
@@ -159,6 +221,8 @@ impl Default for Config {
             global_prompt: String::new(),
             exiftool_path: String::new(),
             last_folder: String::new(),
+            theme: ThemePreference::System,
+            density: LayoutDensity::Comfortable,
             concurrency: 1,
             path: None,
         }
@@ -318,7 +382,43 @@ mod tests {
         assert!(cfg.global_prompt.is_empty());
         assert!(cfg.exiftool_path.is_empty());
         assert!(cfg.last_folder.is_empty());
+        assert_eq!(cfg.theme, ThemePreference::System);
+        assert_eq!(cfg.density, LayoutDensity::Comfortable);
         assert_eq!(cfg.concurrency, 1);
+    }
+
+    #[test]
+    fn theme_preference_round_trips_and_resolves() {
+        for preference in ThemePreference::ALL {
+            let text = toml::to_string_pretty(&Config {
+                theme: preference,
+                ..Config::default()
+            })
+            .expect("serialize theme");
+            let back: Config = toml::from_str(&text).expect("deserialize theme");
+            assert_eq!(back.theme, preference);
+        }
+
+        assert!(!ThemePreference::System.resolve(false));
+        assert!(ThemePreference::System.resolve(true));
+        assert!(!ThemePreference::Light.resolve(true));
+        assert!(ThemePreference::Dark.resolve(false));
+    }
+
+    #[test]
+    fn layout_density_round_trips_and_labels() {
+        for density in LayoutDensity::ALL {
+            let text = toml::to_string_pretty(&Config {
+                density,
+                ..Config::default()
+            })
+            .expect("serialize density");
+            let back: Config = toml::from_str(&text).expect("deserialize density");
+            assert_eq!(back.density, density);
+            assert!(!density.label().is_empty());
+        }
+        assert!(LayoutDensity::Compact.is_compact());
+        assert!(!LayoutDensity::Comfortable.is_compact());
     }
 
     #[test]

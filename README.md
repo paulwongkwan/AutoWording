@@ -5,7 +5,7 @@
 | Item | Value |
 | --- | --- |
 | Language | Rust 2021, minimum `rust-version = 1.85` (verified with 1.99.1) |
-| GUI | `eframe` / `egui` 0.28.1, OpenGL (`glow`), Windows 11 light theme, Segoe UI |
+| GUI | `eframe` / `egui` 0.28.1, OpenGL (`glow`), Windows 11 light/dark appearance, Segoe UI |
 | Workspace | ACDSee Classic dual-mode: **Browser** (This PC folder tree + thumbnail grid + preview) and **Viewer** (single image + filmstrip) |
 | Selection | Path-based multi-selection with Ctrl+Click, Shift+Click, Ctrl+Shift+Click, Ctrl+A, and checkbox overlays |
 | AI transport | `reqwest` 0.12 + `tokio` multi-thread runtime, `native-tls` (Windows Schannel) |
@@ -13,7 +13,7 @@
 | Metadata engine | ExifTool command-line executable (external dependency) |
 | Platform | Windows 10/11 (build and runtime are Windows-specific) |
 | Binary | `target\release\autowording.exe` (~21 MB, Windows subsystem, no console window) |
-| Tests | **99** unit/integration tests, all passing as of 2026-11-05 |
+| Tests | **106** unit/integration tests, all passing as of 2026-11-06 |
 | State | Single crate, no workspace, no CI, no installer, no license file |
 
 This README is the operating manual for another LLM or developer. It records the exact prompt, wire formats, tag mappings, selection rules, batch semantics, filesystem contracts, and pitfalls that are easy to regress.
@@ -35,7 +35,7 @@ This README is the operating manual for another LLM or developer. It records the
 11. **Only one batch runs at a time.** Generation and saving share `App::batch`; all batch buttons are disabled while it is `Some`.
 12. **AI batches may run concurrently, saves are sequential.** `Config::concurrency` is clamped to `1..=4`. Statuses go `Queued → Processing` as each worker starts.
 13. **Saving requires a non-empty title.** Selected items without a title are skipped and counted in a toast.
-14. **Config auto-saves; metadata does not.** Provider/prompt/ExifTool/folder/concurrency settings persist after a 500 ms debounce. Image metadata is written only on Save.
+14. **Config auto-saves; metadata does not.** Provider/prompt/ExifTool/folder/theme/density/concurrency settings persist after a 500 ms debounce. Image metadata is written only on Save.
 15. **API keys are plaintext** in `config.toml`. Never commit, print, or log that file.
 
 ---
@@ -46,7 +46,7 @@ AutoWording is a batch keywording workspace for microstock photographers. The wo
 
 1. Browse This PC in the left system folder tree, then open a stock folder. The center grid shows that folder's direct JPEGs.
 2. Select one image (single inspector) or many (batch inspector).
-3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt to a vision model.
+3. Run AI on the selection. Each worker sends a downscaled JPEG plus the strict prompt and the image's existing metadata (title, caption, keywords, GPS location, capture date) and session context.
 4. Review/edit Title, Editorial status, Caption, and keyword chips. In batch mode, inspect common/mixed values and apply title/caption/keyword changes across the selection.
 5. Save one or many files through ExifTool into EXIF, IPTC, and XMP simultaneously.
 6. Thumbnails show `Pending`, `In queue`, `Processing`, `Generated`, `Saved`, `Failed`, or `Modified` badges.
@@ -58,22 +58,26 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 
 ## 3. Feature summary
 
-- ACDSee-style menu bar: **File / Edit / View / Tools / Help**, plus **Browser | Viewer** mode toggle.
+- ACDSee-style menu bar: **File / Edit / View / Theme / Tools / Help**, plus **Browser | Viewer** mode toggle.
 - Three-pane Browser: lazy Windows-style system folder browser (276 px) with Quick access, mounted drive roots, parent navigation, and path display; responsive thumbnail grid with multi-select, active preview; 372 px metadata inspector.
 - Selection: plain click, Ctrl+Click toggle, Shift+Click contiguous range, Ctrl+Shift+Click additive range, Ctrl+A, and per-card checkbox overlays.
 - Visual states: selected accent border, active focus ring, status badges, checkbox checkmarks, hover feedback.
+- Appearance: **Follow Windows**, **Light**, or **Dark** from the Theme menu. The choice persists in config; System mode re-checks the Windows app theme when the window regains focus.
+- Density: **Comfortable / Compact** in the top bar. Compact uses 126×146 cards, a taller grid area, and tighter metadata spacing and field heights. The choice persists in config.
+- Browser selection summary: selected count, total keyword tags, coverage against the 50-keyword-per-image target, and the number/percentage of selected images with keywords. Coverage waits for selected metadata reads, showing loading, ExifTool-waiting, or unavailable states, and flags unreadable images.
 - Single inspector: editable title/caption/editorial/keywords, live compliance chips, add/remove/normalize keywords.
 - Batch inspector: selection count, common/mixed fields (`<Multiple values>`), keyword cloud with occurrence counts, batch title/caption overwrite, keyword append/replace.
 - Concurrent batch AI: configurable 1–4 workers, per-image live status, partial-failure reporting, retry-failed action.
+- AI context: requests include the loaded title, caption, keywords, GPS location, capture date, and session context; generated title, caption, and keywords replace the existing editable values.
 - Batch save: selected items with titles written sequentially, progress bar, per-file errors.
 - Viewer mode: large active image, previous/next, filmstrip, error overlay, Escape returns to Browser.
 - Folder browser is a lazy/cached **This PC** tree of mounted drives and their folders, plus Quick access shortcuts; it auto-expands to the current folder and supports **Up** / `Alt+Up` parent navigation.
 - Four providers: Ollama, LM Studio, OpenAI, Anthropic.
 - Endpoint model discovery: fetch/refresh a model dropdown from Ollama `/api/tags`, LM Studio and OpenAI `/v1/models`, and Anthropic `/v1/models` with provider authentication.
 - ExifTool auto-detection, manual path override, version display, re-check, Unicode-safe argfile execution.
-- Config persistence: `%APPDATA%\AutoWording\config\config.toml`.
+- Config persistence: `%APPDATA%\AutoWording\config\config.toml`, including appearance and density preferences.
 - Keyboard shortcuts: `Ctrl+O`, `Ctrl+Shift+O`, `Ctrl+A`, `Ctrl+S`, `Ctrl+Enter`, `F5`, `Alt+Up`, arrows, `Esc`.
-- 99 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags, real ExifTool round-trips, selection math, system folder tree, cache lifecycle, config.
+- 106 tests: prompt/parser, all providers and model-list endpoints via mock HTTP, metadata tags including GPS/date, real ExifTool round-trips, selection math, system folder tree, cache lifecycle, config, Windows theme detection, palette application, density preferences, and selection coverage math.
 
 ---
 
@@ -247,7 +251,7 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────┐
-│ File  Edit  View  Tools  Help                          [Browser | Viewer]      │
+│ File  Edit  View  Theme  Tools  Help                   [Browser | Viewer]      │
 ├──────────────────┬─────────────────────────────────────────┬───────────────────┤
 │ FOLDER BROWSER   │  FOLDER HEADER  [n] [selected]  Refresh │ METADATA          │
 │  [Up] [Open…] [Refresh]                                  │  single / batch   │
@@ -269,11 +273,13 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 - Window: 1440×920 initial, minimum 1180×720.
 - Left panel: 276 px, fixed.
 - Right panel: 372 px, fixed.
-- Grid max height: 55% of center height, clamped 180–560 px.
-- Grid card: 148×164 px, 6 px padding; columns computed from available width.
+- Grid max height: 55% of center height, clamped 180–560 px (Compact: 60%, clamped 150–560 px).
+- Grid card: Comfortable 156×180 px, 7 px padding; Compact 126×146 px, 5 px padding. Dimensions appear in a dark overlay on the thumbnail.
+- Compact metadata inspector: 9×6 px frame margin, 4.5 px line spacing, 25 px field height, reduced section gaps, and a 2-line caption field.
+- Browser header summary (when a selection exists): `N selected · N keyword tags · N% of target · N/N images keyworded (N%)`. Tag coverage compares total keywords with 50 per selected image; image coverage counts selected images with at least one keyword. The summary waits for selected metadata reads before showing percentages, displays loading/ExifTool-unavailable states, and flags unreadable images.
 - Thumbnails: max 160 px decode. Preview: max 2200 px decode.
 - Viewer filmstrip: 58 px squares, 82 px strip height.
-- Light theme only. Segoe UI from `C:\Windows\Fonts\segoeui.ttf`; default egui font if absent.
+- Light and dark palettes cover panels, cards, menus, inputs, status badges, preview letterboxing, and custom-painted cards. Segoe UI from `C:\Windows\Fonts\segoeui.ttf`; default egui font if absent.
 
 ### 7.2 Menus
 
@@ -282,10 +288,11 @@ The list is sorted case-insensitively, deduplicated, and limited to model IDs (`
 | File | Open Folder… (`Ctrl+O`), Add Images… (`Ctrl+Shift+O`), Save Selected to EXIF (`Ctrl+S`), Exit |
 | Edit | Select All (`Ctrl+A`), Clear Selection, Run AI on Selected (`Ctrl+Enter`), Save Selected |
 | View | Browser, Viewer, Refresh Folder (`F5`) |
+| Theme | Follow Windows, Light, Dark |
 | Tools | Re-check ExifTool, About / Diagnostics |
 | Help | About AutoWording |
 
-The top-right toggle switches Browser/Viewer without losing selection.
+The top-right Browser/Viewer toggle and the adjacent **Comfortable / Compact** switch apply without losing selection.
 
 ### 7.3 Statuses
 
@@ -322,9 +329,9 @@ Shortcuts use `consume_key`, so they do not also reach text fields.
 - Rounded white card; selected cards use a light blue fill and accent border.
 - The active card gets a thicker accent focus ring.
 - Thumbnail area is dark-neutral; failed images show `Unreadable`, loading shows `Loading…`.
-- File name truncated to 21 characters; dimensions at the bottom-right.
+- File name truncated to 19 characters (15 in Compact); dimensions at the bottom-right.
 - Status badge painted at the bottom-left.
-- Checkbox is visible on every card; checked cards use the accent fill; 17 px hit area.
+- Checkbox is visible on every card; checked cards use the accent fill; 17 px hit area (15 in Compact).
 - Tooltip shows full path, status, and keyword count.
 - Hover does not load metadata; selection does.
 
@@ -396,20 +403,20 @@ open_root(path)
 ```
 generate_paths(paths)
   ├─ reject if batch active / empty / no model / cloud key missing
-  ├─ dedupe paths, set items to Queued
+  ├─ dedupe paths, snapshot existing title/caption/keywords/GPS/date, set items to Queued
   ├─ BatchProgress { total, done: 0, saving: false }
   └─ spawn async coordinator
        ├─ Semaphore(concurrency 1..=4)
        ├─ for each path: acquire permit, spawn task
        │    ├─ send AiStarted → UI sets Processing
        │    ├─ spawn_blocking(prepare_image)
-       │    ├─ ai::generate(AiRequest)
+       │    ├─ ai::generate(AiRequest { existing, context, ... })
        │    └─ drop permit, return (path, result)
        └─ join tasks: count ok/failed, send AiDone per result
             then send BatchFinished
 ```
 
-`AiDone` replaces Title/Caption/Keywords/Editorial, sets `Generated` and `dirty`, and increments `batch.done`. Failed results set `Error` and a message. `BatchFinished` clears the batch slot and shows a success/partial-failure toast.
+`AiDone` replaces the existing Title/Caption/Keywords with the generated values plus Editorial, sets `Generated` and `dirty`, and increments `batch.done`. Failed results set `Error` and a message. `BatchFinished` clears the batch slot and shows a success/partial-failure toast.
 
 ### 8.4 Save flow
 
@@ -433,7 +440,9 @@ selection change / open folder / ExifTool ready
   └─ request_metadata(path) for selected paths
        ├─ skip if no tool or already requested
        ├─ spawn_blocking(ExifTool::read)
-       └─ send MetaLoaded
+       └─ send MetaLoaded or MetaFailed
+            ├─ set meta_loaded; flag read errors
+            ├─ store GPS location and capture date
             ├─ fill dims if absent
             └─ populate title/caption/keywords only if all empty AND status Pending
 ```
@@ -588,6 +597,7 @@ struct AiRequest {
     provider: Provider,
     settings: ProviderSettings, // base_url, model, api_key
     image_base64: String,       // no data: prefix
+    existing: ExistingMetadata, // title, caption, keywords, GPS location, capture date
     context: Option<String>,    // trimmed; omitted when empty
     global_prompt: String,      // extra system instructions
     date: String,               // e.g. "November 5, 2026"
@@ -674,18 +684,29 @@ let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
 
 ### 11.4 User prompt
 
-Without context:
+Existing metadata is included before context. Empty fields are omitted; keywords are comma-separated:
+
 ```text
-Analyze the attached image and return the four labelled fields exactly as specified.
+Existing file metadata (reference only; the returned title, caption, and keywords replace these values):
+GPS location: ...
+Capture date: ...
+Title: ...
+Caption: ...
+Keywords: ...
+
+Use these details as context and return fresh title, caption, and keywords.
 ```
 
-With context (trimmed; blank = absent):
+Context is trimmed; blank = absent:
+
 ```text
 Situational context supplied by the photographer (treat it as ground truth):
 <context>
 
 Analyze the attached image and return the four labelled fields exactly as specified.
 ```
+
+Without metadata or context, the prompt is only the final analyze line.
 
 ### 11.5 Provider wire formats
 
@@ -889,6 +910,8 @@ struct Config {
     global_prompt,
     exiftool_path,
     last_folder,        // reopened at startup
+    theme,              // system | light | dark
+    density,            // comfortable | compact
     concurrency,        // AI workers, clamped 1..=4 at use
     #[serde(skip)] path,
 }
@@ -905,15 +928,19 @@ struct Config {
 | `global_prompt` | empty |
 | `exiftool_path` | empty (auto-detect) |
 | `last_folder` | empty |
+| `theme` | `system` (follows the Windows app theme) |
+| `density` | `comfortable` |
 | `concurrency` | `1` |
 
-TOML provider values: `ollama`, `lm_studio`, `open_ai`, `anthropic`. Unknown values fail the whole parse and fall back to defaults. `#[serde(default)]` fills missing fields/sections.
+TOML provider values: `ollama`, `lm_studio`, `open_ai`, `anthropic`; theme values: `system`, `light`, `dark`; density values: `comfortable`, `compact`. Unknown values fail the whole parse and fall back to defaults. `#[serde(default)]` fills missing fields/sections.
 
 ```toml
 provider = "open_ai"
 global_prompt = "Prefer British spelling and avoid brand names."
 exiftool_path = ""
 last_folder = "C:\\Photos\\2026_Stock"
+theme = "system"
+density = "comfortable"
 concurrency = 2
 
 [ollama]
@@ -965,7 +992,7 @@ export PATH="$PWD/.tools/gnu-bin:$SELF:$PATH"
 cargo +stable-x86_64-pc-windows-gnu test
 ```
 
-Expected: **99 passed; 0 failed; 0 ignored**.
+Expected: **106 passed; 0 failed; 0 ignored**.
 
 List: `cargo test -- --list`.
 
@@ -973,15 +1000,16 @@ List: `cargo test -- --list`.
 
 | Module | Count | Coverage |
 | --- | --- | --- |
-| `ai::prompt::tests` | 24 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, validation boundaries, exact editorial caption |
+| `ai::prompt::tests` | 25 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, validation boundaries, exact editorial caption, existing metadata/context prompt |
 | `ai::tests` | 23 | mock HTTP server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation |
-| `config::tests` | 7 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`concurrency`, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
-| `metadata::tags::tests` | 7 | read precedence/fallbacks/merge/dedupe/invalid payloads/string keywords |
+| `config::tests` | 8 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`theme`/`density`/`concurrency`, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
+| `metadata::tags::tests` | 8 | read precedence/fallbacks/merge/dedupe/invalid payloads/string keywords, GPS and capture-date parsing |
 | `metadata::writer::tests` | 7 | all tags, title fallback, empty metadata, no `+=`, Unicode, 50-keyword cap |
 | `metadata::tests` | 8 | real ExifTool round-trip, overwrite semantics, 50 keywords, Unicode values, Unicode file names, missing files, explicit/directory detection, argfile formatting |
 | `state::tests` | 19 | extension/folder scans, decode resize/corrupt, item conversion, progress, selection math, Ctrl/Shift/checkbox/toggle/retain, aggregate common/mixed, keyword append |
 | `cache::thumbnails::tests` | 1 | request lifecycle blocks duplicates/failures |
 | `ui::tree::tests` | 3 | sorted children/expansion/depth; refresh preserves expansion and rereads children; reveal expands only the ancestor chain |
+| `ui::browser::tests` | 1 | selection-summary percentages for empty, partial, full, and over-target selections |
 
 ExifTool integration tests skip with `exiftool not available; skipping test` if detection fails. This keeps the suite runnable without ExifTool, but those eight only prove metadata correctness when ExifTool is installed. On this machine they run.
 
@@ -1157,9 +1185,9 @@ exiftool -a -G1 -s "path\to\image.jpg"
 
 ## 20. Verification record
 
-Last verified on the development machine (Windows 11, 2026-11-05):
+Last verified on the development machine (Windows 11, 2026-11-06):
 
-- `cargo +stable-x86_64-pc-windows-gnu test` → **99 passed, 0 failed** (includes real ExifTool round-trips).
+- `cargo +stable-x86_64-pc-windows-gnu test` → **106 passed, 0 failed** (includes real ExifTool round-trips).
 - `cargo +stable-x86_64-pc-windows-gnu build --release` → success, no warnings; `target/release/autowording.exe` ~21 MB.
 - The redesigned release was smoke-launched; the native window `AutoWording` was created and responding.
 - The UI was **not** visually inspected or driven through folder/grid/batch interactions in this pass; selection/tree logic is covered by unit tests, but layout and click behavior remain visually unverified.

@@ -58,7 +58,7 @@ impl ExifTool {
         output.with_context(|| format!("Could not run exiftool at {}", self.program.display()))
     }
 
-    /// Read title, caption, keywords and dimensions from a JPEG.
+    /// Read title, caption, keywords, GPS location, capture date and dimensions from a JPEG.
     pub fn read(&self, path: &Path) -> Result<ExistingMetadata> {
         let mut args: Vec<String> = vec![
             "-j".to_string(),

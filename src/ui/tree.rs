@@ -250,7 +250,7 @@ fn display_name(path: &Path) -> String {
 
 pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     crate::ui::section_title(ui, "Folder Browser");
-    ui.add_space(4.0);
+    ui.add_space(5.0);
 
     let parent = app.parent_folder();
     ui.horizontal(|ui| {
@@ -271,19 +271,27 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
 
     if let Some(path) = &app.current_folder {
         let full = path.display().to_string();
-        ui.add_space(3.0);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(&full)
-                    .size(9.5)
-                    .color(crate::theme::TEXT_MUTED),
-            )
-            .truncate(),
-        )
-        .on_hover_text(full);
+        ui.add_space(5.0);
+        egui::Frame::none()
+            .fill(crate::theme::chip_bg())
+            .stroke(egui::Stroke::new(1.0_f32, crate::theme::border()))
+            .rounding(egui::Rounding::same(7.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&full)
+                            .size(9.5)
+                            .color(crate::theme::text_muted()),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(full);
+            });
     }
 
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
     let shortcuts = quick_access();
     let rows = app.folders.rows();
@@ -295,12 +303,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             ui.set_width(ui.available_width());
 
             if !shortcuts.is_empty() {
-                ui.add(egui::Label::new(
-                    egui::RichText::new("Quick access")
-                        .size(10.0)
-                        .strong()
-                        .color(crate::theme::TEXT_MUTED),
-                ));
+                group_label(ui, "QUICK ACCESS");
                 ui.add_space(2.0);
                 for shortcut in shortcuts {
                     let current = app.current_folder.as_deref() == Some(shortcut.path.as_path());
@@ -320,12 +323,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                 ui.add_space(4.0);
             }
 
-            ui.add(egui::Label::new(
-                egui::RichText::new("This PC")
-                    .size(10.0)
-                    .strong()
-                    .color(crate::theme::TEXT_MUTED),
-            ));
+            group_label(ui, "THIS PC");
             ui.add_space(2.0);
 
             if rows.is_empty() {
@@ -333,7 +331,7 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                     egui::Label::new(
                         egui::RichText::new("No mounted drives were found.")
                             .size(11.0)
-                            .color(crate::theme::TEXT_MUTED),
+                            .color(crate::theme::text_muted()),
                     )
                     .wrap(),
                 );
@@ -379,10 +377,23 @@ pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             }
         });
 
-    ui.add_space(6.0);
-    if ui.add(ghost_button("Add images…")).clicked() {
+    ui.add_space(8.0);
+    let width = ui.available_width();
+    if ui
+        .add_sized([width, 28.0], ghost_button("Add images…"))
+        .clicked()
+    {
         app.add_images_dialog(ctx);
     }
+}
+
+fn group_label(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(
+        egui::RichText::new(text)
+            .size(9.0)
+            .strong()
+            .color(crate::theme::text_muted()),
+    ));
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use crate::ai::{self, AiRequest};
 use crate::cache::ThumbnailCache;
-use crate::config::{Config, Provider, ProviderSettings};
-use crate::metadata::{ExifTool, Metadata};
+use crate::config::{Config, LayoutDensity, Provider, ProviderSettings, ThemePreference};
+use crate::metadata::{ExistingMetadata, ExifTool, Metadata};
 use crate::state::{
     self, BatchProgress, ImageItem, SelectModifiers, Selection, Status, WorkerEvent,
 };
@@ -76,17 +76,35 @@ pub struct App {
     pub batch_caption: String,
     pub batch_keywords: String,
     pub show_about: bool,
+    pub dark: bool,
 
+    system_dark: bool,
+    was_focused: bool,
     rt: tokio::runtime::Runtime,
     tx: tokio::sync::mpsc::UnboundedSender<WorkerEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
 }
 
+fn existing_metadata(item: &ImageItem) -> ExistingMetadata {
+    let title = item.title.trim();
+    let caption = item.caption.trim();
+    ExistingMetadata {
+        title: (!title.is_empty()).then(|| title.to_string()),
+        caption: (!caption.is_empty()).then(|| caption.to_string()),
+        keywords: item.keywords.clone(),
+        gps: item.gps.clone(),
+        date: item.date.clone(),
+        dims: item.dims,
+    }
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
-
         let cfg = Config::load();
+        let system_dark = theme::system_prefers_dark();
+        let dark = cfg.theme.resolve(system_dark);
+        theme::setup(&cc.egui_ctx, dark);
+
         let start_folder = cfg.last_folder.clone();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -125,6 +143,9 @@ impl App {
             batch_caption: String::new(),
             batch_keywords: String::new(),
             show_about: false,
+            dark,
+            system_dark,
+            was_focused: true,
             rt,
             tx,
             rx,
@@ -135,6 +156,43 @@ impl App {
             app.open_root(&cc.egui_ctx, PathBuf::from(start_folder));
         }
         app
+    }
+
+    /// Persist and apply a theme selection immediately.
+    pub fn set_theme(&mut self, ctx: &egui::Context, preference: ThemePreference) {
+        self.cfg.theme = preference;
+        if preference == ThemePreference::System {
+            self.system_dark = theme::system_prefers_dark();
+        }
+        self.cfg_dirty = Some(Instant::now());
+        self.apply_theme(ctx);
+    }
+
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        self.dark = self.cfg.theme.resolve(self.system_dark);
+        theme::apply(ctx, self.dark);
+        ctx.request_repaint();
+    }
+
+    /// Persist a density choice; layout reads it from config each frame.
+    pub fn set_density(&mut self, density: LayoutDensity) {
+        if self.cfg.density == density {
+            return;
+        }
+        self.cfg.density = density;
+        self.cfg_dirty = Some(Instant::now());
+    }
+
+    /// Re-read Windows when the app regains focus so System mode stays current.
+    fn refresh_system_theme(&mut self, ctx: &egui::Context) {
+        if self.cfg.theme != ThemePreference::System {
+            return;
+        }
+        let system_dark = theme::system_prefers_dark();
+        if system_dark != self.system_dark {
+            self.system_dark = system_dark;
+            self.apply_theme(ctx);
+        }
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -542,10 +600,12 @@ impl App {
         self.rt.spawn(async move {
             let task_path = path.clone();
             let result = tokio::task::spawn_blocking(move || tool.read(&task_path)).await;
-            if let Ok(Ok(meta)) = result {
-                let _ = tx.send(WorkerEvent::MetaLoaded { path, meta });
-                ctx.request_repaint();
-            }
+            let event = match result {
+                Ok(Ok(meta)) => WorkerEvent::MetaLoaded { path, meta },
+                _ => WorkerEvent::MetaFailed { path },
+            };
+            let _ = tx.send(event);
+            ctx.request_repaint();
         });
     }
 
@@ -608,13 +668,18 @@ impl App {
             .into_iter()
             .filter(|path| seen.insert(path.clone()))
             .collect();
-        for path in &paths {
-            let item = self.ensure_item(path);
-            item.status = Status::Queued;
-            item.message = None;
+        let mut jobs = Vec::with_capacity(paths.len());
+        for path in paths {
+            let existing = {
+                let item = self.ensure_item(&path);
+                item.status = Status::Queued;
+                item.message = None;
+                existing_metadata(item)
+            };
+            jobs.push((path, existing));
         }
 
-        let total = paths.len();
+        let total = jobs.len();
         self.batch = Some(BatchProgress {
             total,
             done: 0,
@@ -635,7 +700,7 @@ impl App {
             let mut tasks: JoinSet<(PathBuf, Result<crate::ai::GeneratedMetadata, String>)> =
                 JoinSet::new();
 
-            for path in paths {
+            for (path, existing) in jobs {
                 let permit = semaphore
                     .clone()
                     .acquire_owned()
@@ -664,6 +729,7 @@ impl App {
                             settings,
                             image_base64,
                             context,
+                            existing,
                             global_prompt,
                             date,
                         }),
@@ -894,6 +960,7 @@ impl App {
                     if let Some(item) = self.items.get_mut(&path) {
                         match result {
                             Ok(generated) => {
+                                // AI results replace the editable title, caption and keywords.
                                 item.title = generated.title;
                                 item.caption = generated.caption;
                                 item.keywords = generated.keywords;
@@ -966,6 +1033,10 @@ impl App {
                 }
                 WorkerEvent::MetaLoaded { path, meta } => {
                     if let Some(item) = self.items.get_mut(&path) {
+                        item.meta_loaded = true;
+                        item.meta_error = false;
+                        item.gps = meta.gps;
+                        item.date = meta.date;
                         if item.dims.is_none() {
                             item.dims = meta.dims;
                         }
@@ -978,6 +1049,12 @@ impl App {
                             item.keywords = meta.keywords;
                             item.dirty = false;
                         }
+                    }
+                }
+                WorkerEvent::MetaFailed { path } => {
+                    if let Some(item) = self.items.get_mut(&path) {
+                        item.meta_loaded = true;
+                        item.meta_error = true;
                     }
                 }
                 WorkerEvent::ModelsLoaded {
@@ -1103,6 +1180,11 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events(ctx);
+        let focused = ctx.input(|input| input.focused);
+        if focused && !self.was_focused {
+            self.refresh_system_theme(ctx);
+        }
+        self.was_focused = focused;
         let shortcuts = self.handle_shortcuts(ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|input| {

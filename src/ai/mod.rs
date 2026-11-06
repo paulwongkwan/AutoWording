@@ -11,6 +11,7 @@ mod tests;
 pub use prompt::GeneratedMetadata;
 
 use crate::config::{Provider, ProviderSettings};
+use crate::metadata::ExistingMetadata;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use std::path::Path;
@@ -24,6 +25,7 @@ pub struct AiRequest {
     pub settings: ProviderSettings,
     pub image_base64: String,
     pub context: Option<String>,
+    pub existing: ExistingMetadata,
     pub global_prompt: String,
     pub date: String,
 }
@@ -61,7 +63,7 @@ pub fn prepare_image(path: &Path) -> Result<String> {
 
 pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     let system = prompt::system_prompt(&req.date, &req.global_prompt);
-    let user = prompt::user_prompt(req.context.as_deref());
+    let user = prompt::user_prompt(req.context.as_deref(), Some(&req.existing));
     let settings = &req.settings;
     let base_url = settings.base_url.trim();
     let model = settings.model.trim();

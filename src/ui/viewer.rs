@@ -11,12 +11,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     crate::ui::metadata_panel::show(app, ctx);
 
     let frame = Frame::none()
-        .fill(theme::BG)
+        .fill(theme::bg())
         .inner_margin(Margin::symmetric(12.0, 10.0));
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-        toolbar(app, ctx, ui);
-        ui.add_space(6.0);
+        theme::card().show(ui, |ui| {
+            toolbar(app, ctx, ui);
+        });
+        ui.add_space(7.0);
         image(app, ctx, ui);
         ui.add_space(6.0);
         filmstrip(app, ctx, ui);
@@ -66,7 +68,7 @@ fn toolbar(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
             }
         } else {
             ui.add(egui::Label::new(
-                RichText::new("No image selected").size(12.0).color(theme::TEXT_MUTED),
+                RichText::new("No image selected").size(12.0).color(theme::text_muted()),
             ));
         }
 
@@ -75,7 +77,7 @@ fn toolbar(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                 ui.add(egui::Label::new(
                     RichText::new(format!("{} / {}", index + 1, total))
                         .size(10.5)
-                        .color(theme::TEXT_MUTED),
+                        .color(theme::text_muted()),
                 ));
             }
             if let Some(active) = &active {
@@ -84,7 +86,7 @@ fn toolbar(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                         ui.add(egui::Label::new(
                             RichText::new(format!("{width} × {height} px"))
                                 .size(10.5)
-                                .color(theme::TEXT_MUTED),
+                                .color(theme::text_muted()),
                         ));
                     }
                 }
@@ -103,7 +105,7 @@ fn image(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                 ui.label(
                     RichText::new("Select an image in Browser mode, then press Viewer.")
                         .size(13.0)
-                        .color(theme::TEXT_MUTED),
+                        .color(theme::text_muted()),
                 );
             });
         });
@@ -121,7 +123,7 @@ fn image(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     let height = (ui.available_height() - 88.0).max(180.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, egui::Rounding::same(8.0), theme::PREVIEW_BG);
+    painter.rect_filled(rect, egui::Rounding::same(10.0), theme::preview_bg());
 
     match texture {
         Some((texture_id, size)) => {
@@ -171,7 +173,7 @@ fn image(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                 Align2::LEFT_CENTER,
                 message,
                 FontId::proportional(10.0),
-                theme::DANGER_SOFT,
+                theme::danger_bright(),
             );
         }
     }
@@ -201,14 +203,14 @@ fn filmstrip(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                     painter.rect_filled(
                         rect,
                         egui::Rounding::same(5.0),
-                        if selected { theme::SELECTED } else { theme::THUMB_BG },
+                        if selected { theme::selected() } else { theme::thumb_bg() },
                     );
                     painter.rect_stroke(
                         rect,
                         egui::Rounding::same(5.0),
                         Stroke::new(
                             if selected { 2.0_f32 } else { 1.0_f32 },
-                            if selected { theme::ACCENT } else { theme::BORDER },
+                            if selected { theme::accent() } else { theme::border() },
                         ),
                     );
 
@@ -228,16 +230,16 @@ fn filmstrip(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                             Align2::CENTER_CENTER,
                             "JPG",
                             FontId::proportional(9.0),
-                            theme::TEXT_MUTED,
+                            theme::text_muted(),
                         );
                     }
 
                     if let Some(item) = app.items.get(&path) {
                         let color = match item.status {
-                            Status::Saved => theme::SUCCESS,
-                            Status::Generated => theme::VIOLET,
-                            Status::Processing | Status::Queued => theme::ACCENT,
-                            Status::Error => theme::DANGER,
+                            Status::Saved => theme::success(),
+                            Status::Generated => theme::violet(),
+                            Status::Processing | Status::Queued => theme::accent(),
+                            Status::Error => theme::danger(),
                             Status::Pending => Color32::TRANSPARENT,
                         };
                         if color != Color32::TRANSPARENT {

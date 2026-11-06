@@ -40,6 +40,10 @@ pub struct ImageItem {
     pub dirty: bool,
     pub message: Option<String>,
     pub dims: Option<(u32, u32)>,
+    pub gps: Option<String>,
+    pub date: Option<String>,
+    pub meta_loaded: bool,
+    pub meta_error: bool,
 }
 
 impl ImageItem {
@@ -54,6 +58,10 @@ impl ImageItem {
             dirty: false,
             message: None,
             dims: None,
+            gps: None,
+            date: None,
+            meta_loaded: false,
+            meta_error: false,
         }
     }
 
@@ -307,6 +315,9 @@ pub enum WorkerEvent {
     MetaLoaded {
         path: PathBuf,
         meta: ExistingMetadata,
+    },
+    MetaFailed {
+        path: PathBuf,
     },
     ModelsLoaded {
         provider: Provider,

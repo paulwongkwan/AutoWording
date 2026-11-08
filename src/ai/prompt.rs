@@ -1,6 +1,5 @@
 use crate::config::{
-    clamp_caption_char_range, clamp_keyword_target, clamp_title_word_range,
-    KEYWORD_TARGET_DEFAULT,
+    clamp_caption_char_range, clamp_keyword_target, clamp_title_word_range, KEYWORD_TARGET_DEFAULT,
 };
 #[cfg(test)]
 use crate::config::{
@@ -85,8 +84,7 @@ pub fn system_prompt_with_constraints(
 ) -> String {
     let target = clamp_keyword_target(keyword_target);
     let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
-    let (caption_min, caption_max) =
-        clamp_caption_char_range(caption_range.0, caption_range.1);
+    let (caption_min, caption_max) = clamp_caption_char_range(caption_range.0, caption_range.1);
     let mut prompt = SYSTEM_TEMPLATE
         .replace("{DATE}", date)
         .replace("{KEYWORD_TARGET}", &target.to_string())
@@ -142,8 +140,7 @@ pub fn retry_prompt(
 ) -> String {
     let target = clamp_keyword_target(keyword_target);
     let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
-    let (caption_min, caption_max) =
-        clamp_caption_char_range(caption_range.0, caption_range.1);
+    let (caption_min, caption_max) = clamp_caption_char_range(caption_range.0, caption_range.1);
     let words = title_word_count(&previous.title);
     let chars = caption_char_count(&previous.caption);
     let title_ok = (title_min..=title_max).contains(&words);
@@ -341,10 +338,7 @@ pub fn parse_response(text: &str) -> Result<GeneratedMetadata> {
     parse_response_with_target(text, KEYWORD_TARGET)
 }
 
-pub fn parse_response_with_target(
-    text: &str,
-    keyword_target: usize,
-) -> Result<GeneratedMetadata> {
+pub fn parse_response_with_target(text: &str, keyword_target: usize) -> Result<GeneratedMetadata> {
     parse_response_inner(text, keyword_target, true)
 }
 
@@ -397,8 +391,8 @@ fn parse_response_inner(
 
     // Explicit "Commercial" wins, otherwise look for the word editorial.
     let editorial_status = editorial_raw.to_ascii_lowercase();
-    let editorial = !editorial_status.contains("commercial")
-        && editorial_status.contains("editorial");
+    let editorial =
+        !editorial_status.contains("commercial") && editorial_status.contains("editorial");
 
     Ok(GeneratedMetadata {
         title: title.trim_end_matches('.').trim().to_string(),
@@ -422,9 +416,9 @@ pub fn normalize_keywords_with_target(raw: &str, keyword_target: usize) -> Vec<S
     let mut keywords: Vec<String> = Vec::with_capacity(target);
     let mut seen = HashSet::new();
 
-    for chunk in raw.split(|c: char| {
-        c == ',' || c == ';' || c == '\n' || c == '\r' || c == '|' || c == '/'
-    }) {
+    for chunk in
+        raw.split(|c: char| c == ',' || c == ';' || c == '\n' || c == '\r' || c == '|' || c == '/')
+    {
         for word in chunk.split_whitespace() {
             let cleaned: String = word.chars().filter(|c| c.is_alphabetic()).collect();
             if cleaned.chars().count() < 2 {
@@ -590,8 +584,7 @@ pub fn validate_with_constraints(
 ) -> Vec<String> {
     let target = clamp_keyword_target(keyword_target);
     let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
-    let (caption_min, caption_max) =
-        clamp_caption_char_range(caption_range.0, caption_range.1);
+    let (caption_min, caption_max) = clamp_caption_char_range(caption_range.0, caption_range.1);
     let mut warnings = Vec::new();
 
     let words = title_word_count(title);
@@ -659,7 +652,10 @@ mod tests {
             KEYWORD_TARGET,
             "duplicates are removed while parsing"
         );
-        assert!(parsed.keywords.iter().all(|k| k.chars().all(char::is_alphabetic)));
+        assert!(parsed
+            .keywords
+            .iter()
+            .all(|k| k.chars().all(char::is_alphabetic)));
     }
 
     #[test]
@@ -667,14 +663,33 @@ mod tests {
         let reply = "Title: Man In Orange Shirt Editorial Status: Editorial Caption: AMSTERDAM, NETHERLANDS – JANUARY 2, 2026: A man in an orange shirt celebrates on a canal boat. Keywords: people, orange, festival, canal, boat, netherlands, celebration, crowd, party, tourism, jacket, hat, water, city, summer, happy, dutch, amsterdam, holiday, event, outdoor, street, joy, culture, weekend, sunny, fun, colorful, tradition, local, travel, portrait, candid, daylight, urban, leisure, group, friendship, lifestyle, europe, parade, costume, music, dance, cheers, orange, bright, vivid, energetic, warm";
         let parsed = parse_response(reply).expect("single line reply should parse");
         assert!(parsed.editorial);
-        assert_eq!(parsed.caption.chars().count(), reply.split("Caption: ").nth(1).unwrap().split(" Keywords:").next().unwrap().chars().count());
+        assert_eq!(
+            parsed.caption.chars().count(),
+            reply
+                .split("Caption: ")
+                .nth(1)
+                .unwrap()
+                .split(" Keywords:")
+                .next()
+                .unwrap()
+                .chars()
+                .count()
+        );
         // duplicate "orange" is removed
-        assert_eq!(parsed.keywords.iter().filter(|k| k.eq_ignore_ascii_case("orange")).count(), 1);
+        assert_eq!(
+            parsed
+                .keywords
+                .iter()
+                .filter(|k| k.eq_ignore_ascii_case("orange"))
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn normalization_strips_numbers_punctuation_and_duplicates() {
-        let keywords = normalize_keywords("Sunset, 2024, new york, Sunset, blue-sky, a, 3d, mountain!");
+        let keywords =
+            normalize_keywords("Sunset, 2024, new york, Sunset, blue-sky, a, 3d, mountain!");
         // Numbers and punctuation are removed ("blue-sky" becomes one word), duplicates
         // and single-letter fragments are dropped, multi-word phrases are split.
         assert_eq!(
@@ -695,7 +710,9 @@ mod tests {
         let warnings = validate("Two words", "too short", &keywords);
         assert_eq!(warnings.len(), 3);
         assert!(warnings.iter().any(|w| w.contains("Title has 2 words")));
-        assert!(warnings.iter().any(|w| w.contains("Caption is 9 characters")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Caption is 9 characters")));
         assert!(warnings.iter().any(|w| w.contains("1 keywords")));
     }
 
@@ -710,7 +727,9 @@ mod tests {
 
     #[test]
     fn missing_fields_are_reported() {
-        let err = parse_response("Title: Only a title").unwrap_err().to_string();
+        let err = parse_response("Title: Only a title")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Caption"));
         assert!(err.contains("Keywords"));
     }
@@ -789,12 +808,13 @@ mod tests {
     fn editorial_status_can_be_explicit_commercial_or_uppercase_editorial() {
         let base = "Title: Three Word Title\nCaption: A factual sentence about the scene with enough characters to look real.\nKeywords: one, two, three\n";
 
-        let parsed = parse_response(&format!("{base}Editorial Status: Not editorial - commercial use only"))
-            .expect("parse");
+        let parsed = parse_response(&format!(
+            "{base}Editorial Status: Not editorial - commercial use only"
+        ))
+        .expect("parse");
         assert!(!parsed.editorial, "explicit commercial must win");
 
-        let parsed = parse_response(&format!("{base}Editorial Status: EDITORIAL"))
-            .expect("parse");
+        let parsed = parse_response(&format!("{base}Editorial Status: EDITORIAL")).expect("parse");
         assert!(parsed.editorial);
     }
 
@@ -896,7 +916,9 @@ mod tests {
         assert!(warnings[0].contains("not a single alphabetic word"));
 
         let warnings = validate("Three Word Title", &"a".repeat(80), &unique_words(49));
-        assert!(warnings.iter().any(|warning| warning.contains("49 keywords")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("49 keywords")));
     }
 
     #[test]
@@ -937,13 +959,7 @@ mod tests {
         let raw = unique_words(60).join(", ");
         assert_eq!(normalize_keywords_with_target(&raw, 37).len(), 37);
 
-        let prompt = system_prompt_with_constraints(
-            "November 6, 2026",
-            "",
-            37,
-            (4, 8),
-            (70, 220),
-        );
+        let prompt = system_prompt_with_constraints("November 6, 2026", "", 37, (4, 8), (70, 220));
         assert!(prompt.contains("Exactly 37 keywords."));
         assert!(prompt.contains("Between 4 and 8 words."));
         assert!(prompt.contains("70 to 220 characters"));
@@ -1004,14 +1020,8 @@ mod tests {
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
         assert!(warnings[0].contains("Title has 4 words (needs 2–3)"));
 
-        let warnings = validate_with_constraints(
-            "One Two",
-            &"a".repeat(81),
-            &keywords,
-            5,
-            (2, 3),
-            (60, 80),
-        );
+        let warnings =
+            validate_with_constraints("One Two", &"a".repeat(81), &keywords, 5, (2, 3), (60, 80));
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
         assert!(warnings[0].contains("Caption is 81 characters (needs 60–80)"));
     }

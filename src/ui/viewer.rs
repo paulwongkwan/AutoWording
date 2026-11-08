@@ -123,7 +123,12 @@ fn image(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
     let height = (ui.available_height() - 88.0).max(180.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, egui::Rounding::same(10.0), theme::preview_bg());
+    painter.rect_filled(rect, egui::Rounding::same(14.0), theme::preview_bg());
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::same(14.0),
+        Stroke::new(1.0_f32, theme::border()),
+    );
 
     match texture {
         Some((texture_id, size)) => {
@@ -202,12 +207,12 @@ fn filmstrip(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                     let painter = ui.painter_at(rect);
                     painter.rect_filled(
                         rect,
-                        egui::Rounding::same(5.0),
+                        egui::Rounding::same(7.0),
                         if selected { theme::selected() } else { theme::thumb_bg() },
                     );
                     painter.rect_stroke(
                         rect,
-                        egui::Rounding::same(5.0),
+                        egui::Rounding::same(7.0),
                         Stroke::new(
                             if selected { 2.0_f32 } else { 1.0_f32 },
                             if selected { theme::accent() } else { theme::border() },

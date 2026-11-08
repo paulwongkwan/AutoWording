@@ -1,10 +1,11 @@
 use crate::ai::prompt::GeneratedMetadata;
 use crate::config::Provider;
-use crate::metadata::{ExistingMetadata, ExifTool, Metadata};
-use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use crate::metadata::{ExifTool, ExistingMetadata, Metadata};
+use gpui_kit::RenderImage;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Status {
@@ -122,6 +123,29 @@ impl SortMode {
     }
 }
 
+/// Whether a generation run should leave this image alone. Saved images stay
+/// untouched even when their metadata is partial; Force regenerate overrides.
+pub fn should_skip_generation(item: &ImageItem) -> bool {
+    item.should_skip_generation()
+}
+
+/// Split requested paths into (skipped, targets) for a generation run.
+/// Images that are already saved or have complete metadata are skipped unless
+/// `force` is set, which regenerates them. This keeps a later batch from
+/// replacing finished work by accident.
+pub fn partition_generation_targets(
+    paths: Vec<PathBuf>,
+    items: &HashMap<PathBuf, ImageItem>,
+    force: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if force {
+        return (Vec::new(), paths);
+    }
+    paths
+        .into_iter()
+        .partition(|path| items.get(path).map(should_skip_generation).unwrap_or(false))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FieldLocks {
     pub title: bool,
@@ -165,6 +189,10 @@ pub struct ImageItem {
     pub date: Option<String>,
     pub meta_loaded: bool,
     pub meta_error: bool,
+    /// Size and modification time captured when the metadata was loaded, used
+    /// to refuse overwriting a file that changed in another program since.
+    pub disk_len: Option<u64>,
+    pub disk_modified: Option<SystemTime>,
 }
 
 impl ImageItem {
@@ -184,6 +212,8 @@ impl ImageItem {
             date: None,
             meta_loaded: false,
             meta_error: false,
+            disk_len: None,
+            disk_modified: None,
         }
     }
 
@@ -204,6 +234,47 @@ impl ImageItem {
 
     pub fn has_metadata(&self) -> bool {
         !self.title.trim().is_empty()
+    }
+
+    /// True when the full set of generated fields is present.
+    pub fn is_complete(&self) -> bool {
+        !self.title.trim().is_empty()
+            && !self.caption.trim().is_empty()
+            && !self.keywords.is_empty()
+    }
+
+    /// Fill empty fields from metadata read out of the file. A file that
+    /// already has a title, caption and keywords is marked `Saved` instead of
+    /// `Pending`, because nothing is left to generate for it; partially filled
+    /// files stay `Pending` so AI can complete them.
+    pub fn adopt_existing_metadata(&mut self, meta: ExistingMetadata) {
+        if self.title.is_empty() && self.caption.is_empty() && self.keywords.is_empty() {
+            self.title = meta.title.unwrap_or_default();
+            self.caption = meta.caption.unwrap_or_default();
+            self.keywords = meta.keywords;
+            self.dirty = false;
+        }
+        if self.status == Status::Pending && self.is_complete() {
+            self.status = Status::Saved;
+        }
+    }
+
+    /// Already written to disk with a full metadata set and untouched since,
+    /// so batch generation can skip it instead of spending a model request.
+    pub fn is_finished(&self) -> bool {
+        self.status == Status::Saved && !self.dirty && self.is_complete()
+    }
+
+    /// True while a fresh card is waiting for its folder metadata read. Once
+    /// the read finishes (or fails), the real status is shown instead.
+    pub fn is_awaiting_metadata(&self) -> bool {
+        self.status == Status::Pending && !self.dirty && !self.meta_loaded && !self.meta_error
+    }
+
+    /// The queue sweep's rule: never generate for a saved image or one that
+    /// already has a full metadata set. Force regenerate overrides this.
+    pub fn should_skip_generation(&self) -> bool {
+        self.status == Status::Saved || self.is_complete()
     }
 
     #[allow(dead_code)]
@@ -289,6 +360,9 @@ pub struct BatchProgress {
     pub total: usize,
     pub done: usize,
     pub saving: bool,
+    /// Duration of the most recently finished image attempt, used to estimate
+    /// the time left without averaging in stale work.
+    pub last_image: Option<Duration>,
 }
 
 impl BatchProgress {
@@ -298,6 +372,80 @@ impl BatchProgress {
         } else {
             self.done as f32 / self.total as f32
         }
+    }
+
+    /// Time left based on the last image's processing time.
+    pub fn eta(&self) -> Option<Duration> {
+        let last = self.last_image?;
+        let remaining = self.total.saturating_sub(self.done);
+        (remaining > 0).then(|| last.mul_f64(remaining as f64))
+    }
+}
+
+/// Extra AI attempts after the first failure. Two retries means an image gets
+/// at most three total generation attempts in one batch.
+pub const AI_MAX_RETRIES: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiQueueEntry<T> {
+    pub item: T,
+    pub retries: u8,
+}
+
+/// FIFO work queue. A failed entry is pushed to the back with one more retry
+/// recorded, so every waiting job gets its turn before any retry runs.
+#[derive(Debug)]
+pub struct AiQueue<T> {
+    queue: VecDeque<AiQueueEntry<T>>,
+}
+
+impl<T> AiQueue<T> {
+    pub fn new(items: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            queue: items
+                .into_iter()
+                .map(|item| AiQueueEntry { item, retries: 0 })
+                .collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.queue.iter().map(|entry| &entry.item)
+    }
+
+    /// Drop entries that no longer need work. Called once before a queue
+    /// starts so images completed or saved while it was assembled are skipped.
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.queue.retain(|entry| keep(&entry.item));
+    }
+
+    pub fn next(&mut self) -> Option<AiQueueEntry<T>> {
+        self.queue.pop_front()
+    }
+
+    /// Requeue a failed entry. Returns the retry number when accepted, or
+    /// `None` once the two-retry limit is exhausted.
+    pub fn retry(&mut self, entry: AiQueueEntry<T>) -> Option<u8> {
+        if entry.retries >= AI_MAX_RETRIES {
+            return None;
+        }
+        let retries = entry.retries + 1;
+        self.queue.push_back(AiQueueEntry {
+            item: entry.item,
+            retries,
+        });
+        Some(retries)
     }
 }
 
@@ -385,8 +533,7 @@ impl Selection {
             .map(|active| !existing.contains(active))
             .unwrap_or(true)
         {
-            self.active = self
-                .first_selected_in_order(ordered);
+            self.active = self.first_selected_in_order(ordered);
         }
     }
 
@@ -477,11 +624,11 @@ impl Selection {
 pub enum WorkerEvent {
     Thumbnail {
         path: PathBuf,
-        image: egui::ColorImage,
+        image: DecodedImage,
     },
     Preview {
         path: PathBuf,
-        image: egui::ColorImage,
+        image: DecodedImage,
     },
     ImageFailed {
         path: PathBuf,
@@ -493,10 +640,20 @@ pub enum WorkerEvent {
     AiDone {
         path: PathBuf,
         result: Result<GeneratedMetadata, String>,
+        duration: Duration,
+    },
+    AiRetryScheduled {
+        path: PathBuf,
+        attempt: u8,
+        max_retries: u8,
+        duration: Duration,
     },
     BatchFinished {
         ok: usize,
         failed: usize,
+    },
+    SaveStarted {
+        path: PathBuf,
     },
     SaveDone {
         path: PathBuf,
@@ -683,9 +840,31 @@ pub fn append_keywords_with_target(
     }
 }
 
-/// Decode a JPEG downscaled for display, returning the texture image and original size.
-pub fn decode(path: &Path, max_dim: u32) -> anyhow::Result<(egui::ColorImage, (u32, u32))> {
-    let image = image::open(path)?;
+/// Decoded RGBA pixels for display, plus the source image's original size.
+pub struct DecodedImage {
+    pub size: [usize; 2],
+    pub pixels: Vec<u8>,
+}
+
+impl DecodedImage {
+    /// Convert the decoded pixels into a GPUI image. GPUI stores BGRA, so the
+    /// red and blue channels are swapped once here rather than on every frame.
+    pub fn to_render_image(&self) -> Arc<RenderImage> {
+        let mut pixels = self.pixels.clone();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let buffer = image::RgbaImage::from_raw(self.size[0] as u32, self.size[1] as u32, pixels)
+            .expect("decoded image dimensions match its pixel buffer");
+        Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+    }
+}
+
+/// Decode a JPEG downscaled for display, returning pixels and the original size.
+pub fn decode(path: &Path, max_dim: u32) -> anyhow::Result<(DecodedImage, (u32, u32))> {
+    let bytes = std::fs::read(path)?;
+    let orientation = crate::orientation::from_jpeg(&bytes).unwrap_or(1);
+    let image = crate::orientation::apply(image::load_from_memory(&bytes)?, orientation);
     let (width, height) = (image.width(), image.height());
 
     let image = if width.max(height) > max_dim {
@@ -702,7 +881,10 @@ pub fn decode(path: &Path, max_dim: u32) -> anyhow::Result<(egui::ColorImage, (u
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok((
-        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+        DecodedImage {
+            size,
+            pixels: rgba.into_raw(),
+        },
         (width, height),
     ))
 }
@@ -733,7 +915,9 @@ mod tests {
 
     #[test]
     fn recognises_jpeg_extensions_case_insensitively() {
-        for name in ["a.jpg", "b.JPG", "c.jpeg", "d.JPEG", "e.jpe", "f.JpE", "g.jfif"] {
+        for name in [
+            "a.jpg", "b.JPG", "c.jpeg", "d.JPEG", "e.jpe", "f.JpE", "g.jfif",
+        ] {
             assert!(is_jpeg(Path::new(name)), "{name} should be a JPEG");
         }
         for name in ["a.png", "b.gif", "c.txt", "noext", "d.jpg.txt", "e.tiff"] {
@@ -814,7 +998,17 @@ mod tests {
         let (image, dims) = decode(&path, 500).expect("decode");
         assert_eq!(dims, (2000, 1000));
         assert_eq!(image.size, [500, 250]);
-        assert_eq!(image.pixels.len(), 500 * 250);
+        assert_eq!(image.pixels.len(), 500 * 250 * 4);
+    }
+
+    #[test]
+    fn decode_applies_exif_orientation() {
+        let dir = temp_dir("orientation");
+        let path = dir.join("portrait.jpg");
+        std::fs::write(&path, crate::orientation::jpeg_with_orientation(40, 20, 6)).unwrap();
+
+        let (_image, dims) = decode(&path, 1000).expect("decode oriented jpeg");
+        assert_eq!(dims, (20, 40), "orientation 6 swaps width and height");
     }
 
     #[test]
@@ -873,8 +1067,7 @@ mod tests {
         items.get_mut(Path::new("b.jpg")).unwrap().status = Status::Error;
         items.get_mut(Path::new("c.jpg")).unwrap().status = Status::Generated;
         items.get_mut(Path::new("a.jpg")).unwrap().keywords = vec!["one".into()];
-        items.get_mut(Path::new("c.jpg")).unwrap().keywords =
-            vec!["one".into(), "two".into()];
+        items.get_mut(Path::new("c.jpg")).unwrap().keywords = vec!["one".into(), "two".into()];
 
         let mut sorted = ordered.clone();
         sort_image_paths(&mut sorted, &items, SortMode::Name, false);
@@ -953,18 +1146,267 @@ mod tests {
 
         item.status = Status::Error;
         assert!(item.is_pending());
-        for status in [Status::Queued, Status::Processing, Status::Generated, Status::Saved] {
+        for status in [
+            Status::Queued,
+            Status::Processing,
+            Status::Generated,
+            Status::Saved,
+        ] {
             item.status = status;
             assert!(!item.is_pending());
         }
     }
 
     #[test]
+    fn fresh_items_await_metadata_until_the_read_finishes() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\New.jpg"));
+        assert!(item.is_awaiting_metadata());
+
+        item.meta_loaded = true;
+        assert!(!item.is_awaiting_metadata());
+
+        item.meta_loaded = false;
+        item.meta_error = true;
+        assert!(!item.is_awaiting_metadata());
+
+        item.meta_error = false;
+        item.dirty = true;
+        assert!(
+            !item.is_awaiting_metadata(),
+            "an edited card keeps its Modified state"
+        );
+
+        item.dirty = false;
+        item.status = Status::Queued;
+        assert!(!item.is_awaiting_metadata());
+    }
+
+    #[test]
+    fn complete_existing_metadata_loads_as_saved() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Ready.jpg"));
+        item.adopt_existing_metadata(ExistingMetadata {
+            title: Some("Existing Title".into()),
+            caption: Some("Existing caption.".into()),
+            keywords: vec!["existing".into()],
+            gps: None,
+            date: None,
+            dims: None,
+        });
+        assert_eq!(item.status, Status::Saved);
+        assert!(!item.dirty);
+        assert_eq!(item.title, "Existing Title");
+        assert_eq!(item.caption, "Existing caption.");
+
+        let mut partial = ImageItem::new(PathBuf::from(r"C:\photos\Partial.jpg"));
+        partial.adopt_existing_metadata(ExistingMetadata {
+            title: Some("Title only".into()),
+            caption: Some(String::new()),
+            keywords: Vec::new(),
+            gps: None,
+            date: None,
+            dims: None,
+        });
+        assert_eq!(partial.status, Status::Pending);
+        assert_eq!(partial.title, "Title only");
+
+        let mut edited = ImageItem::new(PathBuf::from(r"C:\photos\Edited.jpg"));
+        edited.title = "Manual".into();
+        edited.adopt_existing_metadata(ExistingMetadata {
+            title: Some("Existing Title".into()),
+            caption: Some("Existing caption.".into()),
+            keywords: vec!["existing".into()],
+            gps: None,
+            date: None,
+            dims: None,
+        });
+        assert_eq!(
+            edited.title, "Manual",
+            "existing values are not overwritten"
+        );
+        assert_eq!(edited.status, Status::Pending);
+    }
+
+    #[test]
+    fn finished_items_are_saved_complete_and_unmodified() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Done.jpg"));
+        item.status = Status::Saved;
+        item.title = "Title".into();
+        item.caption = "Caption.".into();
+        item.keywords = vec!["keyword".into()];
+        assert!(item.is_finished());
+
+        item.dirty = true;
+        assert!(
+            !item.is_finished(),
+            "an edited saved image still needs work"
+        );
+
+        item.dirty = false;
+        item.status = Status::Generated;
+        assert!(
+            !item.is_finished(),
+            "generated but unwritten is not finished"
+        );
+
+        item.status = Status::Saved;
+        item.caption.clear();
+        assert!(
+            !item.is_finished(),
+            "a saved file with missing fields can still be completed by AI"
+        );
+
+        item.status = Status::Pending;
+        assert!(!item.is_finished());
+    }
+
+    #[test]
+    fn generation_targets_skip_saved_and_complete_items_unless_forced() {
+        let ready = PathBuf::from("ready.jpg");
+        let saved_partial = PathBuf::from("saved-partial.jpg");
+        let generated = PathBuf::from("generated.jpg");
+        let partial = PathBuf::from("partial.jpg");
+        let mut items = HashMap::new();
+        let mut completed = ImageItem::new(ready.clone());
+        completed.status = Status::Saved;
+        completed.title = "Title".into();
+        completed.caption = "Caption.".into();
+        completed.keywords = vec!["keyword".into()];
+        items.insert(ready.clone(), completed);
+        let mut saved_partial_item = ImageItem::new(saved_partial.clone());
+        saved_partial_item.status = Status::Saved;
+        saved_partial_item.title = "Title only".into();
+        items.insert(saved_partial.clone(), saved_partial_item);
+        let mut unwritten = ImageItem::new(generated.clone());
+        unwritten.status = Status::Generated;
+        unwritten.dirty = true;
+        unwritten.title = "Title".into();
+        unwritten.caption = "Caption.".into();
+        unwritten.keywords = vec!["keyword".into()];
+        items.insert(generated.clone(), unwritten);
+        items.insert(partial.clone(), ImageItem::new(partial.clone()));
+
+        let requested = vec![
+            ready.clone(),
+            saved_partial.clone(),
+            generated.clone(),
+            partial.clone(),
+        ];
+        let (skipped, targets) = partition_generation_targets(requested.clone(), &items, false);
+        assert_eq!(skipped, vec![ready, saved_partial, generated]);
+        assert_eq!(targets, vec![partial]);
+
+        let (skipped, targets) = partition_generation_targets(requested, &items, true);
+        assert!(skipped.is_empty());
+        assert_eq!(targets.len(), 4);
+    }
+
+    #[test]
+    fn ai_queue_puts_failures_at_the_back() {
+        let mut queue = AiQueue::new(["first", "second", "third"]);
+        assert_eq!(queue.len(), 3);
+
+        let first = queue.next().expect("first job");
+        assert_eq!(first.item, "first");
+        assert_eq!(queue.retry(first), Some(1));
+        let second = queue.next().expect("second job");
+        assert_eq!(second.item, "second");
+        assert_eq!(queue.retry(second), Some(1));
+        assert_eq!(queue.next().expect("third job").item, "third");
+        assert_eq!(queue.next().expect("first retry").item, "first");
+        assert_eq!(queue.next().expect("second retry").item, "second");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn ai_queue_can_drop_finished_items_before_it_starts() {
+        let mut queue = AiQueue::new(["saved", "pending", "generated"]);
+        queue.retain(|item| *item == "pending");
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.next().expect("pending job").item, "pending");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn ai_queue_allows_two_retries_then_stops() {
+        let mut queue = AiQueue::new(["image"]);
+        let first = queue.next().expect("initial attempt");
+        assert_eq!(first.retries, 0);
+        assert_eq!(queue.retry(first), Some(1));
+
+        let second = queue.next().expect("first retry");
+        assert_eq!(second.retries, 1);
+        assert_eq!(queue.retry(second), Some(2));
+
+        let third = queue.next().expect("second retry");
+        assert_eq!(third.retries, 2);
+        assert_eq!(queue.retry(third), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn batch_progress_fraction_handles_bounds() {
-        assert_eq!(BatchProgress { total: 0, done: 0, saving: false }.fraction(), 0.0);
-        assert_eq!(BatchProgress { total: 4, done: 0, saving: false }.fraction(), 0.0);
-        assert_eq!(BatchProgress { total: 4, done: 2, saving: false }.fraction(), 0.5);
-        assert_eq!(BatchProgress { total: 4, done: 4, saving: true }.fraction(), 1.0);
+        assert_eq!(
+            BatchProgress {
+                total: 0,
+                done: 0,
+                saving: false,
+                last_image: None
+            }
+            .fraction(),
+            0.0
+        );
+        assert_eq!(
+            BatchProgress {
+                total: 4,
+                done: 0,
+                saving: false,
+                last_image: None
+            }
+            .fraction(),
+            0.0
+        );
+        assert_eq!(
+            BatchProgress {
+                total: 4,
+                done: 2,
+                saving: false,
+                last_image: None
+            }
+            .fraction(),
+            0.5
+        );
+        assert_eq!(
+            BatchProgress {
+                total: 4,
+                done: 4,
+                saving: true,
+                last_image: None
+            }
+            .fraction(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn batch_eta_uses_the_last_image_duration() {
+        let mut batch = BatchProgress {
+            total: 4,
+            done: 1,
+            saving: false,
+            last_image: Some(Duration::from_secs(10)),
+        };
+        assert_eq!(batch.eta(), Some(Duration::from_secs(30)));
+
+        batch.done = 3;
+        assert_eq!(batch.eta(), Some(Duration::from_secs(10)));
+
+        batch.done = 4;
+        assert_eq!(batch.eta(), None, "nothing remains to estimate");
+
+        batch.done = 1;
+        batch.last_image = None;
+        assert_eq!(batch.eta(), None, "no image has finished yet");
     }
 
     #[test]
@@ -978,7 +1420,11 @@ mod tests {
         assert_eq!(stepped_index(Some(2), 3, 1), Some(2));
         assert_eq!(stepped_index(Some(1), 3, -1), Some(0));
         assert_eq!(stepped_index(Some(2), 3, -10), Some(0));
-        assert_eq!(stepped_index(Some(99), 3, 1), Some(2), "out-of-range selection is clamped");
+        assert_eq!(
+            stepped_index(Some(99), 3, 1),
+            Some(2),
+            "out-of-range selection is clamped"
+        );
     }
 
     #[test]
@@ -1005,7 +1451,10 @@ mod tests {
         assert!(selection.contains(Path::new("b.jpg")));
         assert_eq!(selection.active(), Some(Path::new("b.jpg")));
         assert_eq!(selection.anchor(), Some(Path::new("b.jpg")));
-        assert_eq!(selection.primary(&ordered).as_deref(), Some(Path::new("b.jpg")));
+        assert_eq!(
+            selection.primary(&ordered).as_deref(),
+            Some(Path::new("b.jpg"))
+        );
     }
 
     #[test]
@@ -1016,7 +1465,10 @@ mod tests {
         selection.click(
             &ordered,
             Path::new("c.jpg"),
-            SelectModifiers { ctrl: true, shift: false },
+            SelectModifiers {
+                ctrl: true,
+                shift: false,
+            },
         );
         assert_eq!(selection.count(), 2);
         assert!(selection.contains(Path::new("a.jpg")));
@@ -1026,7 +1478,10 @@ mod tests {
         selection.click(
             &ordered,
             Path::new("c.jpg"),
-            SelectModifiers { ctrl: true, shift: false },
+            SelectModifiers {
+                ctrl: true,
+                shift: false,
+            },
         );
         assert_eq!(selection.count(), 1);
         assert!(!selection.contains(Path::new("c.jpg")));
@@ -1041,7 +1496,10 @@ mod tests {
         selection.click(
             &ordered,
             Path::new("d.jpg"),
-            SelectModifiers { ctrl: false, shift: true },
+            SelectModifiers {
+                ctrl: false,
+                shift: true,
+            },
         );
         assert_eq!(selection.count(), 3);
         assert!(selection.contains(Path::new("b.jpg")));
@@ -1059,13 +1517,19 @@ mod tests {
         selection.click(
             &ordered,
             Path::new("b.jpg"),
-            SelectModifiers { ctrl: false, shift: true },
+            SelectModifiers {
+                ctrl: false,
+                shift: true,
+            },
         );
         assert_eq!(selection.count(), 2);
         selection.click(
             &ordered,
             Path::new("d.jpg"),
-            SelectModifiers { ctrl: true, shift: true },
+            SelectModifiers {
+                ctrl: true,
+                shift: true,
+            },
         );
         assert_eq!(selection.count(), 4);
         assert!(selection.contains(Path::new("a.jpg")));
@@ -1107,12 +1571,18 @@ mod tests {
         selection.select_all(&ordered);
         assert_eq!(selection.count(), 3);
         assert_eq!(selection.active(), Some(Path::new("a.jpg")));
-        assert_eq!(selection.primary(&ordered).as_deref(), Some(Path::new("a.jpg")));
+        assert_eq!(
+            selection.primary(&ordered).as_deref(),
+            Some(Path::new("a.jpg"))
+        );
 
         selection.click(
             &ordered,
             Path::new("c.jpg"),
-            SelectModifiers { ctrl: true, shift: false },
+            SelectModifiers {
+                ctrl: true,
+                shift: false,
+            },
         );
         selection.retain_existing(&paths(&["b.jpg", "x.jpg"]));
         assert_eq!(selection.count(), 1);
@@ -1154,10 +1624,7 @@ mod tests {
     #[test]
     fn append_keywords_keeps_the_singular_form() {
         let mut existing = vec!["apples".to_string(), "boxes".to_string()];
-        append_keywords(
-            &mut existing,
-            &["apple".to_string(), "box".to_string()],
-        );
+        append_keywords(&mut existing, &["apple".to_string(), "box".to_string()]);
         assert_eq!(existing, vec!["apple", "box"]);
 
         let mut existing = vec!["apple".to_string()];

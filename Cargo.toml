@@ -1,12 +1,11 @@
 [package]
 name = "autowording"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.92"
 description = "AI-powered JPEG metadata keywording desktop app for microstock submissions"
 
 [dependencies]
-eframe = { version = "0.28.1", default-features = false, features = ["default_fonts", "glow"] }
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "native-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -20,6 +19,10 @@ regex = "1.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
 image = { version = "0.25.1", default-features = false, features = ["jpeg"] }
+gpui-kit = "0.9.0"
+
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

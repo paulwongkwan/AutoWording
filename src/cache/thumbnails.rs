@@ -1,17 +1,18 @@
-use eframe::egui::TextureHandle;
+use gpui_kit::RenderImage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-/// In-memory texture cache for grid thumbnails, with in-flight and failure sets.
+/// In-memory image cache for grid thumbnails, with in-flight and failure sets.
 #[derive(Default)]
 pub struct ThumbnailCache {
-    textures: HashMap<PathBuf, TextureHandle>,
+    textures: HashMap<PathBuf, Arc<RenderImage>>,
     loading: HashSet<PathBuf>,
     failed: HashSet<PathBuf>,
 }
 
 impl ThumbnailCache {
-    pub fn texture(&self, path: &Path) -> Option<&TextureHandle> {
+    pub fn texture(&self, path: &Path) -> Option<&Arc<RenderImage>> {
         self.textures.get(path)
     }
 
@@ -33,7 +34,7 @@ impl ThumbnailCache {
         self.loading.insert(path.to_path_buf());
     }
 
-    pub fn insert(&mut self, path: PathBuf, texture: TextureHandle) {
+    pub fn insert(&mut self, path: PathBuf, texture: Arc<RenderImage>) {
         self.loading.remove(&path);
         self.failed.remove(&path);
         self.textures.insert(path, texture);

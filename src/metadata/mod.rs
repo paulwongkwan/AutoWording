@@ -5,7 +5,7 @@ pub use tags::ExistingMetadata;
 pub use writer::Metadata;
 
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,12 +73,79 @@ impl ExifTool {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("exiftool could not read {}: {}", path.display(), stderr.trim());
+            bail!(
+                "exiftool could not read {}: {}",
+                path.display(),
+                stderr.trim()
+            );
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        tags::parse_read_json(&stdout)
-            .with_context(|| format!("Could not parse metadata for {}", path.display()))
+        // ExifTool normally reports Orientation from EXIF or XMP. When it does
+        // not, read the JPEG's own tags so an XMP-only orientation still
+        // swaps the reported dimensions.
+        let fallback = if tags::has_orientation(&stdout) {
+            None
+        } else {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| crate::orientation::from_jpeg(&bytes))
+        };
+        let parsed = match fallback {
+            Some(orientation) => tags::parse_read_json_with_orientation(&stdout, Some(orientation)),
+            None => tags::parse_read_json(&stdout),
+        };
+        parsed.with_context(|| format!("Could not parse metadata for {}", path.display()))
+    }
+
+    /// Read metadata for a whole folder in one exiftool invocation. Entries
+    /// that exiftool cannot read are omitted; the caller marks them failed.
+    pub fn read_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, ExistingMetadata>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut args: Vec<String> = vec![
+            "-j".to_string(),
+            "-charset".to_string(),
+            "iptc=utf8".to_string(),
+        ];
+        args.extend(tags::READ_TAGS.iter().map(|tag| tag.to_string()));
+        args.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
+
+        let output = self.run(args)?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value = serde_json::from_str(&stdout).with_context(|| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("Could not parse exiftool metadata JSON: {stderr}")
+        })?;
+        let Some(objects) = value.as_array() else {
+            bail!("exiftool returned non-array metadata JSON");
+        };
+
+        let mut requested: HashMap<String, PathBuf> = paths
+            .iter()
+            .cloned()
+            .map(|path| (path_key(&path), path))
+            .collect();
+        let mut metadata = HashMap::new();
+        for object in objects {
+            let Some(source) = object.get("SourceFile").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(path) = requested.remove(&path_key(Path::new(source))) else {
+                continue;
+            };
+            let fallback = if tags::has_orientation_in_object(object) {
+                None
+            } else {
+                std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| crate::orientation::from_jpeg(&bytes))
+            };
+            metadata.insert(path, tags::parse_read_object(object, fallback));
+        }
+        Ok(metadata)
     }
 
     /// Write title, caption and keywords into EXIF / IPTC / XMP.
@@ -109,19 +176,20 @@ impl ExifTool {
 
 pub const BACKUP_DIR: &str = ".autowording-backups";
 
+/// Where the pre-write copy of a JPEG lives (see [`backup_original`]).
+pub fn backup_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default();
+    parent.join(BACKUP_DIR).join(name)
+}
+
 /// Copy the JPEG into a sibling backup directory. Repeated saves keep the
 /// first backup, so the pre-AutoWording file remains recoverable.
 pub fn backup_original(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("Could not find the parent folder of {}", path.display()))?;
-    let name = path
-        .file_name()
-        .with_context(|| format!("Could not determine the file name of {}", path.display()))?;
-    let backup_dir = parent.join(BACKUP_DIR);
-    std::fs::create_dir_all(&backup_dir)
+    let backup = backup_path(path);
+    let backup_dir = backup.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(backup_dir)
         .with_context(|| format!("Could not create {}", backup_dir.display()))?;
-    let backup = backup_dir.join(name);
     if !backup.exists() {
         std::fs::copy(path, &backup).with_context(|| {
             format!(
@@ -132,6 +200,28 @@ pub fn backup_original(path: &Path) -> Result<PathBuf> {
         })?;
     }
     Ok(backup)
+}
+
+/// Refuse to overwrite a file that changed on disk after it was loaded. When
+/// no baseline was captured (for example a background batch that never read
+/// metadata), the write is allowed.
+pub fn check_unchanged(
+    path: &Path,
+    expected_len: Option<u64>,
+    expected_modified: Option<std::time::SystemTime>,
+) -> Result<()> {
+    let (Some(expected_len), Some(expected_modified)) = (expected_len, expected_modified) else {
+        return Ok(());
+    };
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("Could not inspect {}", path.display()))?;
+    if metadata.len() != expected_len || metadata.modified().ok() != Some(expected_modified) {
+        bail!(
+            "{} changed on disk since it was loaded; not overwritten. Refresh and review it.",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Verify the values ExifTool reads back after a write. Caption verification
@@ -204,6 +294,15 @@ fn command_for(program: &Path) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+fn path_key(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
 }
 
 fn argfile_text(args: &[String]) -> String {
@@ -293,8 +392,7 @@ mod tests {
 
         let metadata = Metadata {
             title: "Golden Gate Sunrise".into(),
-            caption: "Fog drifts under the Golden Gate Bridge at sunrise in San Francisco."
-                .into(),
+            caption: "Fog drifts under the Golden Gate Bridge at sunrise in San Francisco.".into(),
             keywords: vec!["bridge".into(), "sunrise".into(), "fog".into()],
         };
 
@@ -330,6 +428,65 @@ mod tests {
         tool
     }
 
+    fn run_exiftool(tool: &ExifTool, args: &[&str]) {
+        let output = command_for(tool.program())
+            .args(args)
+            .output()
+            .expect("run exiftool");
+        assert!(
+            output.status.success(),
+            "exiftool {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn xmp_only_orientation_drives_dimensions_and_rotation() {
+        let Some(tool) = require_tool() else { return };
+        let path = temp_jpeg("xmp-orientation", 40, 20);
+        let path_arg = path.to_string_lossy().to_string();
+
+        // Strip every tag, including EXIF, then write only the XMP orientation.
+        run_exiftool(&tool, &["-all=", "-overwrite_original", &path_arg]);
+        run_exiftool(
+            &tool,
+            &["-XMP-tiff:Orientation#=6", "-overwrite_original", &path_arg],
+        );
+
+        let bytes = std::fs::read(&path).expect("read jpeg");
+        assert_eq!(
+            crate::orientation::from_jpeg(&bytes),
+            Some(6),
+            "an XMP-only orientation should still be readable"
+        );
+
+        let read = tool.read(&path).expect("read xmp-only orientation");
+        assert_eq!(
+            read.dims,
+            Some((20, 40)),
+            "orientation 6 should swap the stored 40x20 dimensions"
+        );
+    }
+
+    #[test]
+    fn external_change_guard_detects_modified_files() {
+        let path = temp_jpeg("guard.jpg", 8, 8);
+        let metadata = std::fs::metadata(&path).expect("stat file");
+        let len = metadata.len();
+        let modified = metadata.modified().expect("mtime");
+
+        check_unchanged(&path, Some(len), Some(modified)).expect("unchanged file is writable");
+
+        std::fs::write(&path, b"a different, longer payload").expect("modify file");
+        let error = check_unchanged(&path, Some(len), Some(modified))
+            .expect_err("changed file must be refused")
+            .to_string();
+        assert!(error.contains("changed on disk"), "got: {error}");
+
+        check_unchanged(&path, None, None).expect("unknown baseline allows the write");
+    }
+
     #[test]
     fn backup_original_keeps_the_first_copy() {
         let path = temp_jpeg("backup", 16, 16);
@@ -340,7 +497,10 @@ mod tests {
         std::fs::write(&path, b"changed after backup").expect("change original");
         let backup_again = backup_original(&path).expect("second backup");
         assert_eq!(backup_again, backup);
-        assert_eq!(std::fs::read(&backup_again).expect("read backup again"), original);
+        assert_eq!(
+            std::fs::read(&backup_again).expect("read backup again"),
+            original
+        );
     }
 
     #[test]
@@ -372,16 +532,14 @@ mod tests {
 
         let first = Metadata {
             title: "First Title".into(),
-            caption: "First caption that is long enough for the stock metadata round-trip."
-                .into(),
+            caption: "First caption that is long enough for the stock metadata round-trip.".into(),
             keywords: vec!["one".into(), "two".into(), "three".into()],
         };
         tool.write(&path, &first).expect("first write");
 
         let second = Metadata {
             title: "Second Title".into(),
-            caption: "Second caption that is long enough for the stock metadata round-trip."
-                .into(),
+            caption: "Second caption that is long enough for the stock metadata round-trip.".into(),
             keywords: vec!["alpha".into(), "beta".into()],
         };
         tool.write(&path, &second).expect("second write");
@@ -490,6 +648,47 @@ mod tests {
     }
 
     #[test]
+    fn batch_read_returns_metadata_for_each_file() {
+        let Some(tool) = require_tool() else { return };
+        let first = temp_jpeg("batch-first", 24, 16);
+        let second = temp_jpeg("batch-second", 30, 20);
+
+        tool.write(
+            &first,
+            &Metadata {
+                title: "Batch First".into(),
+                caption: "First batch caption long enough for stock metadata.".into(),
+                keywords: vec!["first".into(), "batch".into()],
+            },
+        )
+        .expect("first metadata write");
+        tool.write(
+            &second,
+            &Metadata {
+                title: "Batch Second".into(),
+                caption: "Second batch caption long enough for stock metadata.".into(),
+                keywords: vec!["second".into(), "batch".into()],
+            },
+        )
+        .expect("second metadata write");
+
+        let read = tool
+            .read_many(&[first.clone(), second.clone()])
+            .expect("batch metadata read");
+        assert_eq!(read.len(), 2);
+        assert_eq!(
+            read.get(&first).and_then(|meta| meta.title.as_deref()),
+            Some("Batch First")
+        );
+        assert_eq!(
+            read.get(&second).and_then(|meta| meta.title.as_deref()),
+            Some("Batch Second")
+        );
+        assert_eq!(read.get(&first).map(|meta| meta.dims), Some(Some((24, 16))));
+        assert!(tool.read_many(&[]).expect("empty batch").is_empty());
+    }
+
+    #[test]
     fn unicode_file_names_round_trip() {
         let Some(tool) = require_tool() else { return };
         let dir = std::env::temp_dir().join("autowording-tests");
@@ -504,7 +703,8 @@ mod tests {
             caption: "Café 北京 description with enough characters to look realistic.".into(),
             keywords: vec!["café".into(), "北京".into()],
         };
-        tool.write(&path, &metadata).expect("write unicode filename");
+        tool.write(&path, &metadata)
+            .expect("write unicode filename");
         let read = tool.read(&path).expect("read unicode filename");
 
         assert_eq!(read.title.as_deref(), Some("Café 北京 Titel"));

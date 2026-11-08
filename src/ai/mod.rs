@@ -42,8 +42,12 @@ pub struct AiRequest {
 
 /// Read a JPEG, downscale it for the vision model and return base64 (no data URI prefix).
 pub fn prepare_image(path: &Path) -> Result<String> {
-    let img = image::open(path)
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Could not read image {}", path.display()))?;
+    let orientation = crate::orientation::from_jpeg(&bytes).unwrap_or(1);
+    let img = image::load_from_memory(&bytes)
         .with_context(|| format!("Could not read image {}", path.display()))?;
+    let img = crate::orientation::apply(img, orientation);
     let (width, height) = (img.width(), img.height());
 
     let img = if width.max(height) > MAX_IMAGE_DIM {
@@ -165,7 +169,8 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         );
         if let Ok(retry_raw) = chat(&client, &req, &system, &retry_user).await {
             if let Ok(retry) = prompt::parse_response_with_target(&retry_raw, keyword_target) {
-                let retry_title_ok = within_range(prompt::title_word_count(&retry.title), title_range);
+                let retry_title_ok =
+                    within_range(prompt::title_word_count(&retry.title), title_range);
                 let retry_caption_ok =
                     within_range(prompt::caption_char_count(&retry.caption), caption_range);
                 if !first_valid && retry_title_ok && retry_caption_ok {
@@ -211,26 +216,10 @@ async fn chat(
 
     match req.provider {
         Provider::Ollama => {
-            ollama::chat(
-                client,
-                base_url,
-                model,
-                system,
-                user,
-                &req.image_base64,
-            )
-            .await
+            ollama::chat(client, base_url, model, system, user, &req.image_base64).await
         }
         Provider::LmStudio => {
-            lmstudio::chat(
-                client,
-                base_url,
-                model,
-                system,
-                user,
-                &req.image_base64,
-            )
-            .await
+            lmstudio::chat(client, base_url, model, system, user, &req.image_base64).await
         }
         Provider::OpenAi => {
             let url = endpoint(base_url, "/chat/completions");

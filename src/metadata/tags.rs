@@ -28,7 +28,35 @@ pub const READ_TAGS: &[&str] = &[
     "-CreateDate",
     "-DateTime",
     "-ImageSize",
+    "-Orientation#",
 ];
+
+fn orientation_number(value: &Value) -> Option<u8> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+        .and_then(|number| u8::try_from(number).ok())
+        .filter(|number| (1..=8).contains(number))
+}
+
+/// True when the payload contains a usable Orientation value.
+pub(crate) fn has_orientation(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .map(has_orientation_in_object)
+        .unwrap_or(false)
+}
+
+pub(crate) fn has_orientation_in_object(object: &Value) -> bool {
+    object
+        .get("Orientation")
+        .and_then(orientation_number)
+        .is_some()
+}
 
 fn first_string(object: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
@@ -76,12 +104,28 @@ fn keyword_list(object: &Value, key: &str) -> Vec<String> {
 
 /// Parse the `exiftool -json` output into the editable fields.
 pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
+    parse_read_json_with_orientation(text, None)
+}
+
+/// Parse the output, using `fallback_orientation` (read from the JPEG's APP1
+/// segments) when ExifTool reports no usable Orientation tag.
+pub fn parse_read_json_with_orientation(
+    text: &str,
+    fallback_orientation: Option<u8>,
+) -> Result<ExistingMetadata> {
     let value: Value = serde_json::from_str(text)?;
     let object = value
         .as_array()
         .and_then(|items| items.first())
         .ok_or_else(|| anyhow!("exiftool returned no metadata"))?;
+    Ok(parse_read_object(object, fallback_orientation))
+}
 
+/// Parse one entry from exiftool's JSON array.
+pub(crate) fn parse_read_object(
+    object: &Value,
+    fallback_orientation: Option<u8>,
+) -> ExistingMetadata {
     let title = first_string(object, &["Title", "XPTitle", "ObjectName"]);
     let caption = first_string(
         object,
@@ -99,12 +143,9 @@ pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
     }
 
     let gps = gps_location(object);
-    let date = first_string(
-        object,
-        &["DateTimeOriginal", "CreateDate", "DateTime"],
-    );
+    let date = first_string(object, &["DateTimeOriginal", "CreateDate", "DateTime"]);
 
-    let dims = object
+    let mut dims = object
         .get("ImageSize")
         .and_then(Value::as_str)
         .and_then(|size| {
@@ -112,19 +153,87 @@ pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
             Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
         });
 
-    Ok(ExistingMetadata {
+    // ImageSize reports stored pixels; orientations 5-8 rotate the displayed
+    // image, so the labels must swap to match what the user sees.
+    let orientation = object
+        .get("Orientation")
+        .and_then(orientation_number)
+        .or(fallback_orientation)
+        .unwrap_or(1);
+    if (5..=8).contains(&orientation) {
+        dims = dims.map(|(width, height)| (height, width));
+    }
+
+    ExistingMetadata {
         title,
         caption,
         keywords,
         gps,
         date,
         dims,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orientation_tag_swaps_dimensions_for_rotated_photos() {
+        let json = r#"[{"ImageSize":"6000x4000","Orientation":6}]"#;
+        assert_eq!(
+            parse_read_json(json).expect("valid json").dims,
+            Some((4000, 6000))
+        );
+
+        let json = r#"[{"ImageSize":"6000x4000","Orientation":"8"}]"#;
+        assert_eq!(
+            parse_read_json(json).expect("valid json").dims,
+            Some((4000, 6000))
+        );
+
+        for upright in [
+            r#"[{"ImageSize":"6000x4000","Orientation":1}]"#,
+            r#"[{"ImageSize":"6000x4000","Orientation":9}]"#,
+            r#"[{"ImageSize":"6000x4000"}]"#,
+        ] {
+            assert_eq!(
+                parse_read_json(upright).expect("valid json").dims,
+                Some((6000, 4000)),
+                "upright or unknown orientation keeps ImageSize order"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_orientation_uses_the_xmp_fallback_for_dimensions() {
+        let json = r#"[{"ImageSize":"6000x4000"}]"#;
+        assert_eq!(
+            parse_read_json_with_orientation(json, Some(6))
+                .expect("valid json")
+                .dims,
+            Some((4000, 6000))
+        );
+        assert_eq!(
+            parse_read_json_with_orientation(json, Some(9))
+                .expect("valid json")
+                .dims,
+            Some((6000, 4000)),
+            "an invalid fallback keeps the stored dimensions"
+        );
+    }
+
+    #[test]
+    fn exif_orientation_wins_over_the_xmp_fallback() {
+        let json = r#"[{"ImageSize":"6000x4000","Orientation":1}]"#;
+        assert_eq!(
+            parse_read_json_with_orientation(json, Some(6))
+                .expect("valid json")
+                .dims,
+            Some((6000, 4000)),
+            "EXIF says upright, so the XMP rotation must not be applied"
+        );
+    }
 
     #[test]
     fn parses_exiftool_json_with_ipct_and_xmp_keywords() {
@@ -143,7 +252,10 @@ mod tests {
         ]"#;
         let parsed = parse_read_json(json).expect("valid json");
         assert_eq!(parsed.title.as_deref(), Some("Golden Gate Sunrise"));
-        assert_eq!(parsed.caption.as_deref(), Some("Fog drifts under the bridge."));
+        assert_eq!(
+            parsed.caption.as_deref(),
+            Some("Fog drifts under the bridge.")
+        );
         assert_eq!(parsed.keywords, vec!["bridge", "sunrise", "fog"]);
         assert_eq!(
             parsed.gps.as_deref(),
@@ -226,7 +338,10 @@ mod tests {
         let parsed = parse_read_json(json).expect("valid json");
         assert!(parsed.title.is_none());
         assert_eq!(parsed.keywords, vec!["ok"]);
-        assert!(parsed.dims.is_none(), "uppercase X is not a valid separator");
+        assert!(
+            parsed.dims.is_none(),
+            "uppercase X is not a valid separator"
+        );
 
         let parsed = parse_read_json(r#"[{"ImageSize":"abc"}]"#).expect("valid json");
         assert!(parsed.dims.is_none());

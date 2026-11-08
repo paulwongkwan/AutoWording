@@ -308,7 +308,8 @@ async fn generate_retries_out_of_range_title_and_caption() {
 
 #[tokio::test]
 async fn generate_retries_an_unparsable_reply() {
-    let bad = r#"{"choices":[{"message":{"content":"I am sorry, I cannot describe this image."}}]}"#;
+    let bad =
+        r#"{"choices":[{"message":{"content":"I am sorry, I cannot describe this image."}}]}"#;
     let good = r#"{"choices":[{"message":{"content":"Title: Golden Gate Sunrise\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
     let server = mock_server_sequence(vec![("200 OK", bad), ("200 OK", good)]);
 
@@ -341,7 +342,8 @@ async fn generate_retries_an_unparsable_reply() {
 
 #[tokio::test]
 async fn generate_gives_up_after_three_parse_retries() {
-    let bad = r#"{"choices":[{"message":{"content":"Here is a description without any labels."}}]}"#;
+    let bad =
+        r#"{"choices":[{"message":{"content":"Here is a description without any labels."}}]}"#;
     let server = mock_server_sequence(vec![("200 OK", bad); MAX_ATTEMPTS]);
 
     let error = generate(AiRequest {
@@ -364,7 +366,10 @@ async fn generate_gives_up_after_three_parse_retries() {
     .expect_err("every reply is missing the labels");
 
     let message = format!("{error:#}");
-    assert!(message.contains("failed after 4 attempts"), "got: {message}");
+    assert!(
+        message.contains("failed after 4 attempts"),
+        "got: {message}"
+    );
     assert!(message.contains("missing Title, Caption"), "got: {message}");
     let requests = server.finish();
     assert_eq!(
@@ -516,7 +521,10 @@ async fn openai_sends_bearer_token_and_data_uri() {
     let request = server.finish();
     let lower = request.to_ascii_lowercase();
     assert!(request.starts_with("POST /v1/chat/completions"));
-    assert!(lower.contains("authorization: bearer test-key"), "got: {lower}");
+    assert!(
+        lower.contains("authorization: bearer test-key"),
+        "got: {lower}"
+    );
     let body = request_body(&request);
     assert_eq!(body["max_tokens"], 900);
     assert_eq!(
@@ -589,7 +597,10 @@ async fn anthropic_sends_key_version_and_base64_image() {
     let lower = request.to_ascii_lowercase();
     assert!(request.starts_with("POST /v1/messages"));
     assert!(lower.contains("x-api-key: test-key"), "got: {lower}");
-    assert!(lower.contains("anthropic-version: 2023-06-01"), "got: {lower}");
+    assert!(
+        lower.contains("anthropic-version: 2023-06-01"),
+        "got: {lower}"
+    );
     let body = request_body(&request);
     assert_eq!(body["system"], "system");
     assert_eq!(body["max_tokens"], 900);
@@ -663,7 +674,10 @@ fn model_list_endpoints_are_provider_specific() {
         "http://localhost:1234/v1/models"
     );
     assert_eq!(
-        models::models_endpoint(Provider::LmStudio, "http://localhost:1234/v1/chat/completions"),
+        models::models_endpoint(
+            Provider::LmStudio,
+            "http://localhost:1234/v1/chat/completions"
+        ),
         "http://localhost:1234/v1/models"
     );
     assert_eq!(
@@ -719,7 +733,10 @@ async fn lmstudio_model_list_uses_v1_models_without_auth() {
 
     let request = server.finish();
     let lower = request.to_ascii_lowercase();
-    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
+    assert!(
+        request.starts_with("GET /v1/models HTTP/1.1"),
+        "got: {request}"
+    );
     assert!(!lower.contains("authorization:"), "no auth header expected");
 }
 
@@ -742,16 +759,19 @@ async fn openai_model_list_sends_bearer_and_parses_ids() {
 
     let request = server.finish();
     let lower = request.to_ascii_lowercase();
-    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
-    assert!(lower.contains("authorization: bearer sk-test"), "got: {lower}");
+    assert!(
+        request.starts_with("GET /v1/models HTTP/1.1"),
+        "got: {request}"
+    );
+    assert!(
+        lower.contains("authorization: bearer sk-test"),
+        "got: {lower}"
+    );
 }
 
 #[tokio::test]
 async fn anthropic_model_list_sends_key_and_version_headers() {
-    let server = mock_server(
-        "200 OK",
-        r#"{"data":[{"id":"claude-sonnet-4-20250514"}]}"#,
-    );
+    let server = mock_server("200 OK", r#"{"data":[{"id":"claude-sonnet-4-20250514"}]}"#);
     let settings = ProviderSettings {
         base_url: format!("{}/v1", server.url()),
         model: String::new(),
@@ -765,9 +785,15 @@ async fn anthropic_model_list_sends_key_and_version_headers() {
 
     let request = server.finish();
     let lower = request.to_ascii_lowercase();
-    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "got: {request}");
+    assert!(
+        request.starts_with("GET /v1/models HTTP/1.1"),
+        "got: {request}"
+    );
     assert!(lower.contains("x-api-key: test-key"), "got: {lower}");
-    assert!(lower.contains("anthropic-version: 2023-06-01"), "got: {lower}");
+    assert!(
+        lower.contains("anthropic-version: 2023-06-01"),
+        "got: {lower}"
+    );
 }
 
 #[tokio::test]

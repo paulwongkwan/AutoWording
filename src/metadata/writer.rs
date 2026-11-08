@@ -135,11 +135,15 @@ mod tests {
         // "+=" would make ExifTool keep the previous keyword list.
         assert!(!args.iter().any(|arg| arg.contains("+=")));
         assert_eq!(
-            args.iter().filter(|arg| arg.starts_with("-IPTC:Keywords")).count(),
+            args.iter()
+                .filter(|arg| arg.starts_with("-IPTC:Keywords"))
+                .count(),
             2
         );
         assert_eq!(
-            args.iter().filter(|arg| arg.starts_with("-XMP-dc:Subject")).count(),
+            args.iter()
+                .filter(|arg| arg.starts_with("-XMP-dc:Subject"))
+                .count(),
             2
         );
     }
@@ -168,11 +172,15 @@ mod tests {
         };
         let args = write_args(&md);
         assert_eq!(
-            args.iter().filter(|arg| arg.starts_with("-IPTC:Keywords=")).count(),
+            args.iter()
+                .filter(|arg| arg.starts_with("-IPTC:Keywords="))
+                .count(),
             KEYWORD_TARGET
         );
         assert_eq!(
-            args.iter().filter(|arg| arg.starts_with("-XMP-dc:Subject=")).count(),
+            args.iter()
+                .filter(|arg| arg.starts_with("-XMP-dc:Subject="))
+                .count(),
             KEYWORD_TARGET
         );
     }

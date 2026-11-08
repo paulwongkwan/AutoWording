@@ -1,5 +1,5 @@
 use crate::app::{App, WorkspaceMode};
-use crate::state::SelectModifiers;
+use crate::state::{SelectModifiers, SortMode, StatusFilter};
 use crate::theme;
 use crate::ui::{self, count_chip, ghost_button, status_pill, status_style};
 use eframe::egui::{
@@ -17,11 +17,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 fn left_panel(app: &mut App, ctx: &egui::Context) {
     let frame = Frame::none()
         .fill(theme::card_fill())
-        .inner_margin(Margin::symmetric(12.0, 12.0));
+        .inner_margin(Margin::symmetric(16.0, 14.0));
 
     egui::SidePanel::left("folder_panel")
         .resizable(false)
-        .exact_width(276.0)
+        .exact_width(288.0)
         .frame(frame)
         .show(ctx, |ui| {
             ui::tree::show(app, ctx, ui);
@@ -31,7 +31,7 @@ fn left_panel(app: &mut App, ctx: &egui::Context) {
 fn central(app: &mut App, ctx: &egui::Context) {
     let frame = Frame::none()
         .fill(theme::bg())
-        .inner_margin(Margin::symmetric(12.0, 10.0));
+        .inner_margin(Margin::symmetric(18.0, 14.0));
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         if app.current_folder.is_none() {
@@ -48,14 +48,18 @@ fn central(app: &mut App, ctx: &egui::Context) {
             .clamp(if compact { 150.0 } else { 180.0 }, 560.0);
         grid(app, ctx, ui, grid_height);
 
-        ui.add_space(9.0);
-        ui.add(egui::Label::new(
-            RichText::new("ACTIVE PREVIEW")
-                .size(9.0)
-                .strong()
-                .color(theme::text_muted()),
-        ));
-        ui.add_space(3.0);
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui::eyebrow(ui, "Preview");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add(egui::Label::new(
+                    RichText::new("Double-click a thumbnail for full screen")
+                        .size(9.5)
+                        .color(theme::text_muted()),
+                ));
+            });
+        });
+        ui.add_space(4.0);
         preview(app, ctx, ui);
     });
 }
@@ -65,33 +69,40 @@ fn welcome(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.set_min_height(ui.available_height());
         ui.set_width(ui.available_width());
         ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+            ui.add_space(72.0);
+            ui::eyebrow(ui, "AutoWording Studio");
+            ui.add_space(16.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(72.0), Sense::hover());
             ui.painter()
-                .circle_filled(rect.center(), 32.0, theme::accent_soft());
+                .circle_filled(rect.center(), 36.0, theme::accent_soft());
+            ui.painter().circle_stroke(
+                rect.center(),
+                36.0,
+                Stroke::new(1.0_f32, theme::border()),
+            );
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
                 "AW",
-                FontId::proportional(20.0),
+                FontId::proportional(22.0),
                 theme::accent(),
             );
-            ui.add_space(14.0);
+            ui.add_space(18.0);
             ui.add(egui::Label::new(
-                RichText::new("Open a stock folder to start").size(18.0).strong(),
+                RichText::new("Open a stock folder to start").size(24.0).strong(),
             ));
-            ui.add_space(5.0);
+            ui.add_space(7.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(
                         "Browse This PC or a folder on the left, select one or many images, then run AI and write the metadata to EXIF/IPTC/XMP.",
                     )
-                    .size(12.0)
+                    .size(12.5)
                     .color(theme::text_muted()),
                 )
                 .wrap(),
             );
-            ui.add_space(14.0);
+            ui.add_space(18.0);
             ui.horizontal(|ui| {
                 if ui.add(ui::primary_button("Open Folder…")).clicked() {
                     app.open_folder_dialog(ctx);
@@ -100,7 +111,7 @@ fn welcome(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                     app.add_images_dialog(ctx);
                 }
             });
-            ui.add_space(18.0);
+            ui.add_space(20.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(
@@ -121,16 +132,25 @@ fn folder_header(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         .as_deref()
         .map(folder_name)
         .unwrap_or_else(|| "Images".to_string());
+    let full_path = app
+        .current_folder
+        .as_ref()
+        .map(|path| path.display().to_string());
     let summary = selection_summary(app);
 
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new(RichText::new(folder_label).size(15.0).strong()));
-        count_chip(ui, &format!("{}", app.folder_images.len()), true);
-        if summary.selected > 0 {
-            count_chip(ui, &format!("{} selected", summary.selected), true);
-        }
+        ui.vertical(|ui| {
+            ui::eyebrow(ui, "Current folder");
+            let title = ui.add(
+                egui::Label::new(RichText::new(folder_label).size(22.0).strong()).truncate(),
+            );
+            if let Some(path) = &full_path {
+                title.on_hover_text(path);
+            }
+        });
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             if ui.add(ghost_button("Refresh")).clicked() {
                 app.refresh_browser(ctx);
             }
@@ -149,12 +169,90 @@ fn folder_header(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         });
     });
 
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        count_chip(ui, &format!("{} images", app.folder_images.len()), true);
+        if summary.selected > 0 {
+            count_chip(ui, &format!("{} selected", summary.selected), true);
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(egui::Label::new(
+                RichText::new("JPEG · EXIF / IPTC / XMP")
+                    .size(9.5)
+                    .color(theme::text_muted()),
+            ));
+        });
+    });
+
     selection_summary_row(
         ui,
         summary,
         app.cfg.keyword_target(),
         app.cfg.density.is_compact(),
     );
+    filter_row(app, ui);
+}
+
+/// Search, status filter, sort order and a shown/total counter for the grid.
+fn filter_row(app: &mut App, ui: &mut egui::Ui) {
+    let compact = app.cfg.density.is_compact();
+    ui.add_space(8.0);
+    theme::surface().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            ui.add(egui::Label::new(
+                RichText::new("⌕").size(14.0).color(theme::text_muted()),
+            ));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.browser_query)
+                    .hint_text("Search file name, title or keywords")
+                    .desired_width(if compact { 158.0 } else { 224.0 }),
+            );
+            egui::ComboBox::from_id_source("status_filter")
+                .width(if compact { 88.0 } else { 104.0 })
+                .selected_text(app.status_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in StatusFilter::ALL {
+                        ui.selectable_value(&mut app.status_filter, filter, filter.label());
+                    }
+                });
+            egui::ComboBox::from_id_source("sort_mode")
+                .width(if compact { 76.0 } else { 90.0 })
+                .selected_text(app.sort_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in SortMode::ALL {
+                        ui.selectable_value(&mut app.sort_mode, mode, mode.label());
+                    }
+                });
+            let arrow = if app.sort_descending { "↓" } else { "↑" };
+            if ui
+                .add(ghost_button(arrow))
+                .on_hover_text(if app.sort_descending {
+                    "Descending — click for ascending"
+                } else {
+                    "Ascending — click for descending"
+                })
+                .clicked()
+            {
+                app.sort_descending = !app.sort_descending;
+            }
+            if app.filters_active() {
+                if ui.add(ghost_button("Clear filters")).clicked() {
+                    app.clear_browser_filter();
+                }
+                let shown = app.visible_images().len();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{shown} of {}", app.folder_images.len()))
+                            .size(10.0)
+                            .color(theme::text_muted()),
+                    ),
+                );
+            }
+        });
+    });
 }
 
 #[derive(Default, Clone, Copy)]
@@ -411,11 +509,39 @@ fn grid(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui, height: f32) {
         return;
     }
 
-    let paths = app.folder_images.clone();
+    let paths = app.visible_images();
+    if paths.is_empty() {
+        Frame::none()
+            .fill(theme::card_fill())
+            .stroke(Stroke::new(1.0_f32, theme::border()))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(18.0, 20.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("No images match the current filter")
+                        .size(14.0)
+                        .strong()
+                        .color(theme::text()),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new("Adjust the search, status or sort controls to see this folder again.")
+                        .size(11.0)
+                        .color(theme::text_muted()),
+                );
+                ui.add_space(8.0);
+                if ui.add(ghost_button("Clear filters")).clicked() {
+                    app.clear_browser_filter();
+                }
+            });
+        return;
+    }
+
     let compact = app.cfg.density.is_compact();
-    let card_w = if compact { 126.0 } else { 156.0 };
-    let card_h = if compact { 146.0 } else { 180.0 };
-    let row_gap = if compact { 6.0 } else { 8.0 };
+    let card_w = if compact { 132.0 } else { 164.0 };
+    let card_h = if compact { 154.0 } else { 192.0 };
+    let row_gap = if compact { 8.0 } else { 10.0 };
     let spacing = ui.spacing().item_spacing.x.max(6.0);
     let columns = (((ui.available_width() + spacing) / (card_w + spacing)).floor() as usize).max(1);
 
@@ -447,26 +573,26 @@ fn card(
     let Some(item) = app.items.get(path).cloned() else {
         return;
     };
-    let edge = if compact { 5.0 } else { 7.0 };
-    let footer = if compact { 42.0 } else { 50.0 };
-    let thumb_font = if compact { 9.0 } else { 10.0 };
-    let pill_gap = if compact { 4.0 } else { 5.0 };
-    let pill_char = if compact { 4.4 } else { 4.9 };
-    let pill_pad = if compact { 9.0 } else { 10.0 };
-    let pill_min = if compact { 30.0 } else { 34.0 };
-    let pill_offset = if compact { 17.0 } else { 19.0 };
-    let pill_height = if compact { 13.0 } else { 14.0 };
-    let pill_font = if compact { 7.2 } else { 8.0 };
-    let name_chars = if compact { 15 } else { 19 };
-    let name_top = if compact { 32.0 } else { 36.0 };
-    let name_size = if compact { 9.8 } else { 10.8 };
-    let badge_char = if compact { 4.8 } else { 5.2 };
+    let edge = if compact { 6.0 } else { 8.0 };
+    let footer = if compact { 46.0 } else { 56.0 };
+    let thumb_font = if compact { 9.5 } else { 10.5 };
+    let pill_gap = if compact { 6.0 } else { 7.0 };
+    let pill_char = if compact { 4.6 } else { 5.0 };
+    let pill_pad = if compact { 10.0 } else { 11.0 };
+    let pill_min = if compact { 32.0 } else { 36.0 };
+    let pill_offset = if compact { 18.0 } else { 20.0 };
+    let pill_height = if compact { 14.0 } else { 15.0 };
+    let pill_font = if compact { 7.4 } else { 8.2 };
+    let name_chars = if compact { 16 } else { 20 };
+    let name_top = if compact { 34.0 } else { 38.0 };
+    let name_size = if compact { 10.2 } else { 11.2 };
+    let badge_char = if compact { 4.9 } else { 5.3 };
     let badge_pad = if compact { 10.0 } else { 12.0 };
-    let badge_min = if compact { 36.0 } else { 40.0 };
-    let badge_top = if compact { 17.0 } else { 19.0 };
-    let badge_height = if compact { 12.5 } else { 14.0 };
-    let badge_font = if compact { 7.8 } else { 8.5 };
-    let checkbox_size = if compact { 15.0 } else { 17.0 };
+    let badge_min = if compact { 38.0 } else { 42.0 };
+    let badge_top = if compact { 16.0 } else { 18.0 };
+    let badge_height = if compact { 13.0 } else { 14.0 };
+    let badge_font = if compact { 7.9 } else { 8.5 };
+    let checkbox_size = if compact { 16.0 } else { 18.0 };
     let check_font = if compact { 10.0 } else { 11.0 };
     let selected = app.selection.contains(path);
     let active = app.selection.active() == Some(path.as_path());
@@ -494,23 +620,23 @@ fn card(
     } else {
         theme::card_fill()
     };
-    painter.rect_filled(rect, egui::Rounding::same(9.0), fill);
+    painter.rect_filled(rect, egui::Rounding::same(14.0), fill);
     let border = if active {
-        Stroke::new(2.5_f32, theme::accent())
+        Stroke::new(2.4_f32, theme::accent())
     } else if selected {
-        Stroke::new(1.8_f32, theme::accent())
+        Stroke::new(1.6_f32, theme::accent())
     } else if hovered {
         Stroke::new(1.2_f32, theme::border_strong())
     } else {
         Stroke::new(1.0_f32, theme::border())
     };
-    painter.rect_stroke(rect, egui::Rounding::same(9.0), border);
+    painter.rect_stroke(rect, egui::Rounding::same(14.0), border);
 
     let image_rect = Rect::from_min_max(
         rect.min + egui::vec2(edge, edge),
         egui::pos2(rect.max.x - edge, rect.max.y - footer),
     );
-    painter.rect_filled(image_rect, egui::Rounding::same(6.0), theme::thumb_bg());
+    painter.rect_filled(image_rect, egui::Rounding::same(10.0), theme::thumb_bg());
 
     match thumbnail {
         Some((texture_id, size)) => {
@@ -589,6 +715,18 @@ fn card(
         FontId::proportional(badge_font),
         fg,
     );
+    if !item.keywords.is_empty() {
+        painter.text(
+            egui::pos2(
+                rect.right() - edge - 1.0,
+                rect.bottom() - badge_top + badge_height * 0.5,
+            ),
+            Align2::RIGHT_CENTER,
+            format!("{} kw", item.keywords.len()),
+            FontId::proportional(if compact { 8.0 } else { 8.8 }),
+            theme::text_muted(),
+        );
+    }
 
     let checkbox_rect =
         Rect::from_min_size(rect.min + egui::vec2(edge, edge), Vec2::splat(checkbox_size));
@@ -599,7 +737,7 @@ fn card(
     );
     painter.rect_filled(
         checkbox_rect,
-        egui::Rounding::same(3.0),
+        egui::Rounding::same(5.0),
         if selected {
             theme::accent()
         } else {
@@ -608,7 +746,7 @@ fn card(
     );
     painter.rect_stroke(
         checkbox_rect,
-        egui::Rounding::same(3.0),
+        egui::Rounding::same(5.0),
         Stroke::new(
             1.2_f32,
             if selected {
@@ -695,7 +833,7 @@ fn preview(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
                             .map(|item| item.file_name())
                             .unwrap_or_else(|| "Image".to_string()),
                     )
-                    .size(13.5)
+                    .size(14.5)
                     .strong(),
                 )
                 .truncate(),
@@ -726,7 +864,12 @@ fn preview(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, egui::Rounding::same(10.0), theme::preview_bg());
+        painter.rect_filled(rect, egui::Rounding::same(12.0), theme::preview_bg());
+        painter.rect_stroke(
+            rect,
+            egui::Rounding::same(12.0),
+            Stroke::new(1.0_f32, theme::border()),
+        );
 
         match texture {
             Some((texture_id, size)) => {

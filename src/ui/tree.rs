@@ -1,7 +1,4 @@
-use crate::app::App;
-use crate::ui::{text_button, tiny_button};
 use directories::UserDirs;
-use eframe::egui::{self, ScrollArea};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -213,6 +210,7 @@ fn system_roots() -> Vec<PathBuf> {
     roots
 }
 
+#[allow(dead_code)]
 fn quick_access() -> Vec<FolderShortcut> {
     let Some(user_dirs) = UserDirs::new() else {
         return Vec::new();
@@ -263,155 +261,6 @@ fn breadcrumbs(path: &Path) -> Vec<(String, PathBuf)> {
             (label, ancestor.to_path_buf())
         })
         .collect()
-}
-
-pub fn show(app: &mut App, ctx: &egui::Context, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        crate::ui::section_title(ui, "Folder Browser");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(text_button("Refresh"))
-                .on_hover_text("Rescan this PC and the current folder (F5)")
-                .clicked()
-            {
-                app.refresh_browser(ctx);
-            }
-        });
-    });
-    ui.add_space(5.0);
-
-    if let Some(path) = &app.current_folder {
-        let crumbs = breadcrumbs(path);
-        ui.add_space(2.0);
-        egui::Frame::none()
-            .fill(crate::theme::chip_bg())
-            .stroke(egui::Stroke::new(1.0_f32, crate::theme::border()))
-            .rounding(egui::Rounding::same(7.0))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    for (index, (label, crumb_path)) in crumbs.iter().enumerate() {
-                        if index > 0 {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new("›")
-                                    .size(9.5)
-                                    .color(crate::theme::border_strong()),
-                            ));
-                        }
-                        let current = index + 1 == crumbs.len();
-                        let response = ui
-                            .selectable_label(
-                                current,
-                                egui::RichText::new(label).size(9.5).color(if current {
-                                    crate::theme::text()
-                                } else {
-                                    crate::theme::text_muted()
-                                }),
-                            )
-                            .on_hover_text(crumb_path.display().to_string());
-                        if response.clicked() && !current {
-                            app.open_folder(ctx, crumb_path.clone());
-                        }
-                    }
-                });
-            });
-    }
-
-    ui.add_space(8.0);
-
-    let shortcuts = quick_access();
-    let rows = app.folders.rows();
-    let available = (ui.available_height() - 4.0).max(150.0);
-    ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .max_height(available)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-
-            if !shortcuts.is_empty() {
-                group_label(ui, "QUICK ACCESS");
-                ui.add_space(2.0);
-                for shortcut in shortcuts {
-                    let current = app.current_folder.as_deref() == Some(shortcut.path.as_path());
-                    if ui
-                        .selectable_label(
-                            current,
-                            egui::RichText::new(shortcut.name).size(11.5),
-                        )
-                        .on_hover_text(shortcut.path.display().to_string())
-                        .clicked()
-                    {
-                        app.open_folder(ctx, shortcut.path);
-                    }
-                }
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-            }
-
-            group_label(ui, "THIS PC");
-            ui.add_space(2.0);
-
-            if rows.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("No mounted drives were found.")
-                            .size(11.0)
-                            .color(crate::theme::text_muted()),
-                    )
-                    .wrap(),
-                );
-                return;
-            }
-
-            for row in rows {
-                ui.horizontal(|ui| {
-                    ui.add_space((row.depth as f32) * 13.0);
-                    if row.has_children {
-                        let glyph = if row.expanded { "▾" } else { "▸" };
-                        if ui
-                            .add(tiny_button(glyph))
-                            .on_hover_text(if row.expanded {
-                                "Collapse folder"
-                            } else {
-                                "Expand folder"
-                            })
-                            .clicked()
-                        {
-                            app.folders.toggle(&row.path);
-                        }
-                    } else {
-                        ui.add_space(13.0);
-                    }
-
-                    let current = app.current_folder.as_deref() == Some(row.path.as_path());
-                    if ui
-                        .selectable_label(current, egui::RichText::new(&row.name).size(12.0))
-                        .clicked()
-                    {
-                        app.open_folder(ctx, row.path.clone());
-                    }
-
-                    if current {
-                        crate::ui::count_chip(
-                            ui,
-                            &format!("{}", app.folder_images.len()),
-                            true,
-                        );
-                    }
-                });
-            }
-        });
-}
-
-fn group_label(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(
-        egui::RichText::new(text)
-            .size(9.0)
-            .strong()
-            .color(crate::theme::text_muted()),
-    ));
 }
 
 #[cfg(test)]

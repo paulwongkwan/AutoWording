@@ -61,16 +61,19 @@ pub async fn list_models(provider: Provider, settings: &ProviderSettings) -> Res
         );
     }
 
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("Unexpected {} model list: {}", provider.label(), snippet(&text)))?;
+    let value: Value = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "Unexpected {} model list: {}",
+            provider.label(),
+            snippet(&text)
+        )
+    })?;
 
     let mut models = match provider {
         Provider::Ollama => named_models(&value, "models", &["name", "model"]),
-        Provider::LmStudio | Provider::OpenAi | Provider::Anthropic => named_models(
-            &value,
-            "data",
-            &["id"],
-        ),
+        Provider::LmStudio | Provider::OpenAi | Provider::Anthropic => {
+            named_models(&value, "data", &["id"])
+        }
     };
 
     models.retain(|model| !model.trim().is_empty());

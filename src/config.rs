@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default and safe bounds for the user-selectable keyword target.
 pub const KEYWORD_TARGET_DEFAULT: usize = 50;
@@ -233,7 +234,9 @@ impl Provider {
             Provider::LmStudio => {
                 "Start LM Studio, load a vision model and enable the local server on port 1234."
             }
-            Provider::OpenAi => "Requests go to api.openai.com. The key is stored locally in config.toml.",
+            Provider::OpenAi => {
+                "Requests go to api.openai.com. The key is stored locally in config.toml."
+            }
             Provider::Anthropic => {
                 "Requests go to api.anthropic.com. The key is stored locally in config.toml."
             }
@@ -405,35 +408,61 @@ impl Config {
 
     /// Remove the retired LM Studio placeholder from configs written by older builds.
     fn clear_legacy_placeholders(&mut self) {
-        if self.lmstudio.model.trim().eq_ignore_ascii_case("local-model") {
+        if self
+            .lmstudio
+            .model
+            .trim()
+            .eq_ignore_ascii_case("local-model")
+        {
             self.lmstudio.model.clear();
         }
     }
 
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        let mut cfg = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|err| {
-                eprintln!("Could not parse {}: {err}. Using defaults.", path.display());
+    pub fn load_with_warning() -> (Self, Option<String>) {
+        Self::load_from(&Self::config_path())
+    }
+
+    fn load_from(path: &Path) -> (Self, Option<String>) {
+        let mut warning = None;
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str(&text) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!("Could not parse {}: {err}. Using defaults.", path.display());
+                    let backup = backup_corrupt_config(path);
+                    warning = Some(match &backup {
+                        Some(backup) => format!(
+                            "Settings could not be parsed; using defaults. Previous file copied to {}.",
+                            backup
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        ),
+                        None => "Settings could not be parsed; using defaults.".to_string(),
+                    });
+                    Self::default()
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                eprintln!("Could not read {}: {err}. Using defaults.", path.display());
+                warning = Some(format!("Could not read settings: {err}. Using defaults."));
                 Self::default()
-            }),
-            Err(_) => Self::default(),
+            }
         };
         cfg.clear_legacy_placeholders();
-        cfg.path = Some(path.clone());
+        cfg.path = Some(path.to_path_buf());
 
         if !path.exists() {
             let _ = cfg.save();
         }
-        cfg
+        (cfg, warning)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
         let path = self.path.clone().unwrap_or_else(Self::config_path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, toml::to_string_pretty(self)?)?;
+        let text = toml::to_string_pretty(self)?;
+        crate::persist::write_atomic(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -472,14 +501,16 @@ impl Config {
     /// and bounded by the app limits in case an old or hand-edited config is invalid.
     pub fn title_word_range(&self) -> (usize, usize) {
         let (min, max) = clamp_title_word_range(self.title_min_words, self.title_max_words);
-        (min.min(self.marketplace.title_words_max()), max.min(self.marketplace.title_words_max()))
+        (
+            min.min(self.marketplace.title_words_max()),
+            max.min(self.marketplace.title_words_max()),
+        )
     }
 
     /// The persisted caption range, clamped to the active marketplace, ordered,
     /// and bounded by the app limits in case an old or hand-edited config is invalid.
     pub fn caption_char_range(&self) -> (usize, usize) {
-        let (min, max) =
-            clamp_caption_char_range(self.caption_min_chars, self.caption_max_chars);
+        let (min, max) = clamp_caption_char_range(self.caption_min_chars, self.caption_max_chars);
         (
             min.min(self.marketplace.caption_chars_max()),
             max.min(self.marketplace.caption_chars_max()),
@@ -499,6 +530,13 @@ impl Config {
     }
 }
 
+/// Keep the unreadable file before the app can overwrite it with defaults.
+fn backup_corrupt_config(path: &Path) -> Option<PathBuf> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let backup = path.with_file_name(format!("config.toml.corrupt-{stamp}"));
+    std::fs::copy(path, &backup).ok().map(|_| backup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +546,37 @@ mod tests {
             .join("autowording-config-tests")
             .join(format!("{}-{name}", std::process::id()))
             .join("config.toml")
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up_and_reported() {
+        let path = temp_config_path("corrupt");
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(&path, b"provider = [").expect("seed corrupt config");
+
+        let (cfg, warning) = Config::load_from(&path);
+        assert_eq!(cfg.provider, Provider::Ollama);
+        let warning = warning.expect("corrupt config warning");
+        assert!(warning.contains("config.toml.corrupt-"), "got: {warning}");
+
+        let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("config.toml.corrupt-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&backups[0]).expect("read backup"),
+            "provider = ["
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -574,7 +643,10 @@ mod tests {
         assert_eq!(cfg.provider, Provider::OpenAi);
         assert_eq!(cfg.openai.model, Provider::OpenAi.default_model());
         // All absent sections fall back to their defaults.
-        assert_eq!(cfg.anthropic.base_url, Provider::Anthropic.default_base_url());
+        assert_eq!(
+            cfg.anthropic.base_url,
+            Provider::Anthropic.default_base_url()
+        );
         assert!(cfg.global_prompt.is_empty());
         assert!(cfg.exiftool_path.is_empty());
         assert!(cfg.last_folder.is_empty());
@@ -644,7 +716,10 @@ mod tests {
 
     #[test]
     fn title_and_caption_ranges_are_clamped_and_ordered() {
-        assert_eq!(clamp_title_word_range(0, 0), (TITLE_WORDS_MIN, TITLE_WORDS_MIN));
+        assert_eq!(
+            clamp_title_word_range(0, 0),
+            (TITLE_WORDS_MIN, TITLE_WORDS_MIN)
+        );
         assert_eq!(clamp_title_word_range(2, 8), (2, 8));
         assert_eq!(clamp_title_word_range(8, 2), (2, 8));
         assert_eq!(clamp_title_word_range(99, 2), (2, TITLE_WORDS_MAX));
@@ -694,7 +769,10 @@ mod tests {
             ..Config::default()
         })
         .expect("serialize marketplace");
-        assert!(text.contains("marketplace = \"adobe_stock\""), "got: {text}");
+        assert!(
+            text.contains("marketplace = \"adobe_stock\""),
+            "got: {text}"
+        );
         let back: Config = toml::from_str(&text).expect("deserialize marketplace");
         assert_eq!(back.marketplace, Marketplace::AdobeStock);
     }
@@ -811,7 +889,10 @@ mod tests {
         assert_eq!(cfg.display_path(), default_path.display().to_string());
 
         let explicit = PathBuf::from("C:\\custom\\config.toml");
-        let cfg = Config { path: Some(explicit.clone()), ..Config::default() };
+        let cfg = Config {
+            path: Some(explicit.clone()),
+            ..Config::default()
+        };
         assert_eq!(cfg.display_path(), explicit.display().to_string());
     }
 

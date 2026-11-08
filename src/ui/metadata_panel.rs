@@ -9,8 +9,8 @@ use crate::state::{
 };
 use crate::theme;
 use crate::ui::{
-    count_chip, ghost_button, primary_button, section_title, segmented_button, status_pill,
-    text_button,
+    count_chip, eyebrow, ghost_button, primary_button, section_title, segmented_button,
+    status_pill, text_button,
 };
 use eframe::egui::{
     self, Frame, Key, Margin, RichText, ScrollArea, Stroke, TextEdit,
@@ -21,16 +21,16 @@ use std::time::Instant;
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let compact = app.cfg.density.is_compact();
     let frame = Frame::none()
-        .fill(theme::card_fill())
+        .fill(theme::bg())
+        .stroke(Stroke::new(1.0_f32, theme::border()))
         .inner_margin(if compact {
-            Margin::symmetric(9.0, 6.0)
-        } else {
             Margin::symmetric(12.0, 10.0)
+        } else {
+            Margin::symmetric(16.0, 14.0)
         });
-
     egui::SidePanel::right("metadata_inspector")
         .resizable(false)
-        .exact_width(372.0)
+        .exact_width(388.0)
         .frame(frame)
         .show(ctx, |ui| {
             if compact {
@@ -44,38 +44,46 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     ui.set_width(ui.available_width());
 
                     let paths = app.selected_paths();
+                    eyebrow(ui, "Inspector");
                     ui.horizontal(|ui| {
-                        section_title(ui, "Metadata");
-                        if paths.len() > 1 {
-                            count_chip(ui, "Batch mode", true);
-                        } else if !paths.is_empty() {
-                            count_chip(ui, "1", true);
-                        }
+                        ui.add(egui::Label::new(
+                            RichText::new("Metadata").size(19.0).strong(),
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if paths.len() > 1 {
+                                count_chip(ui, &format!("{} selected", paths.len()), true);
+                            } else if !paths.is_empty() {
+                                count_chip(ui, "Single image", true);
+                            }
+                        });
                     });
-                    gap(ui, compact, 3.0, 2.0);
-                    ui.separator();
-                    gap(ui, compact, 6.0, 4.0);
+                    ui.add_space(10.0);
 
                     if paths.is_empty() {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(
-                                    "Select one image to edit it, or several to batch-edit.",
+                        theme::surface().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Select one image to edit it, or several to batch-edit.",
+                                    )
+                                    .size(11.5)
+                                    .color(theme::text_muted()),
                                 )
-                                .size(11.0)
-                                .color(theme::text_muted()),
-                            )
-                            .wrap(),
-                        );
+                                .wrap(),
+                            );
+                        });
                     } else if paths.len() == 1 {
                         single(app, ui, ctx, &paths[0], compact);
                     } else {
                         batch(app, ui, ctx, &paths, compact);
                     }
 
-                    gap(ui, compact, 10.0, 6.0);
+                    gap(ui, compact, 12.0, 8.0);
                     ui.separator();
-                    gap(ui, compact, 4.0, 3.0);
+                    gap(ui, compact, 8.0, 6.0);
+                    eyebrow(ui, "Configuration");
+                    gap(ui, compact, 2.0, 1.0);
                     settings(app, ui, ctx, compact);
                 });
         });
@@ -105,19 +113,19 @@ fn single(
     let (caption_min, caption_max) = app.cfg.caption_char_range();
 
     Frame::none()
-        .fill(theme::bg())
+        .fill(theme::card_fill())
         .stroke(Stroke::new(1.0_f32, theme::border()))
-        .rounding(egui::Rounding::same(8.0))
+        .rounding(egui::Rounding::same(12.0))
         .inner_margin(if compact {
-            Margin::symmetric(7.0, 5.0)
+            Margin::symmetric(11.0, 8.0)
         } else {
-            Margin::symmetric(9.0, 7.0)
+            Margin::symmetric(13.0, 10.0)
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::Label::new(RichText::new(item.file_name()).size(13.0).strong())
+                    egui::Label::new(RichText::new(item.file_name()).size(13.5).strong())
                         .truncate(),
                 );
                 status_pill(ui, item.status, item.dirty);
@@ -131,7 +139,9 @@ fn single(
             }
         });
 
-    gap(ui, compact, 7.0, 4.0);
+    gap(ui, compact, 10.0, 7.0);
+    eyebrow(ui, "Content");
+    gap(ui, compact, 4.0, 3.0);
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
             RichText::new("Title").size(11.0).color(theme::text_muted()),
@@ -199,10 +209,12 @@ fn single(
             )),
     );
 
-    gap(ui, compact, 5.0, 4.0);
+    gap(ui, compact, 7.0, 5.0);
+    eyebrow(ui, "Keywords");
+    gap(ui, compact, 3.0, 2.0);
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            RichText::new("Keywords").size(11.0).color(theme::text_muted()),
+            RichText::new("Tags").size(11.0).color(theme::text_muted()),
         ));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             count_chip(
@@ -234,12 +246,12 @@ fn single(
                 let chip = egui::Button::new(
                     RichText::new(format!("{keyword}  ×"))
                         .size(if compact { 10.0 } else { 10.5 })
-                        .color(theme::text()),
+                        .color(theme::accent_text()),
                 )
-                .fill(theme::chip_bg())
-                .stroke(Stroke::new(1.0_f32, theme::border()))
+                .fill(theme::accent_soft())
+                .stroke(Stroke::NONE)
                 .rounding(egui::Rounding::same(999.0))
-                .min_size(egui::vec2(0.0, if compact { 18.0 } else { 20.0 }));
+                .min_size(egui::vec2(0.0, if compact { 20.0 } else { 22.0 }));
                 if ui.add(chip).on_hover_text("Click to remove").clicked() {
                     remove = Some(index);
                 }
@@ -297,7 +309,9 @@ fn single(
         );
     }
 
-    gap(ui, compact, 5.0, 4.0);
+    gap(ui, compact, 9.0, 6.0);
+    eyebrow(ui, "Automation");
+    gap(ui, compact, 4.0, 3.0);
     if lock_controls(ui, &mut locks, compact) {
         if let Some(entry) = app.items.get_mut(path) {
             entry.locks = locks;
@@ -305,37 +319,47 @@ fn single(
     }
 
     gap(ui, compact, 8.0, 6.0);
+    ui.add(egui::Checkbox::new(
+        &mut app.force_regenerate,
+        "Force regenerate saved images",
+    ))
+    .on_hover_text(
+        "Include images that are already saved and complete; normally they are skipped",
+    );
+    gap(ui, compact, 8.0, 6.0);
     let busy = app.batch.is_some();
-    let action_height = if compact { 28.0 } else { 30.0 };
-    let action_width = ((ui.available_width() - 8.0) / 2.0).max(80.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                !busy,
-                primary_button("Generate").min_size(egui::vec2(action_width, action_height)),
-            )
-            .on_hover_text("Ctrl+Enter")
-            .clicked()
-        {
-            generate = true;
-        }
-        let can_save = !busy && app.exiftool.is_some() && !title.trim().is_empty();
-        if ui
-            .add_enabled(
-                can_save,
-                ghost_button("Save to file").min_size(egui::vec2(action_width, action_height)),
-            )
-            .on_hover_text("Ctrl+S")
-            .clicked()
-        {
-            save = true;
+    let width = ui.available_width();
+    if ui
+        .add_enabled(
+            !busy,
+            primary_button("Generate metadata")
+                .min_size(egui::vec2(width, if compact { 32.0 } else { 36.0 })),
+        )
+        .on_hover_text("Ctrl+Enter")
+        .clicked()
+    {
+        generate = true;
+    }
+    gap(ui, compact, 5.0, 4.0);
+    let can_save = !busy && app.exiftool.is_some() && !title.trim().is_empty();
+    if ui
+        .add_enabled(
+            can_save,
+            ghost_button("Save to file")
+                .min_size(egui::vec2(width, if compact { 30.0 } else { 32.0 })),
+        )
+        .on_hover_text("Ctrl+S")
+        .clicked()
+    {
+        save = true;
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.add(text_button("Clear fields")).clicked() {
+            title.clear();
+            caption.clear();
+            keywords.clear();
         }
     });
-    if ui.add(text_button("Clear fields")).clicked() {
-        title.clear();
-        caption.clear();
-        keywords.clear();
-    }
 
     let changed = title != item.title
         || caption != item.caption
@@ -347,9 +371,7 @@ fn single(
             entry.caption = caption;
             entry.keywords = keywords;
             entry.editorial = editorial;
-            if matches!(entry.status, Status::Generated | Status::Saved) {
-                entry.dirty = true;
-            }
+            entry.dirty = true;
         }
     }
 
@@ -378,17 +400,17 @@ fn batch(
 
     Frame::none()
         .fill(theme::accent_soft())
-        .rounding(egui::Rounding::same(8.0))
+        .rounding(egui::Rounding::same(12.0))
         .inner_margin(if compact {
-            Margin::symmetric(8.0, 6.0)
+            Margin::symmetric(11.0, 8.0)
         } else {
-            Margin::symmetric(10.0, 8.0)
+            Margin::symmetric(13.0, 10.0)
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(
-                RichText::new(format!("Multi-Selection ({} items)", items.len()))
-                    .size(13.0)
+                RichText::new(format!("Multi-selection · {} items", items.len()))
+                    .size(14.5)
                     .strong()
                     .color(theme::accent_text()),
             ));
@@ -584,6 +606,14 @@ fn batch(
         .wrap(),
     );
     gap(ui, compact, 5.0, 4.0);
+    ui.add(egui::Checkbox::new(
+        &mut app.force_regenerate,
+        "Force regenerate saved images",
+    ))
+    .on_hover_text(
+        "Include saved, complete images; normally they are skipped by Batch Run AI",
+    );
+    gap(ui, compact, 4.0, 3.0);
     let width = ui.available_width();
     if ui
         .add_enabled(

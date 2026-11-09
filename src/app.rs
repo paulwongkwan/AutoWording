@@ -1,3 +1,4 @@
+use crate::ai::prompt::GeneratedMetadata;
 use crate::ai::{self, AiRequest};
 use crate::cache::ThumbnailCache;
 use crate::config::{Config, LayoutDensity, Provider, ProviderSettings, ThemePreference};
@@ -161,7 +162,6 @@ fn apply_journal_entry(item: &mut ImageItem, entry: &journal::JournalEntry) {
     item.caption = entry.caption.clone();
     item.keywords = entry.keywords.clone();
     item.editorial = entry.editorial;
-    item.review_reasons.clear();
     item.dirty = true;
     item.status = Status::Generated;
 }
@@ -621,7 +621,6 @@ impl App {
                 item.editorial = editorial;
             }
             item.dirty = true;
-            item.review_reasons.clear();
             item.message = None;
             item.status = if item.is_complete(keyword_target) {
                 Status::Generated
@@ -699,7 +698,6 @@ impl App {
                         item.editorial = false;
                         item.status = Status::Pending;
                         item.dirty = false;
-                        item.review_reasons.clear();
                         item.message = None;
                         item.meta_loaded = false;
                         item.disk_len = None;
@@ -1634,10 +1632,6 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.title = value.clone();
                 item.dirty = true;
-                item.review_reasons.clear();
-                if item.status == Status::Review {
-                    item.status = Status::Generated;
-                }
             }
         }
         self.notify(format!("Title applied to {} image(s)", paths.len()), false);
@@ -1649,10 +1643,6 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.caption = value.clone();
                 item.dirty = true;
-                item.review_reasons.clear();
-                if item.status == Status::Review {
-                    item.status = Status::Generated;
-                }
             }
         }
         self.notify(
@@ -1673,10 +1663,6 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 state::append_keywords_with_target(&mut item.keywords, &additions, target);
                 item.dirty = true;
-                item.review_reasons.clear();
-                if item.status == Status::Review {
-                    item.status = Status::Generated;
-                }
             }
         }
         self.notify(
@@ -1697,16 +1683,39 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.keywords = keywords.clone();
                 item.dirty = true;
-                item.review_reasons.clear();
-                if item.status == Status::Review {
-                    item.status = Status::Generated;
-                }
             }
         }
         self.notify(
             format!("Keywords replaced on {} image(s)", paths.len()),
             false,
         );
+    }
+
+    /// Apply an AI result to its item and queue the accepted metadata for the
+    /// immediate write. Returns `true` when the result was accepted.
+    fn finish_generation(
+        &mut self,
+        path: &Path,
+        result: Result<GeneratedMetadata, String>,
+    ) -> bool {
+        let Some(item) = self.items.get_mut(path) else {
+            return false;
+        };
+        match result {
+            Ok(generated) => {
+                apply_generated_metadata(item, generated);
+                item.dirty = true;
+                item.status = Status::Generated;
+                item.message = None;
+                self.auto_save_queue.push(path.to_path_buf());
+                true
+            }
+            Err(error) => {
+                item.status = Status::Error;
+                item.message = Some(error);
+                false
+            }
+        }
     }
 
     /// Write generated metadata as soon as field locks have been applied, one
@@ -1726,7 +1735,7 @@ impl App {
             let Some((metadata, disk_len, disk_modified)) = self
                 .items
                 .get(&path)
-                .filter(|item| item.has_metadata() && item.review_reasons.is_empty())
+                .filter(|item| item.has_metadata())
                 .map(|item| (item.to_metadata(), item.disk_len, item.disk_modified))
             else {
                 continue;
@@ -1852,37 +1861,9 @@ impl App {
                     duration,
                 } => {
                     self.batch_up_next.retain(|queued| queued != &path);
-                    let mut counted = false;
-                    let mut generated_ok = false;
-                    let mut auto_save_ready = false;
-                    if let Some(item) = self.items.get_mut(&path) {
-                        match result {
-                            Ok(generated) => {
-                                apply_generated_metadata(item, generated);
-                                item.dirty = true;
-                                if item.review_reasons.is_empty() {
-                                    item.status = Status::Generated;
-                                    item.message = None;
-                                    auto_save_ready = true;
-                                } else {
-                                    item.status = Status::Review;
-                                    item.message = Some(format!(
-                                        "Needs review: {}",
-                                        item.review_reasons.join("; ")
-                                    ));
-                                }
-                                counted = true;
-                                generated_ok = true;
-                            }
-                            Err(error) => {
-                                item.status = Status::Error;
-                                item.message = Some(error);
-                                counted = true;
-                            }
-                        }
-                    }
-                    if generated_ok && auto_save_ready {
-                        self.auto_save_queue.push(path.clone());
+                    let counted = self.items.contains_key(&path);
+                    let generated_ok = self.finish_generation(&path, result);
+                    if generated_ok {
                         self.pump_auto_save(ctx);
                     }
                     if counted {
@@ -1956,7 +1937,6 @@ impl App {
                             Ok(()) => {
                                 item.status = Status::Saved;
                                 item.dirty = false;
-                                item.review_reasons.clear();
                                 item.message = None;
                                 if let Ok(metadata) = std::fs::metadata(&path) {
                                     item.disk_len = Some(metadata.len());
@@ -2194,5 +2174,50 @@ mod tests {
         assert!(item.dirty, "recovered edits must still count as unsaved");
         assert_eq!(item.status, Status::Generated);
         assert_eq!(item.path, PathBuf::from("D:/photos/harbour.jpg"));
+    }
+
+    fn generated(title: &str, editorial: bool) -> GeneratedMetadata {
+        GeneratedMetadata {
+            title: title.to_string(),
+            caption: "A factual caption that is long enough for this test.".to_string(),
+            keywords: vec!["apple".into(), "banana".into(), "cherry".into()],
+            editorial,
+        }
+    }
+
+    #[test]
+    fn every_successful_generation_is_queued_for_auto_save() {
+        let mut app = App::from_config(Config::default(), None);
+        let commercial = PathBuf::from("D:/photos/street.jpg");
+        let editorial = PathBuf::from("D:/photos/rally.jpg");
+        for path in [&commercial, &editorial] {
+            app.items.insert(path.clone(), ImageItem::new(path.clone()));
+        }
+
+        assert!(app.finish_generation(&commercial, Ok(generated("Quiet Street Corner", false))));
+        assert!(app.finish_generation(&editorial, Ok(generated("Rally Stage At Dawn", true))));
+
+        assert_eq!(
+            app.auto_save_queue,
+            vec![commercial.clone(), editorial.clone()]
+        );
+        assert_eq!(app.items[&commercial].status, Status::Generated);
+        assert_eq!(app.items[&editorial].status, Status::Generated);
+        assert!(app.items[&editorial].editorial);
+        assert!(
+            app.items.values().all(|item| item.message.is_none()),
+            "accepted results must not leave a message"
+        );
+
+        let broken = PathBuf::from("D:/photos/broken.jpg");
+        app.items
+            .insert(broken.clone(), ImageItem::new(broken.clone()));
+        assert!(!app.finish_generation(&broken, Err("provider failed".into())));
+        assert_eq!(app.items[&broken].status, Status::Error);
+        assert_eq!(
+            app.auto_save_queue.len(),
+            2,
+            "a failed generation must not be queued for writing"
+        );
     }
 }

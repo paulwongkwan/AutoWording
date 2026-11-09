@@ -289,6 +289,7 @@ async fn generate_fails_when_a_retry_stays_below_ninety_percent() {
     );
     let server = mock_server_sequence(vec![
         ("200 OK", Box::leak(reply.clone().into_boxed_str())),
+        ("200 OK", Box::leak(reply.clone().into_boxed_str())),
         ("200 OK", Box::leak(reply.into_boxed_str())),
     ]);
 
@@ -315,13 +316,13 @@ async fn generate_fails_when_a_retry_stays_below_ninety_percent() {
         .to_string()
         .contains("at least 9 are required (target 10)"));
     let requests = server.finish();
-    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 3);
 }
 
 #[tokio::test]
 async fn generate_retries_when_the_first_keyword_list_is_short() {
-    let first = r#"{"choices":[{"message":{"content":"Title: Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple"}}]}"#;
-    let second = r#"{"choices":[{"message":{"content":"Title: Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, apples, banana, cherry"}}]}"#;
+    let first = r#"{"choices":[{"message":{"content":"Title: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple"}}]}"#;
+    let second = r#"{"choices":[{"message":{"content":"Title: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, apples, banana, cherry"}}]}"#;
     let server = mock_server_sequence(vec![("200 OK", first), ("200 OK", second)]);
 
     let result = generate(AiRequest {
@@ -347,7 +348,7 @@ async fn generate_retries_when_the_first_keyword_list_is_short() {
     let requests = server.finish();
     assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
     assert!(requests.contains("Only 1 usable keyword was returned"));
-    assert!(requests.contains("title has 2 words"));
+    assert!(requests.contains("at least 2 additional unique single-word keywords"));
 }
 
 #[tokio::test]
@@ -380,9 +381,113 @@ async fn generate_retries_out_of_range_title_and_caption() {
     assert_eq!(result.keywords, vec!["apple", "banana", "cherry"]);
     let requests = server.finish();
     assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
-    assert!(requests.contains("Rewrite the title to 3–5 words"));
-    assert!(requests.contains("Rewrite the caption to 50–180 characters"));
+    assert!(requests.contains("Rewrite the title to exactly 4 words"));
+    assert!(requests.contains("Rewrite the caption to about 115 characters"));
+    assert!(requests.contains("\"temperature\":0.7"));
     assert!(requests.contains("Keep the keywords unchanged"));
+}
+
+#[tokio::test]
+async fn generate_escalates_with_a_fresh_prompt_when_the_retry_repeats() {
+    let repeated = r#"{"choices":[{"message":{"content":"Title: Tiny Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
+    let escalated = r#"{"choices":[{"message":{"content":"Observation: A wide street with shops and people walking.\nTitle: A Quiet Street With Shops\nEditorial Status: Commercial\nCaption: A corrected factual caption about the street scene that is long enough to pass.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![
+        ("200 OK", repeated),
+        ("200 OK", repeated),
+        ("200 OK", escalated),
+    ]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("escalation should replace a repeated invalid title");
+
+    assert_eq!(result.title, "A Quiet Street With Shops");
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 3);
+    assert_eq!(requests.matches("\"temperature\":0.2").count(), 1);
+    assert_eq!(requests.matches("\"temperature\":0.7").count(), 1);
+    assert_eq!(requests.matches("\"temperature\":0.95").count(), 1);
+    assert!(requests.contains("repeated the same title and caption"));
+    assert!(requests.contains("Observation:"));
+}
+
+#[tokio::test]
+async fn generate_escalation_can_fill_a_short_keyword_list() {
+    let short = r#"{"choices":[{"message":{"content":"Title: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple"}}]}"#;
+    let filled = r#"{"choices":[{"message":{"content":"Observation: A red apple on a wooden table.\nTitle: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![
+        ("200 OK", short),
+        ("200 OK", short),
+        ("200 OK", filled),
+    ]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("escalation should fill the short keyword list");
+
+    assert_eq!(result.keywords, vec!["apple", "banana", "cherry"]);
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 3);
+}
+
+#[tokio::test]
+async fn generate_fails_when_escalation_also_repeats() {
+    let repeated = r#"{"choices":[{"message":{"content":"Title: Tiny Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", repeated); 3]);
+
+    let error = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect_err("a repeated invalid title should fail after escalation");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("title with 2 words"), "got: {message}");
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 3);
 }
 
 #[tokio::test]
@@ -421,7 +526,11 @@ async fn generate_retries_non_english_title_and_caption() {
 #[tokio::test]
 async fn generate_fails_when_non_english_title_survives_retry() {
     let reply = r#"{"choices":[{"message":{"content":"Title: Café At Dawn\nEditorial Status: Commercial\nCaption: A charming café scene with people sitting outside in the morning light.\nKeywords: apple, banana, cherry"}}]}"#;
-    let server = mock_server_sequence(vec![("200 OK", reply), ("200 OK", reply)]);
+    let server = mock_server_sequence(vec![
+        ("200 OK", reply),
+        ("200 OK", reply),
+        ("200 OK", reply),
+    ]);
 
     let error = generate(AiRequest {
         provider: Provider::LmStudio,
@@ -444,11 +553,11 @@ async fn generate_fails_when_non_english_title_survives_retry() {
 
     assert!(format!("{error:#}").contains("non-English letters"));
     let requests = server.finish();
-    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 3);
 }
 
 #[tokio::test]
-async fn generate_marks_editorial_metadata_for_review() {
+async fn generate_marks_editorial_metadata() {
     let reply = r#"{"choices":[{"message":{"content":"Title: London Street Scene\nEditorial Status: Editorial\nCaption: London, UK – April 19, 2026: A factual street scene with people walking past shops.\nKeywords: apple, banana, cherry\nReview: None"}}]}"#;
     let server = mock_server_sequence(vec![("200 OK", reply)]);
 
@@ -472,14 +581,6 @@ async fn generate_marks_editorial_metadata_for_review() {
     .expect("editorial metadata should generate");
 
     assert!(result.editorial);
-    assert!(result
-        .review_reasons
-        .iter()
-        .any(|reason| reason.contains("capture date is missing")));
-    assert!(result
-        .review_reasons
-        .iter()
-        .any(|reason| reason.contains("location source is missing")));
     let requests = server.finish();
     assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
 }
@@ -513,14 +614,6 @@ async fn generate_uses_capture_date_for_editorial_prompt() {
     .expect("editorial metadata should generate");
 
     assert!(result.editorial);
-    assert!(!result
-        .review_reasons
-        .iter()
-        .any(|reason| reason.contains("capture date is missing")));
-    assert!(!result
-        .review_reasons
-        .iter()
-        .any(|reason| reason.contains("location source is missing")));
     let requests = server.finish();
     assert!(requests.contains("April 19, 2026"));
     assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
@@ -614,6 +707,7 @@ async fn ollama_sends_image_and_parses_message_content() {
         "system prompt",
         "user prompt",
         "QUJD",
+        0.2,
     )
     .await
     .expect("ollama reply");
@@ -633,7 +727,7 @@ async fn ollama_sends_image_and_parses_message_content() {
 #[tokio::test]
 async fn ollama_surfaces_error_field_and_http_failures() {
     let server = mock_server("200 OK", r#"{"error":"model 'llava' not found"}"#);
-    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD")
+    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -641,7 +735,7 @@ async fn ollama_surfaces_error_field_and_http_failures() {
     server.finish();
 
     let server = mock_server("500 Internal Server Error", r#"{"error":"boom"}"#);
-    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD")
+    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -653,7 +747,7 @@ async fn ollama_surfaces_error_field_and_http_failures() {
 #[tokio::test]
 async fn ollama_rejects_malformed_responses() {
     let server = mock_server("200 OK", "not json at all");
-    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD")
+    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -661,7 +755,7 @@ async fn ollama_rejects_malformed_responses() {
     server.finish();
 
     let server = mock_server("200 OK", "{}");
-    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD")
+    let error = ollama::chat(&http_client(), server.url(), "llava", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -679,7 +773,7 @@ async fn lmstudio_uses_v1_chat_endpoint_without_auth() {
     );
     let base = format!("{}/v1", server.url());
 
-    let reply = lmstudio::chat(&http_client(), &base, "local-model", "s", "u", "QUJD")
+    let reply = lmstudio::chat(&http_client(), &base, "local-model", "s", "u", "QUJD", 0.2)
         .await
         .expect("lm studio reply");
     assert_eq!(reply, "Title: Local Model");
@@ -699,7 +793,7 @@ async fn lmstudio_uses_v1_chat_endpoint_without_auth() {
 #[tokio::test]
 async fn lmstudio_reports_http_and_parse_errors() {
     let server = mock_server("400 Bad Request", r#"{"error":"bad request"}"#);
-    let error = lmstudio::chat(&http_client(), server.url(), "m", "s", "u", "QUJD")
+    let error = lmstudio::chat(&http_client(), server.url(), "m", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -707,7 +801,7 @@ async fn lmstudio_reports_http_and_parse_errors() {
     server.finish();
 
     let server = mock_server("200 OK", r#"{"choices":[]}"#);
-    let error = lmstudio::chat(&http_client(), server.url(), "m", "s", "u", "QUJD")
+    let error = lmstudio::chat(&http_client(), server.url(), "m", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -733,6 +827,7 @@ async fn openai_sends_bearer_token_and_data_uri() {
         "system",
         "user",
         "QUJD",
+        0.2,
     )
     .await
     .expect("openai reply");
@@ -761,7 +856,7 @@ async fn openai_joins_array_content_blocks() {
     );
     let url = format!("{}/v1/chat/completions", server.url());
 
-    let reply = openai::chat(&http_client(), &url, None, "m", "s", "u", "QUJD")
+    let reply = openai::chat(&http_client(), &url, None, "m", "s", "u", "QUJD", 0.2)
         .await
         .expect("openai reply");
     assert_eq!(reply, "hello\nworld");
@@ -772,17 +867,26 @@ async fn openai_joins_array_content_blocks() {
 async fn openai_reports_http_and_parse_errors() {
     let server = mock_server("401 Unauthorized", r#"{"error":{"message":"bad key"}}"#);
     let url = format!("{}/v1/chat/completions", server.url());
-    let error = openai::chat(&http_client(), &url, Some("bad"), "m", "s", "u", "QUJD")
-        .await
-        .unwrap_err()
-        .to_string();
+    let error = openai::chat(
+        &http_client(),
+        &url,
+        Some("bad"),
+        "m",
+        "s",
+        "u",
+        "QUJD",
+        0.2,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("OpenAI returned 401"), "got: {error}");
     assert!(error.contains("bad key"), "got: {error}");
     server.finish();
 
     let server = mock_server("200 OK", "<html>proxy error</html>");
     let url = format!("{}/v1/chat/completions", server.url());
-    let error = openai::chat(&http_client(), &url, None, "m", "s", "u", "QUJD")
+    let error = openai::chat(&http_client(), &url, None, "m", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -808,6 +912,7 @@ async fn anthropic_sends_key_version_and_base64_image() {
         "system",
         "user",
         "QUJD",
+        0.2,
     )
     .await
     .expect("anthropic reply");
@@ -840,7 +945,7 @@ async fn anthropic_skips_non_text_blocks_and_joins_text() {
         r#"{"content":[{"type":"text","text":"hello"},{"type":"tool_use","name":"x"},{"type":"text","text":"world"}]}"#,
     );
     let url = format!("{}/v1/messages", server.url());
-    let reply = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD")
+    let reply = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD", 0.2)
         .await
         .expect("anthropic reply");
     assert_eq!(reply, "hello\nworld");
@@ -851,7 +956,7 @@ async fn anthropic_skips_non_text_blocks_and_joins_text() {
 async fn anthropic_reports_missing_content_and_http_errors() {
     let server = mock_server("200 OK", "{}");
     let url = format!("{}/v1/messages", server.url());
-    let error = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD")
+    let error = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();
@@ -860,7 +965,7 @@ async fn anthropic_reports_missing_content_and_http_errors() {
 
     let server = mock_server("429 Too Many Requests", r#"{"error":"rate limited"}"#);
     let url = format!("{}/v1/messages", server.url());
-    let error = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD")
+    let error = anthropic::chat(&http_client(), &url, "key", "m", "s", "u", "QUJD", 0.2)
         .await
         .unwrap_err()
         .to_string();

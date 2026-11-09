@@ -15,10 +15,16 @@ pub(crate) fn endpoint_for(base_url: &str) -> String {
     }
 }
 
-pub(crate) fn payload(model: &str, system: &str, user: &str, image_base64: &str) -> Value {
+pub(crate) fn payload(
+    model: &str,
+    system: &str,
+    user: &str,
+    image_base64: &str,
+    temperature: f64,
+) -> Value {
     json!({
         "model": model,
-        "temperature": 0.2,
+        "temperature": temperature,
         "max_tokens": 900,
         "messages": [
             {"role": "system", "content": system},
@@ -43,9 +49,10 @@ pub async fn chat(
     system: &str,
     user: &str,
     image_base64: &str,
+    temperature: f64,
 ) -> Result<String> {
     let url = endpoint_for(base_url);
-    let body = payload(model, system, user, image_base64);
+    let body = payload(model, system, user, image_base64, temperature);
 
     let response = client
         .post(&url)

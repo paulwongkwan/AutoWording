@@ -21,6 +21,13 @@ use std::path::Path;
 use std::time::Duration;
 
 const MAX_IMAGE_DIM: u32 = 1600;
+/// First-pass sampling. Low temperature keeps the metadata literal.
+const DEFAULT_TEMPERATURE: f64 = 0.2;
+/// The corrective retry samples hotter than the first pass. At the first-pass
+/// temperature the model tends to reproduce the reply that already failed.
+const RETRY_TEMPERATURE: f64 = 0.7;
+/// Last-resort sampling after a retry that changed nothing.
+const ESCALATION_TEMPERATURE: f64 = 0.95;
 const JPEG_QUALITY: u8 = 85;
 /// One initial request plus three retries before an image is marked failed.
 const MAX_ATTEMPTS: usize = 4;
@@ -127,7 +134,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             None => user.clone(),
         };
 
-        match chat(&client, &req, &system, &attempt_user).await {
+        match chat(&client, &req, &system, &attempt_user, DEFAULT_TEMPERATURE).await {
             Ok(raw) => match prompt::parse_response_allow_empty_keywords(&raw, keyword_target) {
                 Ok(result) => {
                     parsed = Some(result);
@@ -161,14 +168,12 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     // One corrective pass covers all recoverable misses. A valid retry replaces
     // out-of-range title/caption values; keywords are always appended so the
     // first result is preserved and only new unique terms fill a short list.
-    let first_title_ok = within_range(prompt::title_word_count(&result.title), title_range)
-        && !prompt::contains_non_english_letters(&result.title);
-    let first_caption_ok = within_range(prompt::caption_char_count(&result.caption), caption_range)
-        && !prompt::contains_non_english_letters(&result.caption);
-    let first_valid = first_title_ok && first_caption_ok;
+    let first_valid = metadata_ok(&result, title_range, caption_range);
     let minimum_keywords = prompt::minimum_keyword_count(keyword_target);
-    let keywords_short = result.keywords.len() < minimum_keywords;
-    if !first_valid || keywords_short {
+    let mut valid = first_valid && result.keywords.len() >= minimum_keywords;
+    let mut repeated = false;
+
+    if !valid {
         let retry_user = prompt::retry_prompt(
             req.context.as_deref(),
             Some(&req.existing),
@@ -177,28 +182,54 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             caption_range,
             &result,
         );
-        if let Ok(retry_raw) = chat(&client, &req, &system, &retry_user).await {
+        if let Ok(retry_raw) = chat(&client, &req, &system, &retry_user, RETRY_TEMPERATURE).await {
             if let Ok(retry) = prompt::parse_response_with_target(&retry_raw, keyword_target) {
-                let retry_title_ok =
-                    within_range(prompt::title_word_count(&retry.title), title_range)
-                        && !prompt::contains_non_english_letters(&retry.title);
-                let retry_caption_ok =
-                    within_range(prompt::caption_char_count(&retry.caption), caption_range)
-                        && !prompt::contains_non_english_letters(&retry.caption);
-                if !first_valid && retry_title_ok && retry_caption_ok {
-                    result.title = retry.title;
-                    result.caption = retry.caption;
-                    result.editorial = retry.editorial;
-                }
-                result.review_reasons.extend(retry.review_reasons);
-                let combined = result
-                    .keywords
-                    .iter()
-                    .chain(retry.keywords.iter())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                result.keywords = prompt::normalize_keywords_with_target(&combined, keyword_target);
+                repeated = prompt::same_text(&result.title, &retry.title)
+                    && prompt::same_text(&result.caption, &retry.caption);
+                let replace_text = !first_valid && metadata_ok(&retry, title_range, caption_range);
+                merge_candidate(&mut result, retry, replace_text, keyword_target);
+                valid = metadata_ok(&result, title_range, caption_range)
+                    && result.keywords.len() >= minimum_keywords;
+            }
+        }
+    }
+
+    // A retry that leaves the metadata failing the same constraint is not
+    // accepted. Escalate once with different conditions instead of handing the
+    // identical failure back to the batch layer: hotter sampling, the
+    // photographer's extra instructions removed, and a prompt that asks the
+    // model to describe the image before rewriting it.
+    if !valid {
+        let escalated_system = prompt::system_prompt_with_constraints(
+            prompt_date,
+            "",
+            keyword_target,
+            title_range,
+            caption_range,
+        );
+        let escalation_user = prompt::escalation_prompt(
+            req.context.as_deref(),
+            Some(&req.existing),
+            keyword_target,
+            title_range,
+            caption_range,
+            &result,
+            repeated,
+        );
+        if let Ok(escalated_raw) = chat(
+            &client,
+            &req,
+            &escalated_system,
+            &escalation_user,
+            ESCALATION_TEMPERATURE,
+        )
+        .await
+        {
+            if let Ok(candidate) =
+                prompt::parse_response_with_target(&escalated_raw, keyword_target)
+            {
+                let replace_text = metadata_ok(&candidate, title_range, caption_range);
+                merge_candidate(&mut result, candidate, replace_text, keyword_target);
             }
         }
     }
@@ -212,36 +243,17 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         );
     }
 
-    if result.editorial {
-        if capture_date.is_none() {
-            push_review_reason(
-                &mut result.review_reasons,
-                "Editorial capture date is missing; confirm the date taken",
-            );
-        }
-        let has_location_source = req
-            .existing
-            .gps
-            .as_deref()
-            .is_some_and(|gps| !gps.trim().is_empty())
-            || req
-                .context
-                .as_deref()
-                .is_some_and(|context| !context.trim().is_empty());
-        if !has_location_source {
-            push_review_reason(
-                &mut result.review_reasons,
-                "Editorial location source is missing; confirm the city and country",
-            );
-        }
-    }
-    for reason in prompt::stock_review_reasons(
-        &result.title,
-        &result.caption,
-        &result.keywords,
-        result.editorial,
-    ) {
-        push_review_reason(&mut result.review_reasons, &reason);
+    if !metadata_ok(&result, title_range, caption_range) {
+        bail!(
+            "{} returned a title with {} words and a caption with {} characters after retries; {}–{} words and {}–{} characters are required.",
+            req.provider.label(),
+            prompt::title_word_count(&result.title),
+            prompt::caption_char_count(&result.caption),
+            title_range.0,
+            title_range.1,
+            caption_range.0,
+            caption_range.1
+        );
     }
 
     if result.keywords.len() < minimum_keywords {
@@ -261,13 +273,41 @@ fn within_range(value: usize, range: (usize, usize)) -> bool {
     (range.0..=range.1).contains(&value)
 }
 
-fn push_review_reason(reasons: &mut Vec<String>, reason: &str) {
-    if !reasons
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(reason))
-    {
-        reasons.push(reason.to_string());
+/// A title or caption is valid when it fits the configured range and contains
+/// English letters only.
+fn metadata_ok(
+    metadata: &prompt::GeneratedMetadata,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
+) -> bool {
+    within_range(prompt::title_word_count(&metadata.title), title_range)
+        && within_range(prompt::caption_char_count(&metadata.caption), caption_range)
+        && !prompt::contains_non_english_letters(&metadata.title)
+        && !prompt::contains_non_english_letters(&metadata.caption)
+}
+
+/// Keep the first reply's keywords and let the candidate fill a short list, so a
+/// second pass can only add usable terms. `replace_text` swaps in the candidate
+/// title/caption when the candidate pair is valid.
+fn merge_candidate(
+    result: &mut prompt::GeneratedMetadata,
+    candidate: prompt::GeneratedMetadata,
+    replace_text: bool,
+    keyword_target: usize,
+) {
+    if replace_text {
+        result.title = candidate.title;
+        result.caption = candidate.caption;
+        result.editorial = candidate.editorial;
     }
+    let combined = result
+        .keywords
+        .iter()
+        .chain(candidate.keywords.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    result.keywords = prompt::normalize_keywords_with_target(&combined, keyword_target);
 }
 
 async fn chat(
@@ -275,6 +315,7 @@ async fn chat(
     req: &AiRequest,
     system: &str,
     user: &str,
+    temperature: f64,
 ) -> Result<String> {
     let settings = &req.settings;
     let base_url = settings.base_url.trim();
@@ -282,10 +323,28 @@ async fn chat(
 
     match req.provider {
         Provider::Ollama => {
-            ollama::chat(client, base_url, model, system, user, &req.image_base64).await
+            ollama::chat(
+                client,
+                base_url,
+                model,
+                system,
+                user,
+                &req.image_base64,
+                temperature,
+            )
+            .await
         }
         Provider::LmStudio => {
-            lmstudio::chat(client, base_url, model, system, user, &req.image_base64).await
+            lmstudio::chat(
+                client,
+                base_url,
+                model,
+                system,
+                user,
+                &req.image_base64,
+                temperature,
+            )
+            .await
         }
         Provider::OpenAi => {
             let url = endpoint(base_url, "/chat/completions");
@@ -297,6 +356,7 @@ async fn chat(
                 system,
                 user,
                 &req.image_base64,
+                temperature,
             )
             .await
         }
@@ -310,6 +370,7 @@ async fn chat(
                 system,
                 user,
                 &req.image_base64,
+                temperature,
             )
             .await
         }

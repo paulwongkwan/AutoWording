@@ -14,7 +14,6 @@ pub enum Status {
     Queued,
     Processing,
     Generated,
-    Review,
     Saved,
     Error,
 }
@@ -26,7 +25,6 @@ impl Status {
             Status::Queued => "In queue",
             Status::Processing => "Processing",
             Status::Generated => "Generated",
-            Status::Review => "Review",
             Status::Saved => "Saved",
             Status::Error => "Failed",
         }
@@ -39,8 +37,7 @@ impl Status {
             Status::Processing => 2,
             Status::Error => 3,
             Status::Generated => 4,
-            Status::Review => 5,
-            Status::Saved => 6,
+            Status::Saved => 5,
         }
     }
 }
@@ -53,20 +50,18 @@ pub enum StatusFilter {
     Queued,
     Processing,
     Generated,
-    Review,
     Saved,
     Failed,
     Modified,
 }
 
 impl StatusFilter {
-    pub const ALL: [StatusFilter; 9] = [
+    pub const ALL: [StatusFilter; 8] = [
         StatusFilter::All,
         StatusFilter::Pending,
         StatusFilter::Queued,
         StatusFilter::Processing,
         StatusFilter::Generated,
-        StatusFilter::Review,
         StatusFilter::Saved,
         StatusFilter::Failed,
         StatusFilter::Modified,
@@ -79,7 +74,6 @@ impl StatusFilter {
             StatusFilter::Queued => "Queued",
             StatusFilter::Processing => "Processing",
             StatusFilter::Generated => "Generated",
-            StatusFilter::Review => "Review",
             StatusFilter::Saved => "Saved",
             StatusFilter::Failed => "Failed",
             StatusFilter::Modified => "Modified",
@@ -93,15 +87,10 @@ impl StatusFilter {
             StatusFilter::Queued => item.status == Status::Queued,
             StatusFilter::Processing => item.status == Status::Processing,
             StatusFilter::Generated => item.status == Status::Generated,
-            StatusFilter::Review => item.status == Status::Review,
             StatusFilter::Saved => item.status == Status::Saved,
             StatusFilter::Failed => item.status == Status::Error,
             StatusFilter::Modified => {
-                item.dirty
-                    && matches!(
-                        item.status,
-                        Status::Generated | Status::Review | Status::Saved
-                    )
+                item.dirty && matches!(item.status, Status::Generated | Status::Saved)
             }
         }
     }
@@ -186,7 +175,6 @@ pub fn apply_generated_metadata(item: &mut ImageItem, generated: GeneratedMetada
     if !item.locks.keywords {
         item.keywords = generated.keywords;
     }
-    item.review_reasons = generated.review_reasons;
 }
 
 #[derive(Debug, Clone)]
@@ -198,8 +186,6 @@ pub struct ImageItem {
     pub keywords: Vec<String>,
     pub editorial: bool,
     pub dirty: bool,
-    /// Stock-policy or factual risks that must be reviewed before saving.
-    pub review_reasons: Vec<String>,
     pub locks: FieldLocks,
     pub message: Option<String>,
     pub dims: Option<(u32, u32)>,
@@ -223,7 +209,6 @@ impl ImageItem {
             keywords: Vec::new(),
             editorial: false,
             dirty: false,
-            review_reasons: Vec::new(),
             locks: FieldLocks::default(),
             message: None,
             dims: None,
@@ -1085,9 +1070,8 @@ mod tests {
         assert!(image_matches(&item, "", StatusFilter::Failed));
         assert!(!image_matches(&item, "", StatusFilter::Pending));
 
-        item.status = Status::Review;
+        item.status = Status::Generated;
         item.dirty = true;
-        assert!(image_matches(&item, "", StatusFilter::Review));
         assert!(image_matches(&item, "", StatusFilter::Modified));
 
         item.status = Status::Saved;
@@ -1143,7 +1127,6 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
-                review_reasons: Vec::new(),
             },
         );
 
@@ -1160,7 +1143,6 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
-                review_reasons: Vec::new(),
             },
         );
         assert_eq!(item.title, "Generated Title");

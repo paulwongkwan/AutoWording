@@ -29,9 +29,6 @@ pub struct GeneratedMetadata {
     pub caption: String,
     pub keywords: Vec<String>,
     pub editorial: bool,
-    /// Risks that should be checked by a human before the metadata is written.
-    #[serde(default)]
-    pub review_reasons: Vec<String>,
 }
 
 const SYSTEM_TEMPLATE: &str = r#"Role & Task:
@@ -40,14 +37,14 @@ You are an expert photography analyst specializing in metadata tag generation, k
 Accuracy and safety rules:
 1. Ground every claim in the image or supplied data.
    - Name a landmark, building, city, country, species, brand, person, or event only when it is clearly identifiable from visible evidence or supplied GPS/context.
-   - Never guess a location, date, event, name, brand, species, or release status. If uncertain, use a generic description and add a review reason.
+   - Never guess a location, date, event, name, brand, species, or release status. If uncertain, use a generic description and leave the detail out.
    - Do not include trademarks, brand names, product names, real people's names, personal information, URLs, email addresses, phone numbers, or hashtags in commercial metadata.
 2. Commercial vs. Editorial Status:
    - Mark EDITORIAL when the image contains a recognizable face, logo/trademark, private property, minor, or newsworthy/sensitive event, unless the supplied release status says commercial use is cleared.
    - For documentary editorial content, use this exact caption structure:
      CITY, STATE/COUNTRY – MONTH DAY, YEAR: [Factual sentence describing the subject matter].
-   - Use the supplied editorial date only. It must be the date the image was taken. If the supplied date is not a capture date, do not invent one; add `uncertain-date` to Review.
-   - The editorial location must come from supplied GPS/context. If no location is supplied, do not invent one; add `uncertain-location` to Review.
+   - Use the supplied editorial date only. It must be the date the image was taken. If the supplied date is not a capture date, do not invent one; leave the date out.
+   - The editorial location must come from supplied GPS/context. If no location is supplied, do not invent one; describe the scene without it.
 
 Editorial date supplied for this request: {DATE}
 
@@ -73,18 +70,13 @@ Output Formatting Constraints:
    - Relevance: Only include terms visibly supported by the image. Remove generic filler, title repeats, brands, real-person names, and speculative concepts. Do not pad the list just to reach the target.
    - Duplicates: Do not include a plural when its singular form is also present. Keep the singular (for example, keep "apple" and omit "apples").
 
-4. Review:
-   - Write `None` when there are no risks.
-   - Otherwise use a semicolon-separated list of short reasons, such as `face; logo; private-property; minor; sensitive; uncertain-date; uncertain-location; uncertain-identity; other`.
-
 Required Output Schema:
 Title: [{TITLE_MIN_WORDS}-{TITLE_MAX_WORDS} words]
 Editorial Status: [Commercial / Editorial]
 Caption: [{CAPTION_MIN_CHARS}-{CAPTION_MAX_CHARS} characters]
 Keywords: [word1, word2, word3, ... word{KEYWORD_TARGET}]
-Review: [None or semicolon-separated reasons]
 
-Reply with the five labelled lines above and nothing else. Do not use markdown."#;
+Reply with the four labelled lines above and nothing else. Do not use markdown."#;
 
 #[cfg(test)]
 pub fn system_prompt(date: &str, extra: &str) -> String {
@@ -144,9 +136,55 @@ pub fn user_prompt(context: Option<&str>, existing: Option<&ExistingMetadata>) -
         prompt.push_str("\n\n");
     }
     prompt.push_str(
-        "Analyze the attached image and return the five labelled fields exactly as specified.",
+        "Analyze the attached image and return the four labelled fields exactly as specified.",
     );
     prompt
+}
+
+/// Words to aim for inside the allowed title range. A range alone lets the model
+/// land on the same boundary again, so retries name one exact target.
+fn target_title_words(range: (usize, usize)) -> usize {
+    let (min, max) = clamp_title_word_range(range.0, range.1);
+    min + (max - min) / 2
+}
+
+fn target_caption_chars(range: (usize, usize)) -> usize {
+    let (min, max) = clamp_caption_char_range(range.0, range.1);
+    min + (max - min) / 2
+}
+
+/// Show the previous reply verbatim. Without it the model only sees word counts
+/// and tends to return the same sentence at low temperature.
+fn previous_reply_block(previous: &GeneratedMetadata) -> String {
+    let keywords = if previous.keywords.is_empty() {
+        "(none usable)".to_string()
+    } else {
+        previous.keywords.join(", ")
+    };
+    format!(
+        "Your previous reply:\nTitle: {}\nCaption: {}\nKeywords: {keywords}\n\n",
+        previous.title, previous.caption
+    )
+}
+
+/// Compare two replies ignoring case, punctuation, and spacing, so a retry that
+/// reproduces the same sentence is detected even when trimming differs.
+pub fn same_text(left: &str, right: &str) -> bool {
+    fn normalize(text: &str) -> String {
+        text.chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    normalize(left) == normalize(right)
 }
 
 /// Second-pass prompt used when the first reply missed the title, caption, or
@@ -173,6 +211,9 @@ pub fn retry_prompt(
     let caption_ok = caption_length_ok && caption_english_ok;
     let minimum_keywords = minimum_keyword_count(target);
     let keywords_short = previous.keywords.len() < minimum_keywords;
+    let title_aim = target_title_words(title_range);
+    let caption_aim = target_caption_chars(caption_range);
+    let keyword_shortfall = minimum_keywords.saturating_sub(previous.keywords.len());
 
     let mut issues = Vec::new();
     if !title_length_ok {
@@ -213,18 +254,23 @@ pub fn retry_prompt(
         prompt.push_str(&issue);
         prompt.push('\n');
     }
-    prompt.push_str("\nReturn the five labelled fields again. ");
+    prompt.push('\n');
+    prompt.push_str(&previous_reply_block(previous));
+    prompt.push_str(
+        "Write a different reply instead of repeating the previous wording. Do not reuse the previous title or caption, and do not start the title with the same word.\n\n",
+    );
+    prompt.push_str("Return the four labelled fields again. ");
     if title_ok {
         prompt.push_str("Keep the title unchanged. ");
     } else if !title_english_ok && title_length_ok {
         prompt.push_str("Rewrite the title using English letters only. ");
     } else if !title_english_ok {
         prompt.push_str(&format!(
-            "Rewrite the title to {title_min}–{title_max} words using English letters only. "
+            "Rewrite the title to exactly {title_aim} words ({title_min}–{title_max} allowed) using English letters only. "
         ));
     } else {
         prompt.push_str(&format!(
-            "Rewrite the title to {title_min}–{title_max} words. "
+            "Rewrite the title to exactly {title_aim} words ({title_min}–{title_max} allowed). "
         ));
     }
     if caption_ok {
@@ -233,16 +279,16 @@ pub fn retry_prompt(
         prompt.push_str("Rewrite the caption using English letters only. ");
     } else if !caption_english_ok {
         prompt.push_str(&format!(
-            "Rewrite the caption to {caption_min}–{caption_max} characters using English letters only. "
+            "Rewrite the caption to about {caption_aim} characters ({caption_min}–{caption_max} allowed) using English letters only. "
         ));
     } else {
         prompt.push_str(&format!(
-            "Rewrite the caption to {caption_min}–{caption_max} characters. "
+            "Rewrite the caption to about {caption_aim} characters ({caption_min}–{caption_max} allowed). "
         ));
     }
     if keywords_short {
         prompt.push_str(&format!(
-            "Return at least {minimum_keywords} unique single-word keywords, adding enough new terms that were not in the previous list. Previous keywords: {}. ",
+            "Return at least {keyword_shortfall} additional unique single-word keywords that are not in the previous list, so the total reaches at least {minimum_keywords} (target {target}). The previous list was: {}. ",
             previous.keywords.join(", ")
         ));
     } else {
@@ -252,13 +298,70 @@ pub fn retry_prompt(
     prompt
 }
 
+/// Final prompt shape used when the corrective retry did not fix the reply. It
+/// changes the approach rather than repeating the same request: the model must
+/// describe the image first and then rewrite the fields from that description.
+pub fn escalation_prompt(
+    context: Option<&str>,
+    existing: Option<&ExistingMetadata>,
+    keyword_target: usize,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
+    previous: &GeneratedMetadata,
+    repeated: bool,
+) -> String {
+    let target = clamp_keyword_target(keyword_target);
+    let (title_min, title_max) = clamp_title_word_range(title_range.0, title_range.1);
+    let (caption_min, caption_max) = clamp_caption_char_range(caption_range.0, caption_range.1);
+    let title_aim = target_title_words(title_range);
+    let caption_aim = target_caption_chars(caption_range);
+    let minimum_keywords = minimum_keyword_count(target);
+    let chars = caption_char_count(&previous.caption);
+
+    let mut prompt = user_prompt(context, existing);
+    prompt.push_str("\n\nThe previous attempt still failed");
+    if repeated {
+        prompt.push_str(" and repeated the same title and caption");
+    }
+    prompt.push_str(":\n");
+    prompt.push_str(&previous_reply_block(previous));
+    prompt.push_str(
+        "Do not edit the previous wording. Look at the image again and answer in two steps:\n\
+         1. Write one plain sentence beginning with `Observation:` that describes only what is visible.\n\
+         2. Then write the four labelled fields on their own lines, built from that observation.\n\n",
+    );
+    prompt.push_str(&format!(
+        "- Title: exactly {title_aim} words ({title_min}–{title_max} allowed), a different sentence from the previous title, English letters only.\n"
+    ));
+    let caption_advice = if chars > caption_max {
+        "the previous caption was too long, so remove detail instead of adding words"
+    } else if chars < caption_min {
+        "the previous caption was too short, so add visible detail instead of filler adjectives"
+    } else {
+        "keep the same level of detail"
+    };
+    prompt.push_str(&format!(
+        "- Caption: about {caption_aim} characters ({caption_min}–{caption_max} allowed), {caption_advice}, English letters only.\n"
+    ));
+    prompt.push_str(&format!(
+        "- Keywords: at least {minimum_keywords} unique single-word keywords (target {target}), {} more than the previous list; do not reuse: {}.\n",
+        minimum_keywords.saturating_sub(previous.keywords.len()),
+        previous.keywords.join(", ")
+    ));
+    prompt.push_str("\n");
+    prompt.push_str(
+        "Return only the Observation line followed by the four labelled lines. Do not use markdown.",
+    );
+    prompt
+}
+
 /// Prompt used when a reply could not be parsed at all. It repeats the original
-/// request, restates the five labelled lines, and shows the model its previous
+/// request, restates the four labelled lines, and shows the model its previous
 /// reply so a formatting mistake can be corrected instead of failing the image.
 pub fn unparsable_reply_prompt(base: &str, previous_raw: &str) -> String {
     let mut prompt = String::from(base);
     prompt.push_str(
-        "\n\nYour previous reply could not be read because it was missing one or more of the five labelled fields. Reply again with only these lines, each label followed by a colon:\nTitle: ...\nEditorial Status: ...\nCaption: ...\nKeywords: ...\nReview: ...\n\nPrevious reply:\n",
+        "\n\nYour previous reply could not be read because it was missing one or more of the four labelled fields. Reply again with only these lines, each label followed by a colon:\nTitle: ...\nEditorial Status: ...\nCaption: ...\nKeywords: ...\n\nPrevious reply:\n",
     );
     prompt.push_str(&super::snippet(previous_raw));
     prompt
@@ -418,7 +521,6 @@ fn parse_response_inner(
         .get("editorial")
         .cloned()
         .unwrap_or_else(|| "Commercial".to_string());
-    let review_raw = fields.get("review").cloned().unwrap_or_default();
 
     let keywords = normalize_keywords_with_target(&keyword_raw, target);
 
@@ -452,7 +554,6 @@ fn parse_response_inner(
         caption,
         keywords,
         editorial,
-        review_reasons: parse_review_reasons(&review_raw),
     })
 }
 
@@ -497,28 +598,6 @@ fn is_noise_keyword(keyword: &str) -> bool {
     KEYWORD_STOPWORDS.contains(&lower.as_str()) || GENERIC_KEYWORDS.contains(&lower.as_str())
 }
 
-/// Parse the optional `Review:` field into human-facing review reasons.
-fn parse_review_reasons(raw: &str) -> Vec<String> {
-    let mut reasons: Vec<String> = raw
-        .split([';', '|', '\n', '\r'])
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .map(|reason| {
-            reason
-                .trim_matches(|c: char| c == '.' || c == '*' || c == '`')
-                .trim()
-        })
-        .filter(|reason| {
-            !reason.is_empty()
-                && !reason.eq_ignore_ascii_case("none")
-                && !reason.eq_ignore_ascii_case("no review")
-        })
-        .map(ToString::to_string)
-        .collect();
-    reasons.dedup();
-    reasons
-}
-
 /// Convert common EXIF capture-date forms into the editorial caption date.
 pub fn format_capture_date(raw: &str) -> Option<String> {
     let raw = raw.trim();
@@ -544,115 +623,6 @@ pub fn format_capture_date(raw: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn contains_contact_info(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("http://")
-        || lower.contains("https://")
-        || lower.contains("www.")
-        || lower.contains('@')
-        || lower.contains('#')
-        || lower.contains("tel:")
-        || lower.contains("phone")
-}
-
-fn is_all_caps(text: &str) -> bool {
-    let letters: Vec<char> = text.chars().filter(|ch| ch.is_ascii_alphabetic()).collect();
-    letters.len() >= 6 && letters.iter().all(|ch| ch.is_ascii_uppercase())
-}
-
-fn looks_like_keyword_list(title: &str) -> bool {
-    title.matches(',').count() >= 2
-}
-
-fn contains_promotional_language(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "buy",
-        "sale",
-        "discount",
-        "best ",
-        "amazing",
-        "stunning",
-        "beautiful",
-        "click here",
-        "subscribe",
-        "follow us",
-        "stock photo",
-        "image of",
-        "photo of",
-        "picture of",
-    ]
-    .iter()
-    .any(|word| lower.contains(word))
-}
-
-fn is_editorial_caption(caption: &str) -> bool {
-    let Some((head, _body)) = caption.split_once(':') else {
-        return false;
-    };
-    let Some((place, date)) = head.rsplit_once('–').or_else(|| head.rsplit_once('-')) else {
-        return false;
-    };
-    let place = place.trim();
-    let date = date.trim().to_ascii_lowercase();
-    place.contains(',')
-        && [
-            "january",
-            "february",
-            "march",
-            "april",
-            "may",
-            "june",
-            "july",
-            "august",
-            "september",
-            "october",
-            "november",
-            "december",
-        ]
-        .iter()
-        .any(|month| date.contains(month))
-}
-
-/// Deterministic stock-safety checks that do not need another model request.
-/// These become review reasons rather than silent rewrites when the problem is
-/// factual or policy-related.
-pub fn stock_review_reasons(
-    title: &str,
-    caption: &str,
-    keywords: &[String],
-    editorial: bool,
-) -> Vec<String> {
-    let mut reasons = Vec::new();
-
-    if editorial {
-        reasons.push("Verify editorial date, location, and releases before saving".to_string());
-    }
-    if contains_contact_info(title) || contains_contact_info(caption) {
-        reasons.push("Remove URLs, contact details, hashtags, or promotional links".to_string());
-    }
-    if is_all_caps(title) {
-        reasons.push("Title is all caps".to_string());
-    }
-    if looks_like_keyword_list(title) {
-        reasons.push("Title looks like a comma-separated keyword list".to_string());
-    }
-    if contains_promotional_language(title) || contains_promotional_language(caption) {
-        reasons.push("Remove promotional or subjective sales language".to_string());
-    }
-    if editorial && !is_editorial_caption(caption) {
-        reasons.push(
-            "Editorial caption must use CITY, STATE/COUNTRY – MONTH DAY, YEAR: format".to_string(),
-        );
-    }
-    if keywords.iter().any(|keyword| is_noise_keyword(keyword)) {
-        reasons.push("Remove generic or stopword keywords".to_string());
-    }
-
-    reasons.dedup();
-    reasons
 }
 
 pub fn normalize_keywords_with_target(raw: &str, keyword_target: usize) -> Vec<String> {
@@ -978,29 +948,17 @@ mod tests {
     }
 
     #[test]
-    fn review_field_and_stock_safety_checks_are_parsed() {
+    fn a_stray_review_line_is_ignored() {
         let reply = "Title: London Street Scene\nEditorial Status: Editorial\nCaption: London, UK – April 19, 2026: A factual street scene with people walking past shops.\nKeywords: apple, banana, cherry\nReview: face; uncertain-location";
-        let parsed = parse_response(reply).expect("parse review field");
-        assert_eq!(parsed.review_reasons, vec!["face", "uncertain-location"]);
+        let parsed = parse_response(reply).expect("parse a reply with a stray review line");
+        assert_eq!(parsed.title, "London Street Scene");
+        assert!(parsed.editorial);
+        assert_eq!(parsed.keywords, vec!["apple", "banana", "cherry"]);
         assert_eq!(
             format_capture_date("2026:04:19 20:14:03"),
             Some("April 19, 2026".to_string())
         );
         assert_eq!(format_capture_date("not a date"), None);
-
-        let reasons = stock_review_reasons(
-            "London Street Scene",
-            "London, UK – April 19, 2026: A factual street scene with people walking past shops.",
-            &["apple".to_string(), "banana".to_string()],
-            true,
-        );
-        assert!(reasons
-            .iter()
-            .any(|reason| reason.contains("Verify editorial")));
-        assert!(!reasons
-            .iter()
-            .any(|reason| reason.contains("must use CITY")));
-
         assert_eq!(
             normalize_keywords("the, photo, sunset, image, mountain"),
             vec!["sunset", "mountain"]
@@ -1327,7 +1285,6 @@ mod tests {
             caption: "short".to_string(),
             keywords: vec!["apple".to_string()],
             editorial: false,
-            review_reasons: Vec::new(),
         };
         let prompt = retry_prompt(None, None, 5, (3, 5), (50, 180), &previous);
         assert!(prompt.contains("Only 1 usable keyword was returned"));
@@ -1341,12 +1298,40 @@ mod tests {
         assert!(prompt.contains("must have 50–180 characters"));
         assert!(prompt.contains("Rewrite the title"));
         assert!(prompt.contains("Rewrite the caption"));
+        assert!(prompt.contains("Title: Too Many Words In This Title"));
+        assert!(prompt.contains("Caption: short"));
+        assert!(prompt.contains("exactly 4 words"));
+        assert!(prompt.contains("about 115 characters"));
+    }
+
+    #[test]
+    fn same_text_ignores_case_spacing_and_punctuation() {
+        assert!(same_text("A Quiet Street!", "a quiet   street"));
+        assert!(!same_text("A Quiet Street", "A Busy Street"));
+    }
+
+    #[test]
+    fn escalation_prompt_forces_a_fresh_observation() {
+        let previous = GeneratedMetadata {
+            title: "Tiny Title".to_string(),
+            caption: "short".to_string(),
+            keywords: vec!["apple".to_string()],
+            editorial: false,
+        };
+        let prompt = escalation_prompt(None, None, 5, (3, 5), (50, 180), &previous, true);
+        assert!(prompt.contains("Observation:"));
+        assert!(prompt.contains("repeated the same title and caption"));
+        assert!(prompt.contains("Title: Tiny Title"));
+        assert!(prompt.contains("exactly 4 words"));
+        assert!(prompt.contains("about 115 characters"));
+        assert!(prompt.contains("too short"));
+        assert!(prompt.contains("at least 5 unique single-word keywords"));
     }
 
     #[test]
     fn unparsable_reply_prompt_restates_labels_and_previous_reply() {
         let prompt = unparsable_reply_prompt(
-            "Analyze the attached image and return the five labelled fields exactly as specified.",
+            "Analyze the attached image and return the four labelled fields exactly as specified.",
             "Sure! Here is a photo of a bridge.\nIt looks nice.",
         );
         assert!(prompt.starts_with("Analyze the attached image"));
@@ -1354,7 +1339,7 @@ mod tests {
         assert!(prompt.contains("Editorial Status: ..."));
         assert!(prompt.contains("Caption: ..."));
         assert!(prompt.contains("Keywords: ..."));
-        assert!(prompt.contains("Review: ..."));
+        assert!(!prompt.contains("Review:"));
         assert!(prompt.contains("Sure! Here is a photo of a bridge. It looks nice."));
     }
 

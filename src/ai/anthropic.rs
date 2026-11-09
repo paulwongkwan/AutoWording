@@ -5,11 +5,17 @@ use serde_json::{json, Value};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-pub(crate) fn payload(model: &str, system: &str, user: &str, image_base64: &str) -> Value {
+pub(crate) fn payload(
+    model: &str,
+    system: &str,
+    user: &str,
+    image_base64: &str,
+    temperature: f64,
+) -> Value {
     json!({
         "model": model,
         "max_tokens": 900,
-        "temperature": 0.2,
+        "temperature": temperature,
         "system": system,
         "messages": [{
             "role": "user",
@@ -36,8 +42,9 @@ pub async fn chat(
     system: &str,
     user: &str,
     image_base64: &str,
+    temperature: f64,
 ) -> Result<String> {
-    let body = payload(model, system, user, image_base64);
+    let body = payload(model, system, user, image_base64, temperature);
 
     let response = client
         .post(url)

@@ -9,7 +9,7 @@
 | Workspace | ACDSee Classic dual-mode: **Browser** (This PC folder tree + thumbnail grid + inspector) and **Viewer** (single image + filmstrip) |
 | Selection | Path-based multi-selection with Ctrl+Click, Shift+Click, Ctrl+Shift+Click, and Select all |
 | AI transport | `reqwest` 0.12 + `tokio` multi-thread runtime, `native-tls` (Windows Schannel) |
-| Batch engine | Sequential AI processing (one image at a time), FIFO retry queue with two retries per failed image, live `Queued`/`Processing`/`Generated`/`Review`/`Saved`/`Error` status labels |
+| Batch engine | Sequential AI processing (one image at a time), FIFO retry queue with two retries per failed image, live `Queued`/`Processing`/`Generated`/`Saved`/`Error` status labels |
 | Metadata engine | ExifTool command-line executable (external dependency) |
 | Platform | Windows 10/11 (build and runtime are Windows-specific) |
 | Binary | `target\release\autowording.exe` (67,884,693 bytes, Windows subsystem, no console window) |
@@ -35,7 +35,7 @@ This README is the operating manual for another LLM or developer. It records the
 11. **Only one batch runs at a time.** Generation and saving share `App::batch`; all batch buttons are disabled while it is `Some`.
 12. **AI batches are sequential, FIFO, and pausable.** One image is prepared and generated at a time; Pause stops before the next image and Cancel stops after the current request. A failed image moves to the back of the queue and gets up to two retries (three total attempts). Images with complete metadata, including saved files, are skipped automatically unless **Force regenerate** is enabled.
 13. **Saving requires a non-empty title.** Selected items without a title are skipped and counted in a toast.
-14. **AI generation auto-saves safe metadata per image.** Results with no review reasons are written through ExifTool as soon as they are generated, before the next image is requested. Results with stock-policy or factual risks are marked `Review` and left unsaved until the user checks and saves them. Provider/prompt/ExifTool/folder/theme/density/output-range/keyword-target/backup/verification settings persist after a 500 ms debounce.
+14. **AI generation saves every result immediately.** Each generated result is written through ExifTool as soon as field locks have been applied, before the next image is requested. Provider/prompt/ExifTool/folder/theme/density/output-range/keyword-target/backup/verification settings persist after a 500 ms debounce.
 15. **API keys are plaintext** in `config.toml`. Never commit, print, or log that file.
 
 ---
@@ -47,9 +47,9 @@ AutoWording is a batch keywording workspace for microstock photographers. The wo
 1. Browse This PC in the left system folder tree, then open a stock folder. The center grid shows that folder's direct JPEGs.
 2. Select one image (single inspector) or many (batch inspector).
 3. Run AI on the selection. Images are processed one at a time: each request sends a downscaled JPEG plus the strict prompt and the image's existing metadata (title, caption, keywords, GPS location, capture date) and session context. The active marketplace profile's title range, caption range, and keyword target are embedded in the prompt.
-4. Each safe AI result is written to its JPEG immediately through ExifTool (title, caption, keywords into EXIF/IPTC/XMP), one file at a time, before the next image starts. Results with review reasons remain unsaved and show the reasons in the Metadata tab. Review/edit Title, Editorial, Caption and Keywords there. In batch mode, apply title/caption/keyword changes across the selection from the Batch tab.
+4. Each AI result is written to its JPEG immediately through ExifTool (title, caption, keywords into EXIF/IPTC/XMP), one file at a time, before the next image starts. Check or edit Title, Editorial, Caption and Keywords in the Metadata tab afterwards. In batch mode, apply title/caption/keyword changes across the selection from the Batch tab.
 5. After manual edits, use **Save** to write the updated metadata. Successful generation results are already on disk.
-6. Cards show `Pending`, `In queue`, `Processing`, `Generated`, `Review`, `Saved`, `Failed`, or `Modified` labels.
+6. Cards show `Pending`, `In queue`, `Processing`, `Generated`, `Saved`, `Failed`, or `Modified` labels.
 7. Switch to Viewer for a large single-image view with previous/next navigation and a filmstrip.
 
 Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Studio keep traffic local. Files are modified in place.
@@ -63,7 +63,7 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 - Inspector tabs: equal-width **Metadata / Batch / Settings** segmented control. Metadata is the single-image editor, Batch contains shared-field apply actions and the live queue card, and Settings holds provider, prompt, marketplace, appearance, ExifTool, backup, and verification controls.
 - Selection: plain click, Ctrl+Click toggle, Shift+Click contiguous range, Ctrl+Shift+Click additive range, and **Select all**.
 - Visual states: selected accent border, status text colors (pending, info, success, warning, danger) and hover feedback from GPUI Kit controls. Grid cards have no checkbox.
-- Grid filter and sort bar: text search over file name, title, caption and keywords; status buttons (All, Pending, Queued, Working, Generated, Review, Saved, Failed, Modified); a **Sort** button cycling name, status, keyword count and modified time; an Ascending/Descending toggle; a **Force regenerate** switch; and **Clear** while a filter is active. The header shows `N visible`. **Select all** and the sort/filter controls act on the filtered view.
+- Grid filter and sort bar: text search over file name, title, caption and keywords; status buttons (All, Pending, Queued, Working, Generated, Saved, Failed, Modified); a **Sort** button cycling name, status, keyword count and modified time; an Ascending/Descending toggle; a **Force regenerate** switch; and **Clear** while a filter is active. The header shows `N visible`. **Select all** and the sort/filter controls act on the filtered view.
 - Orientation-correct images: the EXIF orientation tag is applied to thumbnails, previews and the AI input, with the XMP `tiff:Orientation` / `exif:Orientation` value as a fallback when EXIF is missing. Phone/camera portraits display and analyze upright, and reported dimensions are post-rotation.
 - Appearance: top-bar **Light/Dark** toggle, plus **Follow Windows / Light / Dark** buttons in Settings. The choice persists in config; System mode reads the Windows app theme at startup and whenever the preference is applied.
 - Density: **Comfortable / Compact** button in the status bar (also in Settings). The preference persists in config; the GPUI layout currently uses one fixed card and field size, so the toggle does not resize the grid yet.
@@ -72,7 +72,7 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 - Batch inspector: selection count, the live queue card with a **Retry all failed** action, title/caption overwrite, keyword append/replace, Generate selected, Save selected, Retry failed, and a Force regenerate switch. Shared values are not aggregated into a common/mixed view.
 - Sequential batch AI: one image at a time, per-image live status, FIFO failure handling, pause/resume, cancel-after-current, partial-failure reporting, retry-failed action. A failed image moves to the back of the queue and is attempted up to two more times (three total attempts). During a run the status bar shows `Generating done / total`, the failed count, a thin progress bar and an ETA; the Batch tab's queue card adds the percent, current file, the next three queued filenames plus a remaining count, Done/Waiting/Failed counts, and a **Retry all failed** action once failures exist. Images with complete metadata, including saved and generated-but-unwritten files, are skipped automatically unless **Force regenerate** is enabled; the completion toast reports how many.
 - AI context: requests include the loaded title, caption, keywords, GPS location, capture date, and session context; generated title, caption, and keywords replace the existing editable values unless the field is locked.
-- Output limits in Settings: keyword target **1–50**, title **1–20 words**, caption **10–1000 characters**. Title and caption are min–max ranges. A reply outside either range, or below 90% (rounded up) of the keyword target, triggers one corrective request. A valid retry replaces an out-of-range title/caption; keywords are merged so the first result is kept and only new unique terms are appended. A reply still below the keyword floor after that pass fails the image. The selected marketplace profile caps these values further (Adobe Stock: 49 keywords; Alamy: 150 caption characters).
+- Output limits in Settings: keyword target **1–50**, title **1–20 words**, caption **10–1000 characters**. Title and caption are min–max ranges. A reply outside either range, or below 90% (rounded up) of the keyword target, triggers one corrective request at temperature 0.7 (the first pass uses 0.2), with the previous title/caption shown verbatim and an exact target length instead of the range. A valid retry replaces an out-of-range title/caption; keywords are merged so the first result is kept and only new unique terms are appended. If the reply still fails a constraint, one escalated request runs at temperature 0.95 without the photographer's extra instructions, asking for an `Observation:` line before the four labelled fields; a reply that repeats the failed title and caption is called out in that prompt. Metadata that still fails after escalation fails the image so the batch retry queue can try again. The selected marketplace profile caps these values further (Adobe Stock: 49 keywords; Alamy: 150 caption characters).
 - AI retries: each image gets one request plus up to **three retries** (300/600/900 ms apart) when the provider request fails or the reply cannot be parsed. A reply missing Title/Caption is sent back to the model with a repair instruction and the previous text; only after all attempts fail does the item become `Error` with the last parse error and raw snippet.
 - Marketplace profiles: **General stock**, **Adobe Stock**, **Shutterstock**, **iStock**, **Dreamstime**, **Alamy**, **Depositphotos**, and **Pond5**, each with its own keyword, title-word, and caption-character caps and defaults. Switching a profile adopts that agency's defaults and clamps further edits; the chosen profile persists in config.
 - Safe writes: optional pre-write copies in `.autowording-backups`, plus optional read-back verification of title, caption, and keywords after every write.
@@ -87,7 +87,7 @@ Cloud providers receive only the re-encoded, downscaled image. Ollama and LM Stu
 - ExifTool auto-detection, manual path override, version display, re-check, Unicode-safe argfile execution.
 - Config persistence: `%APPDATA%\AutoWording\config\config.toml`, including appearance, density, inspector collapse state, marketplace profile, title/caption ranges, keyword-target, backup, and verification preferences.
 - Navigation: Browser/Viewer, Open/Add/Generate/Save, theme, density, and the **More** actions are mouse-driven in the GPUI view. **Ctrl+B** toggles the inspector rail from either state. During an AI batch, **Ctrl+P** pauses, **Ctrl+Shift+P** resumes, and **Ctrl+Shift+C** cancels after the current image.
-- 181 tests: prompt/parser, range-aware prompt and validation, 90% keyword floor, target-aware normalization, singular/plural de-duplication, title/caption, keyword, non-English-title/caption retry, English-only keyword filtering, stock-safety review gating, and malformed-reply retry, field-lock merging, safe-write backup/verification, all providers and model-list endpoints via mock HTTP, metadata tags including GPS/date, real ExifTool round-trips including XMP-only orientation, selection math, system folder tree and breadcrumbs, FIFO retry ordering and retry limits, queue-card retry requeueing, batch pause/resume/cancel shortcuts, cache lifecycle, config, Windows theme detection, EXIF and XMP orientation parsing and rotation, GPUI tab switching, animated inspector collapse and minimum-window layout, and Windows inspector snapshots.
+- 187 tests: prompt/parser, range-aware prompt and validation, 90% keyword floor, target-aware normalization, singular/plural de-duplication, title/caption, keyword, non-English-title/caption retry, identical-output detection and escalated retry, English-only keyword filtering, direct save after every generation, and malformed-reply retry, field-lock merging, safe-write backup/verification, all providers and model-list endpoints via mock HTTP, metadata tags including GPS/date, real ExifTool round-trips including XMP-only orientation, selection math, system folder tree and breadcrumbs, FIFO retry ordering and retry limits, queue-card retry requeueing, batch pause/resume/cancel shortcuts, cache lifecycle, config, Windows theme detection, EXIF and XMP orientation parsing and rotation, GPUI tab switching, animated inspector collapse and minimum-window layout, and Windows inspector snapshots.
 
 ---
 
@@ -218,7 +218,7 @@ The workflow uses the automatic `GITHUB_TOKEN` with `contents: write`; no reposi
 5. **Add** appends arbitrary JPEGs chosen with the native file picker.
 6. The sidebar has no breadcrumb bar and no parent-folder shortcut; use the tree to move elsewhere.
 
-Below the header, the status buttons narrow the grid (All, Pending, Queued, Working, Generated, Review, Saved, Failed, Modified) and the search field matches file name, title, caption and keywords. The **Sort** button cycles name, status, keyword count and modified time; **Ascending/Descending** flips its direction. **Clear** resets both. The header reports `N visible`. Filtered-out images stay in the folder and keep their statuses; selection operations act on the visible subset.
+Below the header, the status buttons narrow the grid (All, Pending, Queued, Working, Generated, Saved, Failed, Modified) and the search field matches file name, title, caption and keywords. The **Sort** button cycles name, status, keyword count and modified time; **Ascending/Descending** flips its direction. **Clear** resets both. The header reports `N visible`. Filtered-out images stay in the folder and keep their statuses; selection operations act on the visible subset.
 
 ### 6.2 Select
 
@@ -246,7 +246,7 @@ With exactly one selected image, the Metadata tab shows:
 - **File details**: capture date, GPS location, and the last error message when present.
 - The **Force regenerate** switch lives in the browser header (and the Batch tab), not the inspector.
 
-Editing a `Generated`, `Review` or `Saved` image sets `dirty` and changes the badge to **Modified** (editing a review item also clears its review reasons and returns it to `Generated`). Editing a `Pending`/`Error` image leaves the status but makes it saveable once a title exists.
+Editing a `Generated` or `Saved` image sets `dirty` and changes the badge to **Modified**. Editing a `Pending`/`Error` image leaves the status but makes it saveable once a title exists.
 
 ### 6.4 Batch selection editing
 
@@ -265,14 +265,14 @@ Batch fields are not a live merged editor; they are explicit apply operations. A
 
 ### 6.5 Save and auto-save
 
-- AI generation auto-saves each result with no review reasons as soon as field locks have been applied, before the next image is requested. Writes stay sequential through ExifTool, use `-overwrite_original`, and go through the same backup/verification settings. Results marked `Review` are never auto-saved; use **Save** after checking the listed reasons.
+- AI generation auto-saves every result as soon as field locks have been applied, before the next image is requested. Writes stay sequential through ExifTool, use `-overwrite_original`, and go through the same backup/verification settings.
 - With **Back up originals before writing** enabled (default), each JPEG is copied to `.autowording-backups` before its first write. Repeated saves keep the first backup.
 - Before every write (manual or automatic), the app compares the file's current size and modification time with the values captured when its metadata was read. If the file changed in another program, that save is refused with `changed on disk since it was loaded`; refresh and review before writing again. Files with no captured baseline are written normally.
 - **Restore backup** (Metadata tab) or **More → Restore backups** copies the first backup back over the selected files, clears their in-memory metadata, re-reads it from disk, and reports how many were restored. Restore is confirmed first because it replaces the current file contents.
 - Unsaved manual edits are continuously journaled to `%APPDATA%\AutoWording\config\edit-journal.json` (debounced to 400 ms) and flushed synchronously when the window closes. Journal writes replace the file atomically, so an interrupted write leaves the previous journal intact. On launch, journal entries whose file still exists are applied to freshly loaded items, shown as **Modified**, and kept until the image is saved or restored. A corrupt journal is ignored, and entries for deleted files are dropped.
 - Closing the window or choosing **More → Exit AutoWording** with dirty images cancels the close and shows an **Unsaved changes** warning with **Save all and exit**, **Exit without saving** and **Keep editing**. **Save all and exit** writes every dirty image, then closes; if any file fails or has no title, the warning returns instead of closing. Exiting still flushes the journal, so the fields survive the relaunch, but the JPEGs keep their previous metadata until Save is used.
 - With **Verify metadata after writing** enabled (default), the file is read back after writing and the save fails if title, caption, or keywords do not match.
-- If ExifTool is unavailable, generation still completes, but the result stays `Generated` or `Review` and the app reports that it was not saved.
+- If ExifTool is unavailable, generation still completes, but the result stays `Generated` and the app reports that it was not saved.
 - Single: **Save to EXIF** (Metadata tab) or **Save** in the top bar writes the active image.
 - Batch: **Save selected** (Batch tab) or **Save** in the top bar writes every selected image with a non-empty title.
 - Items without a title are skipped; the toast reports the skipped count.
@@ -378,11 +378,10 @@ The **Settings** tab holds provider, endpoint, model **Load**, API key, context,
 | `Pending` | Pending (gray) | Title, caption or keywords missing, or fewer than 90% of the keyword target |
 | `Queued` | In queue (blue) | Waiting for the current image to finish |
 | `Processing` | Processing (blue) | AI request in flight |
-| `Generated` | Generated (violet) | Parsed AI result with no review reasons |
-| `Review` | Review (amber) | Parsed AI result with stock-policy or factual risks; auto-save suppressed |
+| `Generated` | Generated (violet) | Parsed AI result awaiting its immediate auto-save |
 | `Saved` | Saved (green) | Written to disk |
 | `Error` | Failed (red) | Generation/save error; the message appears in File details |
-| `Pending`/`Generated`/`Review`/`Saved` + dirty | Modified (amber) | Edited before or after generation/save |
+| `Pending`/`Generated`/`Saved` + dirty | Modified (amber) | Edited before or after generation/save |
 
 `ImageItem::is_pending()` is true for `Pending | Error`; `Queued` is not retried by that helper. `retry_failed` explicitly filters `Error`. Files that already contain a title, caption and at least 90% of the configured keyword target (rounded up) are loaded as `Saved` (`ImageItem::is_complete(target)`), so a folder of finished images does not show a wall of Pending badges; files below that floor stay `Pending` so AI can complete them. Batch generation skips every saved item or item with complete metadata (`ImageItem::is_complete(target)`), including generated-but-unwritten results, so finished work is not sent to the model again; editing a complete image does not make it a generation target either. The browser-header **Force regenerate** switch (also in the Batch tab) bypasses the skip for the next run.
 
@@ -396,7 +395,7 @@ The **Settings** tab holds provider, endpoint, model **Load**, API key, context,
 - Selected cards use the primary color as their border; there is no separate focus ring.
 - Thumbnails use cover fit; failed decodes show `Preview unavailable`, pending ones `Loading preview`.
 - Below the thumbnail: a bold truncated file name; a left-aligned status label colored by state; a right-aligned `N tags` count.
-- Status text is `Pending` / `In queue` / `Processing` / `Generated` / `Review` / `Saved` / `Failed`, `Reading metadata` while a metadata read is pending, and amber `Modified` for dirty editable items.
+- Status text is `Pending` / `In queue` / `Processing` / `Generated` / `Saved` / `Failed`, `Reading metadata` while a metadata read is pending, and amber `Modified` for dirty editable items.
 - No checkbox, no dimensions overlay, no card tooltip.
 - Hover does not load metadata; selection does.
 
@@ -702,11 +701,10 @@ Validation order:
 4. Build `reqwest::Client` with **300-second timeout**.
 5. Dispatch to provider.
 6. Parse with `prompt::parse_response_allow_empty_keywords`; normalization removes non-English keywords, exact duplicates and singular/plural pairs (keeping the singular), then trims to the target. A keyword containing any non-ASCII character is dropped whole rather than truncated.
-7. If the request fails or the reply cannot be parsed, retry up to three times (300, 600, 900 ms apart). A parse failure reuses a repair prompt that restates the five labelled lines and includes the previous reply.
-8. If the title/caption are outside their configured ranges, contain non-English letters, or the parsed reply has fewer than 90% of the target keywords (rounded up), make one corrective request.
-9. If the corrective reply satisfies both title and caption ranges and uses English letters only, replace the first title/caption (and editorial flag). Always merge retry keywords into the first list, preserving order and dropping duplicates/singular-plural pairs before capping at the target. If the title/caption still contains non-English letters, or the merged keyword list is below the 90% floor, return an error so the image can be retried.
-10. Merge the model's optional `Review:` field with deterministic stock checks: contact details/URLs/hashtags, all-caps titles, comma-separated keyword-list titles, promotional language, malformed editorial captions, and generic/stopword keywords.
-11. Any review reason sets `Status::Review`, shows the reasons in the inspector, and suppresses automatic saving. Explicit Save remains available. Documentary editorial items always require review; missing capture date or location source adds specific reasons.
+7. If the request fails or the reply cannot be parsed, retry up to three times (300, 600, 900 ms apart). A parse failure reuses a repair prompt that restates the four labelled lines and includes the previous reply.
+8. If the title/caption are outside their configured ranges, contain non-English letters, or the parsed reply has fewer than 90% of the target keywords (rounded up), make one corrective request at **temperature 0.7** (the first pass uses 0.2). The retry prompt shows the previous title/caption verbatim, forbids reusing that wording, and names an exact target length (the range midpoint) so the model cannot land on the same boundary again.
+9. If the corrective reply satisfies both title and caption ranges and uses English letters only, replace the first title/caption (and editorial flag). Always merge retry keywords into the first list, preserving order and dropping duplicates/singular-plural pairs before capping at the target. If a constraint is still unmet, make one escalated request at **temperature 0.95** with the photographer's extra instructions removed, asking the model to write an `Observation:` line first and build the four fields from it; a retry that returned the same title and caption is named explicitly. Its valid title/caption replaces the failed pair and its keywords fill the short list. If the metadata still fails after escalation, return an error so the image can be retried.
+10. Return the metadata unchanged: there is no stock-policy gating or human review state. The caller marks the image `Generated` and writes it immediately, so every successful generation reaches disk.
 
 No streaming or cancellation. Excess keywords are trimmed before the result reaches the UI.
 
@@ -736,14 +734,14 @@ You are an expert photography analyst specializing in metadata tag generation, k
 Accuracy and safety rules:
 1. Ground every claim in the image or supplied data.
    - Name a landmark, building, city, country, species, brand, person, or event only when it is clearly identifiable from visible evidence or supplied GPS/context.
-   - Never guess a location, date, event, name, brand, species, or release status. If uncertain, use a generic description and add a review reason.
+   - Never guess a location, date, event, name, brand, species, or release status. If uncertain, use a generic description and leave the detail out.
    - Do not include trademarks, brand names, product names, real people's names, personal information, URLs, email addresses, phone numbers, or hashtags in commercial metadata.
 2. Commercial vs. Editorial Status:
    - Mark EDITORIAL when the image contains a recognizable face, logo/trademark, private property, minor, or newsworthy/sensitive event, unless the supplied release status says commercial use is cleared.
    - For documentary editorial content, use this exact caption structure:
      CITY, STATE/COUNTRY – MONTH DAY, YEAR: [Factual sentence describing the subject matter].
-   - Use the supplied editorial date only. It must be the date the image was taken. If the supplied date is not a capture date, do not invent one; add `uncertain-date` to Review.
-   - The editorial location must come from supplied GPS/context. If no location is supplied, do not invent one; add `uncertain-location` to Review.
+   - Use the supplied editorial date only. It must be the date the image was taken. If the supplied date is not a capture date, do not invent one; leave the date out.
+   - The editorial location must come from supplied GPS/context. If no location is supplied, do not invent one; describe the scene without it.
 
 Editorial date supplied for this request: {DATE}
 
@@ -769,21 +767,16 @@ Output Formatting Constraints:
    - Relevance: Only include terms visibly supported by the image. Remove generic filler, title repeats, brands, real-person names, and speculative concepts. Do not pad the list just to reach the target.
    - Duplicates: Do not include a plural when its singular form is also present. Keep the singular (for example, keep "apple" and omit "apples").
 
-4. Review:
-   - Write `None` when there are no risks.
-   - Otherwise use a semicolon-separated list of short reasons, such as `face; logo; private-property; minor; sensitive; uncertain-date; uncertain-location; uncertain-identity; other`.
-
 Required Output Schema:
 Title: [{TITLE_MIN_WORDS}-{TITLE_MAX_WORDS} words]
 Editorial Status: [Commercial / Editorial]
 Caption: [{CAPTION_MIN_CHARS}-{CAPTION_MAX_CHARS} characters]
 Keywords: [word1, word2, word3, ... word{KEYWORD_TARGET}]
-Review: [None or semicolon-separated reasons]
 
-Reply with the five labelled lines above and nothing else. Do not use markdown.
+Reply with the four labelled lines above and nothing else. Do not use markdown.
 ```
 
-The batch date is computed once as a fallback. For each image, a valid EXIF capture date overrides it for the editorial prompt; if the capture date is missing, an editorial result is put into Review.
+The batch date is computed once as a fallback. For each image, a valid EXIF capture date overrides it for the editorial prompt; if the capture date is missing, the batch date is used instead.
 ```rust
 let now = chrono::Local::now();
 let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
@@ -810,7 +803,7 @@ Context is trimmed; blank = absent:
 Situational context supplied by the photographer (treat it as ground truth):
 <context>
 
-Analyze the attached image and return the five labelled fields exactly as specified.
+Analyze the attached image and return the four labelled fields exactly as specified.
 ```
 
 Without metadata or context, the prompt is only the final analyze line.
@@ -818,7 +811,7 @@ Without metadata or context, the prompt is only the final analyze line.
 If normalization leaves fewer than 90% of the target keywords (rounded up; 45 of 50), a second request appends:
 
 ```text
-The previous reply contained only N usable keywords; at least MINIMUM (90% of TARGET, rounded up) are required. Return the five labelled fields again, keeping the same title and caption. Provide at least MINIMUM unique single-word keywords. Do not include both a singular and its plural; keep the singular. Previous keywords: ...
+The previous reply contained only N usable keywords; at least MINIMUM (90% of TARGET, rounded up) are required. Return the four labelled fields again, keeping the same title and caption. Provide at least MINIMUM unique single-word keywords. Do not include both a singular and its plural; keep the singular. Previous keywords: ...
 ```
 
 ### 11.5 Provider wire formats
@@ -1144,8 +1137,8 @@ List: `cargo test -- --list`.
 
 | Module | Count | Coverage |
 | --- | --- | --- |
-| `ai::prompt::tests` | 32 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, singular/plural de-duplication, range-aware prompt/validation/trimming, retry prompt, unparsable-reply repair prompt, validation boundaries, exact editorial caption, existing metadata/context prompt |
-| `ai::tests` | 29 | mock HTTP sequence server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation; short-keyword, title/caption, and malformed-reply retries |
+| `ai::prompt::tests` | 34 | markdown/CRLF/numbered/full-width labels, duplicate labels, multiline values, editorial precedence, title cleanup, keyword normalization/Unicode/dedupe/cap, singular/plural de-duplication, range-aware prompt/validation/trimming, retry prompt with verbatim previous reply and exact targets, escalation prompt, identical-text comparison, unparsable-reply repair prompt, validation boundaries, exact editorial caption, existing metadata/context prompt |
+| `ai::tests` | 32 | mock HTTP sequence server for all providers; model-list endpoints, auth headers, parsing and no-key validation; payload/header/endpoint assertions; malformed JSON; HTTP errors; missing fields; image resize/encoding/rejection; snippet truncation; short-keyword, title/caption, malformed-reply, and escalated retries; retry temperatures |
 | `config::tests` | 14 | defaults, serde names, accessors, save/load round-trip incl. `last_folder`/`theme`/`density`/`keyword_target`/ranges, density serde/clamping, target and range clamping, marketplace profile caps/defaults and profile switching, legacy LM Studio placeholder cleanup, invalid TOML, path stability |
 | `metadata::tags::tests` | 11 | read precedence/fallbacks/merge/dedupe/invalid payloads/string keywords, GPS and capture-date parsing, orientation-aware dimensions, XMP fallback precedence |
 | `metadata::writer::tests` | 7 | all tags, title fallback, empty metadata, no `+=`, Unicode, 50-keyword safety cap |
@@ -1154,7 +1147,7 @@ List: `cargo test -- --list`.
 | `orientation::tests` | 9 | EXIF APP1 parsing (little- and big-endian TIFF), XMP element/attribute and `exif:` prefix fallbacks, EXIF precedence, invalid XMP values, rotation/transpose dimensions, clockwise pixel placement |
 | `csv::tests` | 6 | generic round-trip with quotes/commas/newlines, agency headers and columns, Shutterstock/Adobe/generic header mapping, editorial flags, missing Filename and blank rows, case-insensitive filename index |
 | `journal::tests` | 4 | dirty-edit round-trip, empty journal removes the file, corrupt journal ignored, entries for deleted files dropped |
-| `app::tests` | 1 | a journal entry restores title/caption/keywords/editorial as a dirty Modified item |
+| `app::tests` | 2 | a journal entry restores title/caption/keywords/editorial as a dirty Modified item; every accepted generation, commercial or editorial, is queued for auto-save while failures are not |
 | `cache::thumbnails::tests` | 1 | request lifecycle blocks duplicates/failures |
 | `theme::tests` | 1 | Windows theme registry parsing |
 | `ui::tree::tests` | 4 | sorted children/expansion/depth; refresh preserves expansion and rereads children; reveal expands only the ancestor chain; breadcrumb path segments |
@@ -1163,7 +1156,7 @@ List: `cargo test -- --list`.
 
 ExifTool integration tests skip with `exiftool not available; skipping test` if detection fails. This keeps the suite runnable without ExifTool, but those tests only prove metadata correctness when ExifTool is installed. On this machine they run.
 
-Provider tests make no real API calls. `src/ai/tests.rs` has a TCP HTTP server on `127.0.0.1:0` that can return a sequence of responses; it reads each request, asserts method/path/headers/body, and returns canned JSON. The keyword, title/caption, and malformed-reply retry tests use two responses; the give-up test consumes all four (the first request plus three parse retries).
+Provider tests make no real API calls. `src/ai/tests.rs` has a TCP HTTP server on `127.0.0.1:0` that can return a sequence of responses; it reads each request, asserts method/path/headers/body, and returns canned JSON. The keyword and title/caption retry tests use two responses; the escalation tests use three (initial, corrective, escalated), and the give-up test consumes all four (the first request plus three parse retries).
 
 Temporary artifacts: `%TEMP%\autowording-tests`, `autowording-state-tests`, `autowording-config-tests`, `autowording-tree-tests`, `autowording-persist-tests`.
 

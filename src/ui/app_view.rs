@@ -163,10 +163,6 @@ impl AutoWordingView {
                         if item.title != value {
                             item.title = value;
                             item.dirty = true;
-                            item.review_reasons.clear();
-                            if item.status == Status::Review {
-                                item.status = Status::Generated;
-                            }
                             item.message = None;
                         }
                     }
@@ -184,10 +180,6 @@ impl AutoWordingView {
                         if item.caption != value {
                             item.caption = value;
                             item.dirty = true;
-                            item.review_reasons.clear();
-                            if item.status == Status::Review {
-                                item.status = Status::Generated;
-                            }
                             item.message = None;
                         }
                     }
@@ -206,10 +198,6 @@ impl AutoWordingView {
                         if item.keywords != parsed {
                             item.keywords = parsed;
                             item.dirty = true;
-                            item.review_reasons.clear();
-                            if item.status == Status::Review {
-                                item.status = Status::Generated;
-                            }
                             item.message = None;
                         }
                     }
@@ -955,7 +943,6 @@ impl AutoWordingView {
             (StatusFilter::Queued, "Queued"),
             (StatusFilter::Processing, "Working"),
             (StatusFilter::Generated, "Generated"),
-            (StatusFilter::Review, "Review"),
             (StatusFilter::Saved, "Saved"),
             (StatusFilter::Failed, "Failed"),
             (StatusFilter::Modified, "Modified"),
@@ -1182,7 +1169,6 @@ impl AutoWordingView {
             match item.status {
                 Status::Saved => cx.theme().success,
                 Status::Error => cx.theme().danger,
-                Status::Review => cx.theme().warning,
                 Status::Generated => cx.theme().primary,
                 Status::Processing | Status::Queued => cx.theme().info,
                 Status::Pending => cx.theme().muted_foreground,
@@ -1613,9 +1599,7 @@ impl AutoWordingView {
                                     .bg(cx.theme().accent)
                                     .text_xs()
                                     .text_color(cx.theme().accent_foreground)
-                                    .child(if item.status == Status::Review {
-                                        item.status.label()
-                                    } else if item.dirty {
+                                    .child(if item.dirty {
                                         "Modified"
                                     } else {
                                         item.status.label()
@@ -1712,10 +1696,6 @@ impl AutoWordingView {
                                     if let Some(item) = this.core.items.get_mut(&editorial_path) {
                                         item.editorial = *checked;
                                         item.dirty = true;
-                                        item.review_reasons.clear();
-                                        if item.status == Status::Review {
-                                            item.status = Status::Generated;
-                                        }
                                     }
                                     cx.notify();
                                 });

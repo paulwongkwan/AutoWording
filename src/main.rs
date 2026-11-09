@@ -21,6 +21,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            ui::init_keybindings(cx);
             gpui_kit::open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Maximized(Bounds {

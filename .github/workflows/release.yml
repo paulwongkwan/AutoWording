@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows-release:
+    name: Build and publish Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version
+        id: release
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $cargo = Get-Content -Raw -LiteralPath "Cargo.toml"
+          if ($cargo -notmatch '(?m)^\s*version\s*=\s*"([^"]+)"') {
+            throw "Could not read the package version from Cargo.toml."
+          }
+          $version = $Matches[1]
+          $tag = "v$version"
+          if ($env:REF_TYPE -eq "tag" -and $env:REF_NAME -ne $tag) {
+            throw "Tag $env:REF_NAME does not match Cargo.toml version $tag. Bump Cargo.toml or retag."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "asset=AutoWording-$tag-windows-x64.exe" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing $tag from $env:GITHUB_SHA"
+
+      - name: Test
+        run: cargo test --locked -- --skip inspector_tabs_match_snapshots
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $asset = "${{ steps.release.outputs.asset }}"
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item -LiteralPath "target/release/autowording.exe" -Destination "dist/$asset" -Force
+          $bytes = (Get-Item -LiteralPath "dist/$asset").Length
+          "size=$([math]::Round($bytes / 1MB, 1)) MB" >> $env:GITHUB_OUTPUT
+          Write-Host "Packaged dist/$asset ($bytes bytes)"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoWording-windows-x64
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ASSET: ${{ steps.release.outputs.asset }}
+          SIZE: ${{ steps.package.outputs.size }}
+        run: |
+          git rev-parse --verify --quiet "refs/tags/$env:TAG" *> $null
+          $tagExists = $LASTEXITCODE -eq 0
+          $previous = git tag --sort=-creatordate | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1
+          if ($tagExists -and $previous) {
+            $range = "$previous..$env:TAG"
+          } elseif ($previous) {
+            $range = "$previous..HEAD"
+          } else {
+            $range = "HEAD"
+          }
+
+          $commits = @(git log $range --no-merges --pretty=format:"- %s")
+          if ($commits.Count -eq 0) {
+            $commits = @("- Release $env:TAG")
+          }
+          $notes = "## Changes`n`n" + ($commits -join "`n")
+          $notesPath = Join-Path $PWD "release-notes.md"
+          [System.IO.File]::WriteAllText($notesPath, $notes, [System.Text.UTF8Encoding]::new($false))
+
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG "dist/$env:ASSET" --clobber
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to upload $env:ASSET to release $env:TAG."
+            }
+            gh release edit $env:TAG --title "AutoWording $env:TAG" --notes-file $notesPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to update release notes for $env:TAG."
+            }
+          } else {
+            gh release create $env:TAG "dist/$env:ASSET" --title "AutoWording $env:TAG" --notes-file $notesPath --target "$env:GITHUB_SHA"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create release $env:TAG."
+            }
+          }
+
+          "### AutoWording $env:TAG`n`n- Asset: ``$env:ASSET`` ($env:SIZE)`n- Commit: ``$env:GITHUB_SHA``" >> $env:GITHUB_STEP_SUMMARY

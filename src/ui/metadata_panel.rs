@@ -220,7 +220,7 @@ fn single(
             count_chip(
                 ui,
                 &format!("{} / {}", keywords.len(), keyword_target),
-                keywords.len() == keyword_target,
+                keywords.len() >= prompt::minimum_keyword_count(keyword_target),
             );
             if ui.add(text_button("Normalize")).clicked() {
                 keywords = prompt::normalize_keywords_with_target(

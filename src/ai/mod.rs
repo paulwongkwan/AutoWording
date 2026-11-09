@@ -79,8 +79,15 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     let keyword_target = clamp_keyword_target(req.keyword_target);
     let title_range = clamp_title_word_range(req.title_range.0, req.title_range.1);
     let caption_range = clamp_caption_char_range(req.caption_range.0, req.caption_range.1);
+    // Editorial captions need the capture date, not the upload/batch date.
+    let capture_date = req
+        .existing
+        .date
+        .as_deref()
+        .and_then(prompt::format_capture_date);
+    let prompt_date = capture_date.as_deref().unwrap_or(&req.date);
     let system = prompt::system_prompt_with_constraints(
-        &req.date,
+        prompt_date,
         &req.global_prompt,
         keyword_target,
         title_range,
@@ -109,7 +116,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
 
     // A malformed reply (missing labels) or a transport error is retried a few
     // times before the image is marked failed. After a parse failure the model
-    // is shown its own reply and asked for the four labelled lines again.
+    // is shown its own reply and asked for the five labelled lines again.
     let mut parsed: Option<prompt::GeneratedMetadata> = None;
     let mut last_reply: Option<String> = None;
     let mut last_error: Option<anyhow::Error> = None;
@@ -154,10 +161,13 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     // One corrective pass covers all recoverable misses. A valid retry replaces
     // out-of-range title/caption values; keywords are always appended so the
     // first result is preserved and only new unique terms fill a short list.
-    let first_title_ok = within_range(prompt::title_word_count(&result.title), title_range);
-    let first_caption_ok = within_range(prompt::caption_char_count(&result.caption), caption_range);
+    let first_title_ok = within_range(prompt::title_word_count(&result.title), title_range)
+        && !prompt::contains_non_english_letters(&result.title);
+    let first_caption_ok = within_range(prompt::caption_char_count(&result.caption), caption_range)
+        && !prompt::contains_non_english_letters(&result.caption);
     let first_valid = first_title_ok && first_caption_ok;
-    let keywords_short = result.keywords.len() < keyword_target;
+    let minimum_keywords = prompt::minimum_keyword_count(keyword_target);
+    let keywords_short = result.keywords.len() < minimum_keywords;
     if !first_valid || keywords_short {
         let retry_user = prompt::retry_prompt(
             req.context.as_deref(),
@@ -170,14 +180,17 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         if let Ok(retry_raw) = chat(&client, &req, &system, &retry_user).await {
             if let Ok(retry) = prompt::parse_response_with_target(&retry_raw, keyword_target) {
                 let retry_title_ok =
-                    within_range(prompt::title_word_count(&retry.title), title_range);
+                    within_range(prompt::title_word_count(&retry.title), title_range)
+                        && !prompt::contains_non_english_letters(&retry.title);
                 let retry_caption_ok =
-                    within_range(prompt::caption_char_count(&retry.caption), caption_range);
+                    within_range(prompt::caption_char_count(&retry.caption), caption_range)
+                        && !prompt::contains_non_english_letters(&retry.caption);
                 if !first_valid && retry_title_ok && retry_caption_ok {
                     result.title = retry.title;
                     result.caption = retry.caption;
                     result.editorial = retry.editorial;
                 }
+                result.review_reasons.extend(retry.review_reasons);
                 let combined = result
                     .keywords
                     .iter()
@@ -190,10 +203,54 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         }
     }
 
-    if result.keywords.is_empty() {
+    if prompt::contains_non_english_letters(&result.title)
+        || prompt::contains_non_english_letters(&result.caption)
+    {
         bail!(
-            "{} returned no keywords after a retry.",
+            "{} returned a title or caption with non-English letters after a retry.",
             req.provider.label()
+        );
+    }
+
+    if result.editorial {
+        if capture_date.is_none() {
+            push_review_reason(
+                &mut result.review_reasons,
+                "Editorial capture date is missing; confirm the date taken",
+            );
+        }
+        let has_location_source = req
+            .existing
+            .gps
+            .as_deref()
+            .is_some_and(|gps| !gps.trim().is_empty())
+            || req
+                .context
+                .as_deref()
+                .is_some_and(|context| !context.trim().is_empty());
+        if !has_location_source {
+            push_review_reason(
+                &mut result.review_reasons,
+                "Editorial location source is missing; confirm the city and country",
+            );
+        }
+    }
+    for reason in prompt::stock_review_reasons(
+        &result.title,
+        &result.caption,
+        &result.keywords,
+        result.editorial,
+    ) {
+        push_review_reason(&mut result.review_reasons, &reason);
+    }
+
+    if result.keywords.len() < minimum_keywords {
+        bail!(
+            "{} returned {} usable keywords after a retry; at least {} are required (target {}).",
+            req.provider.label(),
+            result.keywords.len(),
+            minimum_keywords,
+            keyword_target
         );
     }
 
@@ -202,6 +259,15 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
 
 fn within_range(value: usize, range: (usize, usize)) -> bool {
     (range.0..=range.1).contains(&value)
+}
+
+fn push_review_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(reason))
+    {
+        reasons.push(reason.to_string());
+    }
 }
 
 async fn chat(

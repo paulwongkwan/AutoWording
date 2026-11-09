@@ -23,6 +23,15 @@ const PREVIEW_MAX: u32 = 2200;
 const TOAST_LIFETIME: Duration = Duration::from_secs(9);
 const CONFIG_SAVE_DELAY: Duration = Duration::from_millis(500);
 const METADATA_READ_CONCURRENCY: usize = 4;
+const THUMB_DECODE_MAX: usize = 4;
+const PREVIEW_DECODE_CONCURRENCY: usize = 1;
+
+/// Decode thumbnails in parallel while reserving CPU for the UI thread.
+fn thumbnail_decode_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| (count.get() / 2).clamp(1, THUMB_DECODE_MAX))
+        .unwrap_or(2)
+}
 
 /// A small bridge for model methods that used to ask egui for a repaint. The
 /// GPUI view owns an event pump, so worker updates are drained on its cadence.
@@ -77,11 +86,20 @@ pub struct App {
     pub loading_preview: HashSet<PathBuf>,
     pub meta_requested: HashSet<PathBuf>,
     metadata_permits: Arc<tokio::sync::Semaphore>,
+    thumb_permits: Arc<tokio::sync::Semaphore>,
+    preview_permits: Arc<tokio::sync::Semaphore>,
+    folder_scan_generation: u64,
+    preview_generation: u64,
+    preview_cancel: Option<Arc<AtomicBool>>,
     pub decode_failed: HashSet<PathBuf>,
     pub context: String,
     pub batch: Option<BatchProgress>,
     pub batch_paused: bool,
     pub batch_current: Option<PathBuf>,
+    /// Queue entries after the current item, in the order they will run.
+    pub batch_up_next: Vec<PathBuf>,
+    batch_failed_paths: Vec<PathBuf>,
+    batch_retry_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<(PathBuf, ExistingMetadata)>>>,
     pub batch_started: Option<Instant>,
     batch_skipped: usize,
     pub force_regenerate: bool,
@@ -143,6 +161,7 @@ fn apply_journal_entry(item: &mut ImageItem, entry: &journal::JournalEntry) {
     item.caption = entry.caption.clone();
     item.keywords = entry.keywords.clone();
     item.editorial = entry.editorial;
+    item.review_reasons.clear();
     item.dirty = true;
     item.status = Status::Generated;
 }
@@ -183,11 +202,19 @@ impl App {
             loading_preview: HashSet::new(),
             meta_requested: HashSet::new(),
             metadata_permits: Arc::new(tokio::sync::Semaphore::new(METADATA_READ_CONCURRENCY)),
+            thumb_permits: Arc::new(tokio::sync::Semaphore::new(thumbnail_decode_concurrency())),
+            preview_permits: Arc::new(tokio::sync::Semaphore::new(PREVIEW_DECODE_CONCURRENCY)),
+            folder_scan_generation: 0,
+            preview_generation: 0,
+            preview_cancel: None,
             decode_failed: HashSet::new(),
             context: String::new(),
             batch: None,
             batch_paused: false,
             batch_current: None,
+            batch_up_next: Vec::new(),
+            batch_failed_paths: Vec::new(),
+            batch_retry_tx: None,
             batch_started: None,
             batch_skipped: 0,
             force_regenerate: false,
@@ -255,6 +282,17 @@ impl App {
         }
         self.cfg.density = density;
         self.cfg_dirty = Some(Instant::now());
+    }
+
+    /// Persist the inspector rail state so the next launch opens the same way.
+    pub fn set_inspector_collapsed(&mut self, collapsed: bool) {
+        if self.cfg.inspector_collapsed == collapsed {
+            return;
+        }
+        self.cfg.inspector_collapsed = collapsed;
+        if self.cfg.path.is_some() {
+            self.cfg_dirty = Some(Instant::now());
+        }
     }
 
     /// Re-read Windows when the app regains focus so System mode stays current.
@@ -555,6 +593,7 @@ impl App {
             return;
         }
 
+        let keyword_target = self.cfg.keyword_target();
         let index = csv::filename_index(&self.folder_images);
         let mut applied: Vec<PathBuf> = Vec::new();
         let mut unmatched = 0usize;
@@ -582,8 +621,9 @@ impl App {
                 item.editorial = editorial;
             }
             item.dirty = true;
+            item.review_reasons.clear();
             item.message = None;
-            item.status = if item.is_complete() {
+            item.status = if item.is_complete(keyword_target) {
                 Status::Generated
             } else {
                 Status::Pending
@@ -659,6 +699,7 @@ impl App {
                         item.editorial = false;
                         item.status = Status::Pending;
                         item.dirty = false;
+                        item.review_reasons.clear();
                         item.message = None;
                         item.meta_loaded = false;
                         item.disk_len = None;
@@ -739,6 +780,7 @@ impl App {
         self.cfg.last_folder = dir.to_string_lossy().to_string();
         self.cfg_dirty = Some(Instant::now());
         self.selection.clear();
+        self.folder_images.clear();
         self.preview = None;
         self.meta_requested.clear();
         self.refresh_folder(ctx);
@@ -748,22 +790,29 @@ impl App {
         let Some(dir) = self.current_folder.clone() else {
             return;
         };
-        let files = state::collect_folder_jpegs(&dir);
-        for file in &files {
-            self.ensure_item(file);
-        }
-        self.folder_images = files;
+        self.folder_scan_generation = self.folder_scan_generation.wrapping_add(1);
+        let generation = self.folder_scan_generation;
         self.preview = None;
         self.meta_requested.clear();
         self.folders.refresh();
 
-        let present: HashSet<PathBuf> = self.folder_images.iter().cloned().collect();
-        self.thumbs.retain(&present);
-        // Folder changes clear the selection in `open_folder`; a refresh should
-        // only drop paths that no longer exist, never select a replacement.
-        self.selection.retain_existing(&self.folder_images);
-        self.request_all_metadata(ctx);
-        self.after_selection_change(ctx);
+        // Directory enumeration can block on a busy or network drive. Keep it
+        // on the blocking pool; the UI only applies the newest scan result.
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        let scan_dir = dir.clone();
+        self.rt.spawn(async move {
+            let task_dir = scan_dir.clone();
+            let files = tokio::task::spawn_blocking(move || state::collect_folder_jpegs(&task_dir))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(WorkerEvent::FolderScanned {
+                dir: scan_dir,
+                files,
+                generation,
+            });
+            ctx.request_repaint();
+        });
     }
 
     /// Refresh the grid and rescan mounted drives without discarding tree expansion.
@@ -822,8 +871,13 @@ impl App {
     }
 
     fn after_selection_change(&mut self, ctx: &UiContext) {
-        if let Some(active) = self.active_path() {
-            self.request_preview(ctx, &active);
+        // Browser mode has no preview pane. Decoding a 2200 px preview for
+        // every grid click competes with thumbnail work and makes input feel
+        // laggy, so only the Viewer requests the full preview.
+        if self.mode == WorkspaceMode::Viewer {
+            if let Some(active) = self.active_path() {
+                self.request_preview(ctx, &active);
+            }
         }
         for path in self.selected_paths() {
             self.request_metadata(ctx, &path);
@@ -998,13 +1052,21 @@ impl App {
 
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        let permits = self.thumb_permits.clone();
         let path = path.to_path_buf();
         self.rt.spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
             let task_path = path.clone();
             let result =
                 tokio::task::spawn_blocking(move || state::decode(&task_path, THUMB_MAX)).await;
             let event = match result {
-                Ok(Ok((image, _dims))) => WorkerEvent::Thumbnail { path, image },
+                Ok(Ok((image, _dims))) => WorkerEvent::Thumbnail {
+                    path,
+                    image: image.into_render_image(),
+                },
                 Ok(Err(err)) => WorkerEvent::ImageFailed {
                     path,
                     error: format!("{err:#}"),
@@ -1031,17 +1093,40 @@ impl App {
         if self.loading_preview.contains(path) || self.decode_failed.contains(path) {
             return;
         }
+        self.loading_preview
+            .retain(|loading| loading.as_path() == path);
         self.loading_preview.insert(path.to_path_buf());
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.preview_cancel.replace(cancel.clone()) {
+            previous.store(true, Ordering::Relaxed);
+        }
 
         let tx = self.tx.clone();
         let ctx = ctx.clone();
+        let permits = self.preview_permits.clone();
         let path = path.to_path_buf();
         self.rt.spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let task_path = path.clone();
             let result =
                 tokio::task::spawn_blocking(move || state::decode(&task_path, PREVIEW_MAX)).await;
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let event = match result {
-                Ok(Ok((image, _dims))) => WorkerEvent::Preview { path, image },
+                Ok(Ok((image, _dims))) => WorkerEvent::Preview {
+                    path,
+                    image: image.into_render_image(),
+                    generation,
+                },
                 Ok(Err(err)) => WorkerEvent::ImageFailed {
                     path,
                     error: format!("{err:#}"),
@@ -1133,6 +1218,9 @@ impl App {
             self.notify("A batch job is already running", true);
             return;
         }
+        self.batch_up_next.clear();
+        self.batch_failed_paths.clear();
+        self.batch_retry_tx = None;
         if paths.is_empty() {
             self.notify("Nothing to process", true);
             return;
@@ -1167,6 +1255,7 @@ impl App {
         // Sweep the assembled queue once before it starts. Images that were
         // already complete or saved while it was being assembled must not spend
         // a model request; Force regenerate is the explicit exception.
+        let keyword_target = self.cfg.keyword_target();
         let mut queue = AiQueue::new(jobs);
         let mut skipped = 0usize;
         if !self.force_regenerate {
@@ -1174,11 +1263,12 @@ impl App {
             queue.retain(|(path, _)| {
                 self.items
                     .get(path)
-                    .map(|item| !state::should_skip_generation(item))
+                    .map(|item| !state::should_skip_generation(item, keyword_target))
                     .unwrap_or(true)
             });
             skipped = before.saturating_sub(queue.len());
         }
+        self.batch_up_next = queue.iter().map(|(path, _)| path.clone()).collect();
         if queue.is_empty() {
             self.notify(
                 format!(
@@ -1201,6 +1291,7 @@ impl App {
         self.batch = Some(BatchProgress {
             total,
             done: 0,
+            failed: 0,
             saving: false,
             last_image: None,
         });
@@ -1216,17 +1307,26 @@ impl App {
         let context = Some(self.context.trim().to_string()).filter(|value| !value.is_empty());
         let now = chrono::Local::now();
         let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
-        let keyword_target = self.cfg.keyword_target();
         let title_range = self.cfg.title_word_range();
         let caption_range = self.cfg.caption_char_range();
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.batch_retry_tx = Some(retry_tx);
 
         self.rt.spawn(async move {
             let mut ok = 0usize;
             let mut failed = 0usize;
 
-            while let Some(entry) = queue.next() {
+            loop {
+                while let Ok(retries) = retry_rx.try_recv() {
+                    for job in retries {
+                        queue.push(job);
+                    }
+                }
+                let Some(entry) = queue.next() else {
+                    break;
+                };
                 let retries = entry.retries;
                 let (path, existing) = entry.item;
                 if cancel.load(Ordering::Relaxed) {
@@ -1346,6 +1446,79 @@ impl App {
         self.generate_paths(ctx, paths);
     }
 
+    /// Retry every image that failed in the running batch, appending the
+    /// attempts to its queue. Outside a batch, retry every failed image in the
+    /// folder as a new batch.
+    pub fn retry_all_failed(&mut self, ctx: &UiContext) {
+        if self.batch.is_none() {
+            let paths: Vec<PathBuf> = self
+                .folder_images
+                .iter()
+                .filter(|path| {
+                    self.items
+                        .get(*path)
+                        .map(|item| item.status == Status::Error)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if paths.is_empty() {
+                self.notify("No failed images to retry", true);
+                return;
+            }
+            self.generate_paths(ctx, paths);
+            return;
+        }
+
+        let Some(tx) = self.batch_retry_tx.clone() else {
+            self.notify("The batch is no longer running", true);
+            return;
+        };
+        let paths: Vec<PathBuf> = self
+            .batch_failed_paths
+            .iter()
+            .filter(|path| {
+                self.items
+                    .get(*path)
+                    .map(|item| item.status == Status::Error)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            self.notify("No failed images to retry", true);
+            return;
+        }
+        let jobs: Vec<(PathBuf, ExistingMetadata)> = paths
+            .iter()
+            .filter_map(|path| {
+                self.items
+                    .get(path)
+                    .map(|item| (path.clone(), existing_metadata(item)))
+            })
+            .collect();
+        if jobs.is_empty() || tx.send(jobs).is_err() {
+            self.notify("The batch is no longer running", true);
+            return;
+        }
+
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                item.status = Status::Queued;
+                item.message = None;
+            }
+        }
+        if let Some(batch) = self.batch.as_mut() {
+            if !batch.saving {
+                batch.done = batch.done.saturating_sub(paths.len());
+                batch.failed = batch.failed.saturating_sub(paths.len());
+            }
+        }
+        self.batch_up_next.extend(paths.iter().cloned());
+        self.batch_failed_paths.clear();
+        self.notify(format!("Retrying {} failed image(s)…", paths.len()), false);
+    }
+
     pub fn save_selected(&mut self, ctx: &UiContext) {
         let selected = self.selected_paths();
         let _ = self.save_paths(ctx, selected);
@@ -1357,6 +1530,9 @@ impl App {
             self.notify("A batch job is already running", true);
             return false;
         }
+        self.batch_up_next.clear();
+        self.batch_failed_paths.clear();
+        self.batch_retry_tx = None;
         let Some(tool) = self.exiftool.clone() else {
             self.notify(
                 "ExifTool is unavailable — set its path in AI Settings",
@@ -1398,10 +1574,12 @@ impl App {
             );
         }
 
+        self.batch_up_next = items.iter().map(|(path, _, _, _)| path.clone()).collect();
         let total = items.len();
         self.batch = Some(BatchProgress {
             total,
             done: 0,
+            failed: 0,
             saving: true,
             last_image: None,
         });
@@ -1456,6 +1634,10 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.title = value.clone();
                 item.dirty = true;
+                item.review_reasons.clear();
+                if item.status == Status::Review {
+                    item.status = Status::Generated;
+                }
             }
         }
         self.notify(format!("Title applied to {} image(s)", paths.len()), false);
@@ -1467,6 +1649,10 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.caption = value.clone();
                 item.dirty = true;
+                item.review_reasons.clear();
+                if item.status == Status::Review {
+                    item.status = Status::Generated;
+                }
             }
         }
         self.notify(
@@ -1487,6 +1673,10 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 state::append_keywords_with_target(&mut item.keywords, &additions, target);
                 item.dirty = true;
+                item.review_reasons.clear();
+                if item.status == Status::Review {
+                    item.status = Status::Generated;
+                }
             }
         }
         self.notify(
@@ -1507,6 +1697,10 @@ impl App {
             if let Some(item) = self.items.get_mut(path) {
                 item.keywords = keywords.clone();
                 item.dirty = true;
+                item.review_reasons.clear();
+                if item.status == Status::Review {
+                    item.status = Status::Generated;
+                }
             }
         }
         self.notify(
@@ -1532,7 +1726,7 @@ impl App {
             let Some((metadata, disk_len, disk_modified)) = self
                 .items
                 .get(&path)
-                .filter(|item| item.has_metadata())
+                .filter(|item| item.has_metadata() && item.review_reasons.is_empty())
                 .map(|item| (item.to_metadata(), item.disk_len, item.disk_modified))
             else {
                 continue;
@@ -1573,12 +1767,44 @@ impl App {
             match event {
                 WorkerEvent::Thumbnail { path, image } => {
                     self.decode_failed.remove(&path);
-                    self.thumbs.insert(path, image.to_render_image());
+                    self.thumbs.insert(path, image);
                 }
-                WorkerEvent::Preview { path, image } => {
+                WorkerEvent::Preview {
+                    path,
+                    image,
+                    generation,
+                } => {
                     self.loading_preview.remove(&path);
                     self.decode_failed.remove(&path);
-                    self.preview = Some((path, image.to_render_image()));
+                    if generation == self.preview_generation
+                        && self.active_path().as_deref() == Some(path.as_path())
+                    {
+                        self.preview = Some((path, image));
+                    }
+                }
+                WorkerEvent::FolderScanned {
+                    dir,
+                    files,
+                    generation,
+                } => {
+                    if generation != self.folder_scan_generation
+                        || self.current_folder.as_deref() != Some(dir.as_path())
+                    {
+                        continue;
+                    }
+                    for file in &files {
+                        self.ensure_item(file);
+                    }
+                    self.folder_images = files;
+                    self.preview = None;
+
+                    let present: HashSet<PathBuf> = self.folder_images.iter().cloned().collect();
+                    self.thumbs.retain(&present);
+                    // A refresh should only drop paths that no longer exist;
+                    // never select a replacement automatically.
+                    self.selection.retain_existing(&self.folder_images);
+                    self.request_all_metadata(ctx);
+                    self.after_selection_change(ctx);
                 }
                 WorkerEvent::ImageFailed { path, error } => {
                     self.loading_preview.remove(&path);
@@ -1592,6 +1818,7 @@ impl App {
                 }
                 WorkerEvent::AiStarted { path } => {
                     self.batch_current = Some(path.clone());
+                    self.batch_up_next.retain(|queued| queued != &path);
                     if let Some(item) = self.items.get_mut(&path) {
                         if item.status == Status::Queued {
                             item.status = Status::Processing;
@@ -1605,6 +1832,8 @@ impl App {
                     duration,
                 } => {
                     self.batch_current = None;
+                    self.batch_up_next.retain(|queued| queued != &path);
+                    self.batch_up_next.push(path.clone());
                     if let Some(batch) = self.batch.as_mut() {
                         if !batch.saving {
                             batch.last_image = Some(duration);
@@ -1622,15 +1851,26 @@ impl App {
                     result,
                     duration,
                 } => {
+                    self.batch_up_next.retain(|queued| queued != &path);
                     let mut counted = false;
                     let mut generated_ok = false;
+                    let mut auto_save_ready = false;
                     if let Some(item) = self.items.get_mut(&path) {
                         match result {
                             Ok(generated) => {
                                 apply_generated_metadata(item, generated);
-                                item.status = Status::Generated;
                                 item.dirty = true;
-                                item.message = None;
+                                if item.review_reasons.is_empty() {
+                                    item.status = Status::Generated;
+                                    item.message = None;
+                                    auto_save_ready = true;
+                                } else {
+                                    item.status = Status::Review;
+                                    item.message = Some(format!(
+                                        "Needs review: {}",
+                                        item.review_reasons.join("; ")
+                                    ));
+                                }
                                 counted = true;
                                 generated_ok = true;
                             }
@@ -1641,22 +1881,36 @@ impl App {
                             }
                         }
                     }
-                    if generated_ok {
-                        self.auto_save_queue.push(path);
+                    if generated_ok && auto_save_ready {
+                        self.auto_save_queue.push(path.clone());
                         self.pump_auto_save(ctx);
                     }
                     if counted {
                         if let Some(batch) = self.batch.as_mut() {
                             if !batch.saving {
                                 batch.done += 1;
+                                if !generated_ok {
+                                    batch.failed += 1;
+                                }
                                 batch.last_image = Some(duration);
                             }
+                        }
+                        if !generated_ok {
+                            self.batch_failed_paths.push(path);
                         }
                     }
                 }
                 WorkerEvent::BatchFinished { ok, failed } => {
+                    let final_ok = self
+                        .batch
+                        .map(|batch| batch.done.saturating_sub(batch.failed))
+                        .unwrap_or(ok);
+                    let final_failed = self.batch.map(|batch| batch.failed).unwrap_or(failed);
                     self.batch = None;
                     self.batch_current = None;
+                    self.batch_up_next.clear();
+                    self.batch_failed_paths.clear();
+                    self.batch_retry_tx = None;
                     self.batch_started = None;
                     self.batch_paused = false;
                     for item in self.items.values_mut() {
@@ -1666,10 +1920,10 @@ impl App {
                         }
                     }
                     let skipped = std::mem::take(&mut self.batch_skipped);
-                    let summary = if failed == 0 {
-                        format!("AI finished for {ok} image(s)")
+                    let summary = if final_failed == 0 {
+                        format!("AI finished for {final_ok} image(s)")
                     } else {
-                        format!("AI finished: {ok} succeeded, {failed} failed")
+                        format!("AI finished: {final_ok} succeeded, {final_failed} failed")
                     };
                     let summary = if skipped == 0 {
                         summary
@@ -1677,7 +1931,7 @@ impl App {
                         format!("{summary}; skipped {skipped} already complete")
                     };
                     self.pump_auto_save(ctx);
-                    if self.exiftool.is_none() && ok > 0 {
+                    if self.exiftool.is_none() && final_ok > 0 {
                         self.notify(
                             format!(
                                 "{summary}; ExifTool is unavailable, so metadata was not saved"
@@ -1685,14 +1939,16 @@ impl App {
                             true,
                         );
                     } else {
-                        self.notify(summary, failed > 0);
+                        self.notify(summary, final_failed > 0);
                     }
                 }
                 WorkerEvent::SaveStarted { path } => {
-                    self.batch_current = Some(path);
+                    self.batch_current = Some(path.clone());
+                    self.batch_up_next.retain(|queued| queued != &path);
                 }
                 WorkerEvent::SaveDone { path, result } => {
                     self.auto_saving = false;
+                    self.batch_up_next.retain(|queued| queued != &path);
                     let mut counted = false;
                     let mut saved = false;
                     if let Some(item) = self.items.get_mut(&path) {
@@ -1700,6 +1956,7 @@ impl App {
                             Ok(()) => {
                                 item.status = Status::Saved;
                                 item.dirty = false;
+                                item.review_reasons.clear();
                                 item.message = None;
                                 if let Ok(metadata) = std::fs::metadata(&path) {
                                     item.disk_len = Some(metadata.len());
@@ -1722,6 +1979,9 @@ impl App {
                         if let Some(batch) = self.batch.as_mut() {
                             if batch.saving {
                                 batch.done += 1;
+                                if !saved {
+                                    batch.failed += 1;
+                                }
                             }
                         }
                     }
@@ -1730,6 +1990,9 @@ impl App {
                 WorkerEvent::BatchSaved { ok, failed } => {
                     self.batch = None;
                     self.batch_current = None;
+                    self.batch_up_next.clear();
+                    self.batch_failed_paths.clear();
+                    self.batch_retry_tx = None;
                     self.batch_started = None;
                     if failed == 0 {
                         self.notify(format!("Metadata written to {ok} file(s)"), false);
@@ -1754,6 +2017,7 @@ impl App {
                     }
                 }
                 WorkerEvent::MetaLoaded { path, meta } => {
+                    let keyword_target = self.cfg.keyword_target();
                     if let Some(item) = self.items.get_mut(&path) {
                         item.meta_loaded = true;
                         item.meta_error = false;
@@ -1766,7 +2030,7 @@ impl App {
                         if item.dims.is_none() {
                             item.dims = meta.dims;
                         }
-                        item.adopt_existing_metadata(meta);
+                        item.adopt_existing_metadata(meta, keyword_target);
                     }
                 }
                 WorkerEvent::MetaFailed { path } => {
@@ -1859,6 +2123,57 @@ fn folder_of(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_all_failed_requeues_batch_errors() {
+        let mut app = App::from_config(Config::default(), None);
+        let failed = [
+            PathBuf::from("D:/photos/failed-a.jpg"),
+            PathBuf::from("D:/photos/failed-b.jpg"),
+        ];
+        let waiting = PathBuf::from("D:/photos/waiting.jpg");
+        for path in failed.iter().chain(std::iter::once(&waiting)) {
+            let mut item = ImageItem::new(path.clone());
+            item.status = if path == &waiting {
+                Status::Queued
+            } else {
+                Status::Error
+            };
+            app.items.insert(path.clone(), item);
+        }
+        app.batch = Some(BatchProgress {
+            total: 4,
+            done: 3,
+            failed: 2,
+            saving: false,
+            last_image: None,
+        });
+        app.batch_failed_paths = failed.to_vec();
+        app.batch_up_next = vec![waiting.clone()];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.batch_retry_tx = Some(tx);
+
+        app.retry_all_failed(&UiContext);
+
+        let batch = app.batch.expect("the batch should still be active");
+        assert_eq!(batch.done, 1);
+        assert_eq!(batch.failed, 0);
+        assert!(app.batch_failed_paths.is_empty());
+        assert_eq!(
+            app.batch_up_next,
+            vec![waiting, failed[0].clone(), failed[1].clone()]
+        );
+        assert!(failed
+            .iter()
+            .all(|path| { app.items.get(path).map(|item| item.status) == Some(Status::Queued) }));
+        let jobs = rx
+            .try_recv()
+            .expect("retry jobs should be sent to the worker");
+        assert_eq!(
+            jobs.into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            failed
+        );
+    }
 
     #[test]
     fn journal_entry_restores_fields_as_modified() {

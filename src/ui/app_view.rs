@@ -2,6 +2,7 @@ use crate::app::{App, UiContext, WorkspaceMode};
 use crate::config::{LayoutDensity, Marketplace, Provider, ThemePreference};
 use crate::csv::Agency;
 use crate::state::{ImageItem, SelectModifiers, SortMode, Status, StatusFilter};
+use crate::ui::{CancelBatch, PauseBatch, ResumeBatch, ToggleInspector};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -13,14 +14,32 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InspectorTab {
     Metadata,
     Batch,
     Settings,
+}
+
+impl InspectorTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "Metadata",
+            Self::Batch => "Batch",
+            Self::Settings => "Settings",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Batch => "batch",
+            Self::Settings => "settings",
+        }
+    }
 }
 
 pub struct AutoWordingView {
@@ -34,6 +53,7 @@ pub struct AutoWordingView {
     batch_caption: Entity<TextareaState>,
     batch_keywords: Entity<InputState>,
     context: Entity<TextareaState>,
+    focus_handle: FocusHandle,
     base_url: Entity<InputState>,
     model: Entity<InputState>,
     api_key: Entity<InputState>,
@@ -49,6 +69,7 @@ pub struct AutoWordingView {
     active_path: Option<PathBuf>,
     settings_provider: Provider,
     inspector: InspectorTab,
+    inspector_collapsed: bool,
     show_more: bool,
     show_about: bool,
     theme_dark: bool,
@@ -61,6 +82,8 @@ impl AutoWordingView {
 
     pub(crate) fn new_with_core(core: App, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let provider = core.cfg.provider;
+        let inspector_collapsed = core.cfg.inspector_collapsed;
+        let focus_handle = cx.focus_handle();
         let settings = core.cfg.settings(provider).clone();
         let keyword_target = core.cfg.keyword_target();
         let (title_min_value, title_max_value) = core.cfg.title_word_range();
@@ -140,6 +163,10 @@ impl AutoWordingView {
                         if item.title != value {
                             item.title = value;
                             item.dirty = true;
+                            item.review_reasons.clear();
+                            if item.status == Status::Review {
+                                item.status = Status::Generated;
+                            }
                             item.message = None;
                         }
                     }
@@ -157,6 +184,10 @@ impl AutoWordingView {
                         if item.caption != value {
                             item.caption = value;
                             item.dirty = true;
+                            item.review_reasons.clear();
+                            if item.status == Status::Review {
+                                item.status = Status::Generated;
+                            }
                             item.message = None;
                         }
                     }
@@ -175,6 +206,10 @@ impl AutoWordingView {
                         if item.keywords != parsed {
                             item.keywords = parsed;
                             item.dirty = true;
+                            item.review_reasons.clear();
+                            if item.status == Status::Review {
+                                item.status = Status::Generated;
+                            }
                             item.message = None;
                         }
                     }
@@ -360,6 +395,7 @@ impl AutoWordingView {
             batch_caption,
             batch_keywords,
             context,
+            focus_handle,
             base_url,
             model,
             api_key,
@@ -375,6 +411,7 @@ impl AutoWordingView {
             active_path: None,
             settings_provider: provider,
             inspector: InspectorTab::Metadata,
+            inspector_collapsed,
             show_more: false,
             show_about: false,
             theme_dark: false,
@@ -394,6 +431,7 @@ impl AutoWordingView {
             allow
         });
 
+        window.focus(&view.focus_handle, cx);
         view
     }
 
@@ -569,6 +607,30 @@ impl AutoWordingView {
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_collapsed = !self.inspector_collapsed;
+        self.core.set_inspector_collapsed(self.inspector_collapsed);
+        cx.notify();
+    }
+
+    fn can_control_batch(&self) -> bool {
+        self.core.batch.map(|batch| !batch.saving).unwrap_or(false)
+    }
+
+    fn pause_batch_from_shortcut(&mut self, paused: bool, cx: &mut Context<Self>) {
+        if self.can_control_batch() {
+            self.core.set_batch_paused(paused);
+            cx.notify();
+        }
+    }
+
+    fn cancel_batch_from_shortcut(&mut self, cx: &mut Context<Self>) {
+        if self.can_control_batch() {
+            self.core.cancel_batch();
+            cx.notify();
+        }
+    }
+
     fn top_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let can_act = !self.core.selection.is_empty() && self.core.batch.is_none();
         h_flex()
@@ -698,14 +760,21 @@ impl AutoWordingView {
                     })),
             )
             .child(
-                Button::new("settings-tab")
-                    .label("Settings")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.inspector = InspectorTab::Settings;
-                        cx.notify();
-                    })),
+                div()
+                    .debug_selector(|| "inspector-toggle".to_string())
+                    .child(
+                        Button::new("toggle-inspector")
+                            .label(if self.inspector_collapsed {
+                                "Show panel"
+                            } else {
+                                "Hide panel"
+                            })
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_inspector(cx);
+                            })),
+                    ),
             )
             .child(
                 Button::new("more-actions")
@@ -886,6 +955,7 @@ impl AutoWordingView {
             (StatusFilter::Queued, "Queued"),
             (StatusFilter::Processing, "Working"),
             (StatusFilter::Generated, "Generated"),
+            (StatusFilter::Review, "Review"),
             (StatusFilter::Saved, "Saved"),
             (StatusFilter::Failed, "Failed"),
             (StatusFilter::Modified, "Modified"),
@@ -958,6 +1028,7 @@ impl AutoWordingView {
         };
 
         v_flex()
+            .debug_selector(|| "workspace-center".to_string())
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -1111,6 +1182,7 @@ impl AutoWordingView {
             match item.status {
                 Status::Saved => cx.theme().success,
                 Status::Error => cx.theme().danger,
+                Status::Review => cx.theme().warning,
                 Status::Generated => cx.theme().primary,
                 Status::Processing | Status::Queued => cx.theme().info,
                 Status::Pending => cx.theme().muted_foreground,
@@ -1367,17 +1439,13 @@ impl AutoWordingView {
     }
 
     fn inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let tab_button = |_tab: InspectorTab, label: &'static str, selected: bool| {
-            let button = Button::new(ElementId::Name(format!("tab-{label}").into()))
-                .label(label)
-                .small();
-            if selected {
-                button.primary()
-            } else {
-                button.ghost()
-            }
+        let rail_width = inspector_rail_width(window.viewport_size().width.as_f32());
+        let target_width = if self.inspector_collapsed {
+            px(0.0)
+        } else {
+            px(rail_width)
         };
-
+        let inspector_slug = self.inspector.slug();
         let content = match self.inspector {
             InspectorTab::Metadata => self.metadata_tab(window, cx),
             InspectorTab::Batch => self.batch_tab(window, cx),
@@ -1385,53 +1453,129 @@ impl AutoWordingView {
         };
 
         v_flex()
-            .w(px(356.0))
+            .debug_selector(|| "inspector-rail".to_string())
+            .w(px(rail_width))
+            .min_w_0()
+            .overflow_hidden()
             .flex_shrink_0()
             .min_h_0()
             .bg(cx.theme().secondary)
             .border_1()
             .border_color(cx.theme().border)
             .child(
-                h_flex()
-                    .p_2()
-                    .gap_1()
-                    .items_center()
-                    .child(tab_button(
-                        InspectorTab::Metadata,
-                        "Metadata",
-                        self.inspector == InspectorTab::Metadata,
-                    ))
-                    .child(tab_button(
-                        InspectorTab::Batch,
-                        "Batch",
-                        self.inspector == InspectorTab::Batch,
-                    ))
-                    .child(tab_button(
-                        InspectorTab::Settings,
-                        "Settings",
-                        self.inspector == InspectorTab::Settings,
-                    ))
-                    .child(div().flex_1())
+                v_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         div()
                             .text_xs()
+                            .font_bold()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} selected", self.core.selection.count())),
+                            .child("INSPECTOR"),
+                    )
+                    .child(
+                        h_flex()
+                            .p_1()
+                            .gap_1()
+                            .rounded(px(10.0))
+                            .bg(cx.theme().muted)
+                            .child(self.inspector_tab_button(
+                                InspectorTab::Metadata,
+                                self.inspector == InspectorTab::Metadata,
+                                cx,
+                            ))
+                            .child(self.inspector_tab_button(
+                                InspectorTab::Batch,
+                                self.inspector == InspectorTab::Batch,
+                                cx,
+                            ))
+                            .child(self.inspector_tab_button(
+                                InspectorTab::Settings,
+                                self.inspector == InspectorTab::Settings,
+                                cx,
+                            )),
                     ),
             )
-            .child(content)
+            .child(
+                v_flex()
+                    .id(ElementId::Name("inspector-content".into()))
+                    .debug_selector(move || format!("inspector-content-{inspector_slug}"))
+                    .flex_1()
+                    .min_h_0()
+                    .child(content),
+            )
+            .with_spring(
+                "inspector-rail-transition",
+                SpringAnimation::new(SpringConfig::new(320.0, 36.0, 1.0)).to(target_width),
+                move |rail, width| {
+                    let opacity = (width.as_f32() / rail_width.max(1.0)).clamp(0.0, 1.0);
+                    rail.w(width)
+                        .opacity(opacity)
+                        .when(width < px(1.0), |rail| rail.border_0())
+                },
+            )
             .into_any_element()
     }
 
-    fn metadata_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn inspector_tab_button(
+        &self,
+        tab: InspectorTab,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let foreground = if active {
+            cx.theme().foreground
+        } else {
+            cx.theme().muted_foreground
+        };
+        let active_bg = cx.theme().background;
+        let border = if active {
+            cx.theme().border
+        } else {
+            cx.theme().muted
+        };
+
+        div()
+            .id(ElementId::Name(
+                format!("inspector-tab-{}", tab.slug()).into(),
+            ))
+            .debug_selector(move || format!("inspector-tab-{}", tab.slug()))
+            .aria_label(tab.label())
+            .flex_1()
+            .h(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(border)
+            .text_sm()
+            .text_color(foreground)
+            .cursor_pointer()
+            .when(active, |tab| tab.bg(active_bg).font_bold())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.inspector != tab {
+                    this.inspector = tab;
+                    cx.notify();
+                }
+            }))
+            .child(tab.label())
+            .into_any_element()
+    }
+
+    fn metadata_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let paths = self.core.selected_paths();
         if paths.is_empty() {
             return empty_inspector("Select an image", "Select one image to edit its stock metadata, or use Batch for several images at once.", cx);
         }
         if paths.len() > 1 {
-            return self.batch_content(cx);
+            return self.multi_select_inspector(paths.len(), cx);
         }
         let path = paths[0].clone();
+        let compact = inspector_rail_width(window.viewport_size().width.as_f32()) < 340.0;
         self.core.request_metadata(&self.ui, &path);
         let Some(item) = self.core.items.get(&path).cloned() else {
             return empty_inspector("Loading", "Reading file metadata…", cx);
@@ -1469,7 +1613,9 @@ impl AutoWordingView {
                                     .bg(cx.theme().accent)
                                     .text_xs()
                                     .text_color(cx.theme().accent_foreground)
-                                    .child(if item.dirty {
+                                    .child(if item.status == Status::Review {
+                                        item.status.label()
+                                    } else if item.dirty {
                                         "Modified"
                                     } else {
                                         item.status.label()
@@ -1500,11 +1646,23 @@ impl AutoWordingView {
             ))
             .child(
                 h_flex()
+                    .debug_selector(|| "metadata-locks".to_string())
                     .gap_2()
+                    .when(compact, |row| row.gap_1())
                     .items_center()
+                    .flex_wrap()
+                    .when(compact, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("LOCKS"),
+                        )
+                    })
                     .child(
                         Checkbox::new("lock-title")
-                            .label("Lock title")
+                            .label(if compact { "Title" } else { "Lock title" })
                             .checked(item.locks.title)
                             .on_change({
                                 let weak = lock_weak.clone();
@@ -1521,7 +1679,7 @@ impl AutoWordingView {
                     )
                     .child(
                         Checkbox::new("lock-caption")
-                            .label("Lock caption")
+                            .label(if compact { "Caption" } else { "Lock caption" })
                             .checked(item.locks.caption)
                             .on_change(move |checked, _, cx| {
                                 let _ = lock_weak.update(cx, |this, cx| {
@@ -1534,7 +1692,7 @@ impl AutoWordingView {
                     )
                     .child(
                         Checkbox::new("lock-keywords")
-                            .label("Lock keywords")
+                            .label(if compact { "Keywords" } else { "Lock keywords" })
                             .checked(item.locks.keywords)
                             .on_change(move |checked, _, cx| {
                                 let _ = weak.update(cx, |this, cx| {
@@ -1554,6 +1712,10 @@ impl AutoWordingView {
                                     if let Some(item) = this.core.items.get_mut(&editorial_path) {
                                         item.editorial = *checked;
                                         item.dirty = true;
+                                        item.review_reasons.clear();
+                                        if item.status == Status::Review {
+                                            item.status = Status::Generated;
+                                        }
                                     }
                                     cx.notify();
                                 });
@@ -1623,17 +1785,53 @@ impl AutoWordingView {
             .into_any_element()
     }
 
+    fn multi_select_inspector(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .p_5()
+            .gap_2()
+            .child(
+                div()
+                    .text_lg()
+                    .font_bold()
+                    .child(format!("{count} images selected")),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Edit shared fields in Batch, or select one image to edit its metadata.",
+                    ),
+            )
+            .child(
+                Button::new("open-batch-editor")
+                    .label("Open batch editor")
+                    .primary()
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.inspector = InspectorTab::Batch;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn batch_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.batch_content(cx)
     }
 
     fn batch_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.core.selection.count();
+        let queue = self.batch_queue_panel(cx);
         v_flex()
             .flex_1()
             .overflow_y_scrollbar()
             .p_3()
             .gap_3()
+            .when_some(queue, |panel, queue| panel.child(queue))
             .child(div().text_lg().font_bold().child("Batch edit"))
             .child(
                 div()
@@ -1748,6 +1946,239 @@ impl AutoWordingView {
                                 });
                             })
                     }),
+            )
+            .into_any_element()
+    }
+
+    fn batch_queue_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let batch = self.core.batch?;
+        let saving = batch.saving;
+        let paused = !saving && self.core.batch_paused;
+        let processing = usize::from(self.core.batch_current.is_some());
+        let waiting = batch
+            .total
+            .saturating_sub(batch.done)
+            .saturating_sub(processing);
+        let eta = batch.eta().filter(|_| !paused);
+        let percent = (batch.fraction() * 100.0).round() as u32;
+        let current = self.core.batch_current.as_deref().map(display_file_name);
+        let queued_after_current: Vec<PathBuf> = self
+            .core
+            .batch_up_next
+            .iter()
+            .filter(|path| self.core.batch_current.as_deref() != Some(path.as_path()))
+            .cloned()
+            .collect();
+        let up_next_total = queued_after_current.len();
+        let up_next = up_next_labels(&queued_after_current, BATCH_UP_NEXT_LIMIT);
+        let up_next_remaining = up_next_total.saturating_sub(up_next.len());
+        let current_label = current
+            .map(|name| format!("Current: {name}"))
+            .unwrap_or_else(|| {
+                if saving {
+                    "Waiting for the next file".to_string()
+                } else {
+                    "Waiting for the next image".to_string()
+                }
+            });
+        let title = if saving { "Save queue" } else { "AI queue" };
+        let action = if paused {
+            "Paused"
+        } else if saving {
+            "Writing"
+        } else {
+            "Working"
+        };
+        let action_color = if paused {
+            cx.theme().warning
+        } else {
+            cx.theme().primary
+        };
+        let muted = cx.theme().muted_foreground;
+
+        Some(
+            v_flex()
+                .debug_selector(|| "batch-queue".to_string())
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .p_3()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().font_bold().child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(action_color)
+                                .child(action),
+                        )
+                        .child(div().flex_1())
+                        .child(div().text_xs().font_bold().child(format!("{percent}%"))),
+                )
+                .child(
+                    div()
+                        .h(px(6.0))
+                        .w_full()
+                        .rounded(px(999.0))
+                        .bg(cx.theme().border)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(batch.fraction().max(0.02)))
+                                .rounded(px(999.0))
+                                .bg(cx.theme().primary),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{} of {} complete", batch.done, batch.total)),
+                        )
+                        .child(div().flex_1())
+                        .when_some(eta, |row, eta| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("~{} left", format_duration(eta))),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(current_label),
+                )
+                .when(!up_next.is_empty(), |panel| {
+                    let mut list = v_flex()
+                        .debug_selector(|| "batch-up-next".to_string())
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(muted)
+                                .child("UP NEXT"),
+                        );
+                    for (index, name) in up_next.iter().enumerate() {
+                        list = list.child(
+                            div()
+                                .debug_selector(move || format!("batch-up-next-{index}"))
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(name.clone()),
+                        );
+                    }
+                    if up_next_remaining > 0 {
+                        list = list.child(
+                            div()
+                                .debug_selector(|| "batch-up-next-more".to_string())
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("+{up_next_remaining} more")),
+                        );
+                    }
+                    panel.child(list)
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(self.queue_stat("Done", batch.done, false, cx))
+                        .child(self.queue_stat("Waiting", waiting, false, cx))
+                        .child(self.queue_stat("Failed", batch.failed, batch.failed > 0, cx)),
+                )
+                .when(!saving, |panel| {
+                    panel.child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div().debug_selector(|| "batch-pause".to_string()).child(
+                                    Button::new("batch-pause")
+                                        .label(if paused { "Resume" } else { "Pause" })
+                                        .outline()
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.core.set_batch_paused(!this.core.batch_paused);
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .when(batch.failed > 0, |row| {
+                                row.child(
+                                    div()
+                                        .debug_selector(|| "batch-retry-failed".to_string())
+                                        .child(
+                                            Button::new("batch-retry-failed")
+                                                .label("Retry all failed")
+                                                .ghost()
+                                                .small()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.core.retry_all_failed(&this.ui);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            })
+                            .child(
+                                Button::new("batch-cancel")
+                                    .label("Cancel")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.core.cancel_batch();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn queue_stat(
+        &self,
+        label: &'static str,
+        value: usize,
+        danger: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .flex_1()
+            .gap_1()
+            .p_2()
+            .rounded(px(8.0))
+            .bg(cx.theme().secondary)
+            .child(
+                div()
+                    .text_lg()
+                    .font_bold()
+                    .text_color(if danger {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().foreground
+                    })
+                    .child(value.to_string()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
             )
             .into_any_element()
     }
@@ -1996,6 +2427,15 @@ impl AutoWordingView {
                         .font_bold()
                         .child(format!("{action} {} / {}", batch.done, batch.total)),
                 )
+                .when(batch.failed > 0, |bar| {
+                    bar.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(format!("{} failed", batch.failed)),
+                    )
+                })
                 .child(
                     div()
                         .w(px(110.0))
@@ -2059,6 +2499,20 @@ impl AutoWordingView {
                     .text_xs()
                     .child(self.core.provider_line()),
             )
+            .when(self.core.batch.is_some(), |bar| {
+                bar.child(
+                    Button::new("show-queue")
+                        .label("Queue")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.inspector = InspectorTab::Batch;
+                            this.inspector_collapsed = false;
+                            this.core.set_inspector_collapsed(false);
+                            cx.notify();
+                        })),
+                )
+            })
             .child(div().flex_shrink_0().text_xs().truncate().child(
                 if self.core.exiftool.is_some() {
                     "ExifTool ready"
@@ -2257,6 +2711,26 @@ impl AutoWordingView {
     }
 }
 
+const BATCH_UP_NEXT_LIMIT: usize = 3;
+
+fn display_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn up_next_labels(paths: &[PathBuf], limit: usize) -> Vec<String> {
+    paths
+        .iter()
+        .take(limit)
+        .map(|path| display_file_name(path))
+        .collect()
+}
+
+fn inspector_rail_width(viewport_width: f32) -> f32 {
+    (viewport_width * 0.30).clamp(320.0, 356.0)
+}
+
 impl Render for AutoWordingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
@@ -2284,6 +2758,20 @@ impl Render for AutoWordingView {
             .size_full()
             .min_w_0()
             .min_h_0()
+            .track_focus(&self.focus_handle)
+            .key_context("AutoWording")
+            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
+                this.toggle_inspector(cx);
+            }))
+            .on_action(cx.listener(|this, _: &PauseBatch, _, cx| {
+                this.pause_batch_from_shortcut(true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResumeBatch, _, cx| {
+                this.pause_batch_from_shortcut(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CancelBatch, _, cx| {
+                this.cancel_batch_from_shortcut(cx);
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
@@ -2347,6 +2835,7 @@ fn parse_keywords(value: &str) -> Vec<String> {
         .split(',')
         .map(str::trim)
         .filter(|keyword| !keyword.is_empty())
+        .filter(|keyword| !crate::ai::prompt::contains_non_english_letters(keyword))
         .map(ToString::to_string)
         .collect()
 }
@@ -2504,13 +2993,15 @@ fn modal_shell(
 
 #[cfg(test)]
 mod tests {
-    use super::AutoWordingView;
+    use super::{
+        inspector_rail_width, up_next_labels, AutoWordingView, InspectorTab, BATCH_UP_NEXT_LIMIT,
+    };
     use crate::app::App;
     use crate::config::Config;
     use crate::metadata::{ExifTool, Metadata};
-    use crate::state::{ImageItem, Status};
+    use crate::state::{BatchProgress, ImageItem, Status};
     use gpui_kit::{
-        px, size, AppContext as _, Bounds, TestAppContext, WindowBounds, WindowOptions,
+        px, size, AppContext as _, Bounds, Modifiers, TestAppContext, WindowBounds, WindowOptions,
     };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2540,6 +3031,14 @@ mod tests {
         image.save(path).expect("write fixture JPEG");
     }
 
+    fn step_animation(cx: &mut TestAppContext, frames: usize) {
+        for _ in 0..frames {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+    }
+
     #[gpui_kit::test]
     async fn folder_open_marks_complete_images_saved_and_incomplete_pending(
         cx: &mut TestAppContext,
@@ -2563,7 +3062,7 @@ mod tests {
             &Metadata {
                 title: "Complete Fixture".into(),
                 caption: "A complete fixture caption for the folder-open test.".into(),
-                keywords: vec!["fixture".into(), "complete".into()],
+                keywords: (0..45).map(|index| format!("fixture{index}")).collect(),
             },
         )
         .expect("write complete fixture metadata");
@@ -2629,23 +3128,608 @@ mod tests {
 
         view.update(cx, |view, _| {
             assert_eq!(view.core.folder_images.len(), 3);
+            let keyword_target = view.core.cfg.keyword_target();
             let complete_item = fixture_item(view, "complete.jpg").expect("complete item");
             let partial_item = fixture_item(view, "partial.jpg").expect("partial item");
             let untagged_item = fixture_item(view, "untagged.jpg").expect("untagged item");
 
             assert_eq!(complete_item.status, Status::Saved);
             assert_eq!(complete_item.status.label(), "Saved");
-            assert!(complete_item.is_complete());
+            assert!(complete_item.is_complete(keyword_target));
 
             assert_eq!(partial_item.status, Status::Pending);
             assert_eq!(partial_item.status.label(), "Pending");
-            assert!(!partial_item.is_complete());
+            assert!(!partial_item.is_complete(keyword_target));
 
             assert_eq!(untagged_item.status, Status::Pending);
             assert_eq!(untagged_item.status.label(), "Pending");
-            assert!(!untagged_item.is_complete());
+            assert!(!untagged_item.is_complete(keyword_target));
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn inspector_fits_minimum_window(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        let path = PathBuf::from("minimum-window.jpg");
+        view.update(cx, |view, _| {
+            view.core.folder_images.push(path.clone());
+            view.core
+                .items
+                .insert(path.clone(), ImageItem::new(path.clone()));
+            view.core.selection.select_only(&path);
+        });
+        cx.simulate_resize(size(px(1024.0), px(680.0)));
+        cx.run_until_parked();
+        step_animation(cx, 60);
+
+        let rail = cx
+            .debug_bounds("inspector-rail")
+            .expect("the inspector rail should render at the minimum window size");
+        assert!(rail.origin.x >= px(0.0));
+        assert!(
+            rail.origin.x + rail.size.width <= px(1024.0),
+            "the inspector rail must stay inside the minimum window"
+        );
+        assert!(
+            rail.size.width >= px(320.0),
+            "the inspector rail must not shrink below its readable minimum"
+        );
+        assert!(
+            rail.size.width < px(356.0),
+            "the inspector rail should shrink at the minimum window size"
+        );
+        let center = cx
+            .debug_bounds("workspace-center")
+            .expect("the image workspace should render at the minimum window size");
+        assert!(
+            center.size.width >= px(450.0),
+            "the grid must keep usable width when the inspector shrinks"
+        );
+
+        let locks = cx
+            .debug_bounds("metadata-locks")
+            .expect("the metadata lock controls should render at the minimum window size");
+        assert!(
+            locks.size.height <= px(56.0),
+            "the metadata lock controls should stay compact at the minimum window size: {:?}",
+            locks
+        );
+
+        let mut previous_right = rail.origin.x;
+        for selector in [
+            "inspector-tab-metadata",
+            "inspector-tab-batch",
+            "inspector-tab-settings",
+        ] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should render at the minimum window size"));
+            assert!(
+                bounds.size.width >= px(90.0),
+                "{selector} should remain readable at the minimum window size"
+            );
+            assert!(bounds.origin.x >= previous_right);
+            previous_right = bounds.origin.x + bounds.size.width;
+            assert!(previous_right <= rail.origin.x + rail.size.width);
+        }
+
+        let toggle = cx
+            .debug_bounds("inspector-toggle")
+            .expect("the inspector toggle should render at the minimum window size");
+        assert!(
+            toggle.origin.x + toggle.size.width <= px(1024.0),
+            "the inspector toggle must stay inside the minimum window"
+        );
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector = InspectorTab::Batch;
+                view.core.batch = Some(BatchProgress {
+                    total: 6,
+                    done: 2,
+                    failed: 1,
+                    saving: false,
+                    last_image: Some(Duration::from_secs(10)),
+                });
+                view.core.batch_current = Some(PathBuf::from("current.jpg"));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        let queue = cx
+            .debug_bounds("batch-queue")
+            .expect("the queue card should render at the minimum window size");
+        assert!(
+            queue.origin.x >= rail.origin.x
+                && queue.origin.x + queue.size.width <= rail.origin.x + rail.size.width,
+            "the queue card must stay inside the inspector rail: queue={:?} rail={:?}",
+            queue,
+            rail
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn inspector_rail_collapses_and_reopens(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::init_keybindings(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        cx.simulate_resize(size(px(1280.0), px(800.0)));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("inspector-rail").is_some(),
+            "the inspector should start expanded"
+        );
+        let center_before = cx
+            .debug_bounds("workspace-center")
+            .expect("the workspace should be rendered")
+            .size
+            .width;
+        cx.simulate_keystrokes("ctrl-b");
+        cx.run_until_parked();
+        step_animation(cx, 90);
+
+        assert!(cx.update(|_, cx| view.read(cx).inspector_collapsed));
+        assert!(cx.update(|_, cx| view.read(cx).core.cfg.inspector_collapsed));
+        let collapsed_rail = cx
+            .debug_bounds("inspector-rail")
+            .expect("the animated inspector rail should remain mounted while collapsed");
+        assert!(
+            collapsed_rail.size.width <= px(0.5),
+            "collapsing should shrink the inspector rail to zero width: {:?}",
+            collapsed_rail
+        );
+        assert!(
+            cx.debug_bounds("inspector-toggle").is_some(),
+            "the toggle must remain available while collapsed"
+        );
+        let center_after = cx
+            .debug_bounds("workspace-center")
+            .expect("the workspace should still be rendered")
+            .size
+            .width;
+        assert!(
+            center_after > center_before,
+            "hiding the rail should widen the image workspace"
+        );
+
+        let toggle = cx
+            .debug_bounds("inspector-toggle")
+            .expect("the toggle should still be available");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        step_animation(cx, 90);
+
+        assert!(!cx.update(|_, cx| view.read(cx).inspector_collapsed));
+        assert!(!cx.update(|_, cx| view.read(cx).core.cfg.inspector_collapsed));
+        let expanded_rail = cx
+            .debug_bounds("inspector-rail")
+            .expect("expanding should restore the inspector rail");
+        assert!(
+            expanded_rail.size.width >= px(355.0),
+            "expanding should restore the inspector rail width: {:?}",
+            expanded_rail
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn batch_queue_panel_exposes_progress_and_pause(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        cx.simulate_resize(size(px(1280.0), px(800.0)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector = InspectorTab::Batch;
+                view.core.batch = Some(BatchProgress {
+                    total: 6,
+                    done: 2,
+                    failed: 1,
+                    saving: false,
+                    last_image: Some(Duration::from_secs(10)),
+                });
+                view.core.batch_current = Some(PathBuf::from("current.jpg"));
+                view.core.batch_up_next = vec![
+                    PathBuf::from("C:/photos/next-a.jpg"),
+                    PathBuf::from("C:/photos/next-b.jpg"),
+                    PathBuf::from("C:/photos/next-c.jpg"),
+                    PathBuf::from("C:/photos/next-d.jpg"),
+                ];
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("batch-queue").is_some(),
+            "the running batch should show its queue panel"
+        );
+        assert!(
+            cx.debug_bounds("batch-retry-failed").is_some(),
+            "the queue panel should expose retry-all-failed when failures exist"
+        );
+        assert!(
+            cx.debug_bounds("batch-up-next").is_some(),
+            "the queue panel should show the next filenames"
+        );
+        for selector in ["batch-up-next-0", "batch-up-next-1", "batch-up-next-2"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should be rendered"
+            );
+        }
+        assert!(
+            cx.debug_bounds("batch-up-next-3").is_none(),
+            "the queue card should cap the visible up-next rows"
+        );
+        assert!(
+            cx.debug_bounds("batch-up-next-more").is_some(),
+            "the queue card should summarize filenames beyond the visible rows"
+        );
+        assert_eq!(
+            up_next_labels(
+                &[
+                    PathBuf::from("C:/photos/next-a.jpg"),
+                    PathBuf::from("C:/photos/next-b.jpg"),
+                    PathBuf::from("C:/photos/next-c.jpg"),
+                    PathBuf::from("C:/photos/next-d.jpg"),
+                ],
+                BATCH_UP_NEXT_LIMIT
+            ),
+            vec![
+                "next-a.jpg".to_string(),
+                "next-b.jpg".to_string(),
+                "next-c.jpg".to_string(),
+            ]
+        );
+        let pause = cx
+            .debug_bounds("batch-pause")
+            .expect("the queue panel should expose a pause button");
+        cx.simulate_click(pause.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cx.update(|_, cx| view.read(cx).core.batch_paused));
+    }
+
+    #[gpui_kit::test]
+    async fn batch_shortcuts_pause_resume_and_cancel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::init_keybindings(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        cx.simulate_resize(size(px(1280.0), px(800.0)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.core.batch = Some(BatchProgress {
+                    total: 4,
+                    done: 1,
+                    failed: 0,
+                    saving: false,
+                    last_image: None,
+                });
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-p");
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_, cx| view.read(cx).core.batch_paused),
+            "Ctrl+P should pause the running batch"
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-p");
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_, cx| view.read(cx).core.batch_paused),
+            "Ctrl+Shift+P should resume the paused batch"
+        );
+
+        cx.simulate_keystrokes("ctrl-p");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-shift-c");
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_, cx| view.read(cx).core.batch_paused),
+            "cancelling should clear the paused state"
+        );
+        let toast = cx
+            .update(|_, cx| {
+                view.read(cx)
+                    .core
+                    .toast
+                    .as_ref()
+                    .map(|toast| toast.text.clone())
+            })
+            .expect("cancelling should notify the user");
+        assert!(
+            toast.contains("Cancelling after the current image"),
+            "unexpected cancel toast: {toast}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn inspector_tabs_match_snapshots() {
+        const SNAPSHOT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots");
+        const MAX_CHANNEL_DELTA: u8 = 8;
+        const INSPECTOR_TOP: f32 = 58.0;
+        const INSPECTOR_HEADER_HEIGHT: f32 = 92.0;
+        const STATUS_BAR_HEIGHT: f32 = 30.0;
+        const SNAPSHOT_SCALE: f32 = 2.0;
+        const SNAPSHOT_HEIGHT: u32 = 184;
+
+        fn assert_snapshot(name: &str, actual: &image::RgbaImage) {
+            let path = Path::new(SNAPSHOT_DIR).join(format!("{name}.png"));
+            if std::env::var_os("UPDATE_INSPECTOR_SNAPSHOTS").is_some() {
+                std::fs::create_dir_all(SNAPSHOT_DIR).expect("create inspector snapshot directory");
+                actual.save(&path).expect("write inspector snapshot");
+                return;
+            }
+
+            let expected = image::open(&path)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "missing inspector snapshot {}: {error}; run UPDATE_INSPECTOR_SNAPSHOTS=1 cargo test inspector_tabs_match_snapshots",
+                        path.display()
+                    )
+                })
+                .to_rgba8();
+            assert_eq!(
+                actual.dimensions(),
+                expected.dimensions(),
+                "inspector snapshot {name} changed size"
+            );
+
+            let changed = actual
+                .pixels()
+                .zip(expected.pixels())
+                .filter(|(actual, expected)| {
+                    actual
+                        .0
+                        .iter()
+                        .zip(expected.0)
+                        .any(|(actual, expected)| actual.abs_diff(expected) > MAX_CHANNEL_DELTA)
+                })
+                .count();
+            let allowed = (actual.width() as u64 * actual.height() as u64 / 2000) as usize;
+            if changed > allowed {
+                let actual_path = Path::new("target").join(format!("{name}-actual.png"));
+                actual
+                    .save(&actual_path)
+                    .expect("save failing inspector snapshot");
+                panic!(
+                    "inspector snapshot {name} changed: {changed} pixels differ (allowed {allowed}); actual image saved to {}",
+                    actual_path.display()
+                );
+            }
+        }
+
+        let fixture_dir = fixture_dir();
+        let fixture_path = fixture_dir.join("inspector-baseline.jpg");
+        write_jpeg(&fixture_path);
+        let snapshot_fixture = fixture_path.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            gpui_kit::Application::with_platform(gpui_kit::platform::current_platform(false))
+                .with_assets(gpui_kit::assets::Assets)
+                .run(move |cx| {
+                    gpui_kit::init(cx);
+                    // Windows ignores these bounds at off-screen positions, so the
+                    // snapshot windows stay visible but unfocused at the top-left.
+                    let mut captures = Vec::new();
+                    for (width, height, prefix) in [
+                        (1280.0_f32, 800.0_f32, "inspector"),
+                        (1024.0_f32, 680.0_f32, "inspector-min"),
+                    ] {
+                        let (handle, view) = gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    gpui_kit::point(px(0.0), px(0.0)),
+                                    size(px(width), px(height)),
+                                ))),
+                                focus: false,
+                                show: true,
+                                ..Default::default()
+                            },
+                            cx,
+                            {
+                                let fixture_path = snapshot_fixture.clone();
+                                move |window, cx| {
+                                    let mut app = App::from_config(Config::default(), None);
+                                    let mut item = ImageItem::new(fixture_path.clone());
+                                    item.title = "Inspector Baseline".to_string();
+                                    item.caption = "A stable fixture caption used to exercise the full metadata inspector layout.".to_string();
+                                    item.keywords = (0..45)
+                                        .map(|i| {
+                                            let first = (b'a' + (i / 26) as u8) as char;
+                                            let second = (b'a' + (i % 26) as u8) as char;
+                                            format!("{first}{second}")
+                                        })
+                                        .collect();
+                                    item.status = Status::Generated;
+                                    item.dims = Some((64, 48));
+                                    item.meta_loaded = true;
+                                    item.locks.title = true;
+                                    item.locks.keywords = true;
+                                    app.items.insert(fixture_path.clone(), item);
+                                    app.folder_images.push(fixture_path.clone());
+                                    app.selection.select_only(&fixture_path);
+                                    app.meta_requested.insert(fixture_path);
+                                    cx.new(|cx| AutoWordingView::new_with_core(app, window, cx))
+                                }
+                            },
+                        )
+                        .expect("open AutoWording snapshot window");
+
+                        let viewport_width = cx
+                            .update_window(handle, |_, window, _| {
+                                window.viewport_size().width.as_f32()
+                            })
+                            .expect("read AutoWording snapshot viewport");
+                        assert!(
+                            (viewport_width - width).abs() < 1.0,
+                            "inspector snapshot window requested {width}px but the viewport is {viewport_width}px"
+                        );
+                        let rail_points = inspector_rail_width(viewport_width);
+
+                        for (tab, slug) in [
+                            (InspectorTab::Metadata, "metadata"),
+                            (InspectorTab::Batch, "batch"),
+                            (InspectorTab::Settings, "settings"),
+                        ] {
+                            view.update(cx, |view, cx| {
+                                view.inspector = tab;
+                                cx.notify();
+                            });
+                            let image = cx
+                                .update_window(handle, |_, window, cx| {
+                                    window.refresh();
+                                    let clear = window.draw(cx);
+                                    clear.clear(cx);
+                                    window.render_to_image()
+                                })
+                                .expect("render AutoWording snapshot window")
+                                .expect("capture AutoWording snapshot window");
+                            let scale = image.width() as f32 / viewport_width;
+                            let rail_width = (rail_points * scale).round() as u32;
+                            let rail_x = image.width().saturating_sub(rail_width);
+                            let header_y = (INSPECTOR_TOP * scale).round() as u32;
+                            let header_height = (INSPECTOR_HEADER_HEIGHT * scale).round() as u32;
+                            let header = image::imageops::crop_imm(
+                                &image,
+                                rail_x,
+                                header_y,
+                                rail_width,
+                                header_height,
+                            )
+                            .to_image();
+                            let snapshot_width = (rail_points * SNAPSHOT_SCALE).round() as u32;
+                            let header = image::imageops::resize(
+                                &header,
+                                snapshot_width,
+                                SNAPSHOT_HEIGHT,
+                                image::imageops::FilterType::Triangle,
+                            );
+                            captures.push((format!("{prefix}-{slug}"), header));
+
+                            if tab == InspectorTab::Metadata {
+                                let full_height_points = height - INSPECTOR_TOP - STATUS_BAR_HEIGHT;
+                                let full_height =
+                                    (full_height_points * scale).round() as u32;
+                                let full = image::imageops::crop_imm(
+                                    &image,
+                                    rail_x,
+                                    header_y,
+                                    rail_width,
+                                    full_height,
+                                )
+                                .to_image();
+                                let snapshot_full_height =
+                                    (full_height_points * SNAPSHOT_SCALE).round() as u32;
+                                let full = image::imageops::resize(
+                                    &full,
+                                    snapshot_width,
+                                    snapshot_full_height,
+                                    image::imageops::FilterType::Triangle,
+                                );
+                                captures.push((format!("{prefix}-{slug}-full"), full));
+                            }
+                        }
+                        cx.update_window(handle, |_, window, _| window.remove_window())
+                            .expect("close AutoWording snapshot window");
+                    }
+                    let result = tx.send(captures);
+                    cx.quit();
+                    result.ok();
+                });
+        });
+
+        let captures = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("timed out rendering the inspector");
+        assert_eq!(
+            captures.len(),
+            8,
+            "capture every inspector tab at both widths plus the full metadata rail"
+        );
+        for (name, image) in captures {
+            assert_snapshot(&name, &image);
+        }
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
+    #[gpui_kit::test]
+    async fn inspector_tabs_switch_the_right_panel(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        cx.simulate_resize(size(px(1280.0), px(800.0)));
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, cx| view.read(cx).inspector),
+            InspectorTab::Metadata
+        );
+        assert!(
+            cx.debug_bounds("inspector-content-metadata").is_some(),
+            "the metadata panel should be visible initially"
+        );
+
+        for (tab_selector, content_selector, expected) in [
+            (
+                "inspector-tab-batch",
+                "inspector-content-batch",
+                InspectorTab::Batch,
+            ),
+            (
+                "inspector-tab-settings",
+                "inspector-content-settings",
+                InspectorTab::Settings,
+            ),
+            (
+                "inspector-tab-metadata",
+                "inspector-content-metadata",
+                InspectorTab::Metadata,
+            ),
+        ] {
+            let bounds = cx
+                .debug_bounds(tab_selector)
+                .unwrap_or_else(|| panic!("{tab_selector} should be rendered"));
+            cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+
+            assert_eq!(
+                cx.update(|_, cx| view.read(cx).inspector),
+                expected,
+                "clicking {tab_selector} should select {expected:?}"
+            );
+            assert!(
+                cx.debug_bounds(content_selector).is_some(),
+                "{content_selector} should render after selecting {expected:?}"
+            );
+        }
     }
 }

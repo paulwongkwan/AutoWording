@@ -8,6 +8,7 @@ use crate::config::{
 };
 use crate::metadata::ExistingMetadata;
 use anyhow::{bail, Result};
+use chrono::{Datelike, NaiveDate};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -15,54 +16,75 @@ use std::sync::OnceLock;
 
 pub const KEYWORD_TARGET: usize = KEYWORD_TARGET_DEFAULT;
 
+/// Minimum usable keyword count accepted for a target: 90%, rounded up.
+/// A reply below this floor is retried and then treated as a failed generation.
+pub fn minimum_keyword_count(keyword_target: usize) -> usize {
+    let target = clamp_keyword_target(keyword_target);
+    (target * 9 + 9) / 10
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GeneratedMetadata {
     pub title: String,
     pub caption: String,
     pub keywords: Vec<String>,
     pub editorial: bool,
+    /// Risks that should be checked by a human before the metadata is written.
+    #[serde(default)]
+    pub review_reasons: Vec<String>,
 }
 
 const SYSTEM_TEMPLATE: &str = r#"Role & Task:
 You are an expert photography analyst specializing in metadata tag generation, keywording, and stock image description. Analyze the provided image and generate accurate titles, captions, and keywords following strict guidelines.
 
-Analysis Guidelines:
-1. Identification Focus:
-   - Identify specific landmarks, famous buildings, cities, or locations whenever possible.
-   - Specify exact biological classification for fauna and flora (e.g., "Monarch Butterfly - Danaus plexippus", "Quercus robur") rather than broad categories.
-   - Detail vehicle makes, models, and types, along with specific technical or industrial objects.
+Accuracy and safety rules:
+1. Ground every claim in the image or supplied data.
+   - Name a landmark, building, city, country, species, brand, person, or event only when it is clearly identifiable from visible evidence or supplied GPS/context.
+   - Never guess a location, date, event, name, brand, species, or release status. If uncertain, use a generic description and add a review reason.
+   - Do not include trademarks, brand names, product names, real people's names, personal information, URLs, email addresses, phone numbers, or hashtags in commercial metadata.
 2. Commercial vs. Editorial Status:
-   - Check for recognizable human faces.
-   - If a recognizable face is present, mark the image as EDITORIAL and construct the caption following the Shutterstock standard format:
+   - Mark EDITORIAL when the image contains a recognizable face, logo/trademark, private property, minor, or newsworthy/sensitive event, unless the supplied release status says commercial use is cleared.
+   - For documentary editorial content, use this exact caption structure:
      CITY, STATE/COUNTRY – MONTH DAY, YEAR: [Factual sentence describing the subject matter].
-   - Use today's date for the editorial timestamp.
+   - Use the supplied editorial date only. It must be the date the image was taken. If the supplied date is not a capture date, do not invent one; add `uncertain-date` to Review.
+   - The editorial location must come from supplied GPS/context. If no location is supplied, do not invent one; add `uncertain-location` to Review.
 
-Today's date: {DATE}
+Editorial date supplied for this request: {DATE}
 
 Output Formatting Constraints:
 
 1. Title:
    - Length: Between {TITLE_MIN_WORDS} and {TITLE_MAX_WORDS} words.
-   - Content: Clear, descriptive summary of the primary subject.
+   - Content: A complete descriptive sentence about the primary subject, not a comma-separated keyword list.
+   - Language: English letters only. No accented or non-English letters.
+   - Do not use special characters, promotional language, URLs, contact details, or all caps.
 
 2. Caption:
    - Length: Strict limit of {CAPTION_MIN_CHARS} to {CAPTION_MAX_CHARS} characters (including spaces).
-   - Content: Factual description of the scene (or Shutterstock editorial format if applicable).
+   - Content: Factual description of the scene (or the editorial structure above).
+   - Language: English letters only. No accented or non-English letters.
+   - Do not use promotional language, URLs, contact details, hashtags, or keyword stuffing.
 
 3. Keywords:
    - Quantity: Exactly {KEYWORD_TARGET} keywords.
    - Format: Single words only (no multi-word phrases/keyphrases).
    - Separator: Comma-separated.
-   - Rules: Alphabetic characters only. No numbers, punctuation, or special characters.
+   - Rules: English letters only (A-Z, a-z). No numbers, punctuation, special characters, or accented letters.
+   - Relevance: Only include terms visibly supported by the image. Remove generic filler, title repeats, brands, real-person names, and speculative concepts. Do not pad the list just to reach the target.
    - Duplicates: Do not include a plural when its singular form is also present. Keep the singular (for example, keep "apple" and omit "apples").
+
+4. Review:
+   - Write `None` when there are no risks.
+   - Otherwise use a semicolon-separated list of short reasons, such as `face; logo; private-property; minor; sensitive; uncertain-date; uncertain-location; uncertain-identity; other`.
 
 Required Output Schema:
 Title: [{TITLE_MIN_WORDS}-{TITLE_MAX_WORDS} words]
 Editorial Status: [Commercial / Editorial]
 Caption: [{CAPTION_MIN_CHARS}-{CAPTION_MAX_CHARS} characters]
 Keywords: [word1, word2, word3, ... word{KEYWORD_TARGET}]
+Review: [None or semicolon-separated reasons]
 
-Reply with the four labelled lines above and nothing else. Do not use markdown."#;
+Reply with the five labelled lines above and nothing else. Do not use markdown."#;
 
 #[cfg(test)]
 pub fn system_prompt(date: &str, extra: &str) -> String {
@@ -122,7 +144,7 @@ pub fn user_prompt(context: Option<&str>, existing: Option<&ExistingMetadata>) -
         prompt.push_str("\n\n");
     }
     prompt.push_str(
-        "Analyze the attached image and return the four labelled fields exactly as specified.",
+        "Analyze the attached image and return the five labelled fields exactly as specified.",
     );
     prompt
 }
@@ -143,20 +165,34 @@ pub fn retry_prompt(
     let (caption_min, caption_max) = clamp_caption_char_range(caption_range.0, caption_range.1);
     let words = title_word_count(&previous.title);
     let chars = caption_char_count(&previous.caption);
-    let title_ok = (title_min..=title_max).contains(&words);
-    let caption_ok = (caption_min..=caption_max).contains(&chars);
-    let keywords_short = previous.keywords.len() < target;
+    let title_length_ok = (title_min..=title_max).contains(&words);
+    let caption_length_ok = (caption_min..=caption_max).contains(&chars);
+    let title_english_ok = !contains_non_english_letters(&previous.title);
+    let caption_english_ok = !contains_non_english_letters(&previous.caption);
+    let title_ok = title_length_ok && title_english_ok;
+    let caption_ok = caption_length_ok && caption_english_ok;
+    let minimum_keywords = minimum_keyword_count(target);
+    let keywords_short = previous.keywords.len() < minimum_keywords;
 
     let mut issues = Vec::new();
-    if !title_ok {
+    if !title_length_ok {
         issues.push(format!(
             "The title has {words} words; it must have {title_min}–{title_max}."
         ));
     }
-    if !caption_ok {
+    if !title_english_ok {
+        issues
+            .push("The title contains non-English letters; use English letters only.".to_string());
+    }
+    if !caption_length_ok {
         issues.push(format!(
             "The caption has {chars} characters; it must have {caption_min}–{caption_max} characters."
         ));
+    }
+    if !caption_english_ok {
+        issues.push(
+            "The caption contains non-English letters; use English letters only.".to_string(),
+        );
     }
     if keywords_short {
         let verb = if previous.keywords.len() == 1 {
@@ -165,7 +201,7 @@ pub fn retry_prompt(
             "keywords were"
         };
         issues.push(format!(
-            "Only {} usable {verb} returned; exactly {target} are required.",
+            "Only {} usable {verb} returned; at least {minimum_keywords} are required (target {target}).",
             previous.keywords.len()
         ));
     }
@@ -177,9 +213,15 @@ pub fn retry_prompt(
         prompt.push_str(&issue);
         prompt.push('\n');
     }
-    prompt.push_str("\nReturn the four labelled fields again. ");
+    prompt.push_str("\nReturn the five labelled fields again. ");
     if title_ok {
         prompt.push_str("Keep the title unchanged. ");
+    } else if !title_english_ok && title_length_ok {
+        prompt.push_str("Rewrite the title using English letters only. ");
+    } else if !title_english_ok {
+        prompt.push_str(&format!(
+            "Rewrite the title to {title_min}–{title_max} words using English letters only. "
+        ));
     } else {
         prompt.push_str(&format!(
             "Rewrite the title to {title_min}–{title_max} words. "
@@ -187,6 +229,12 @@ pub fn retry_prompt(
     }
     if caption_ok {
         prompt.push_str("Keep the caption unchanged. ");
+    } else if !caption_english_ok && caption_length_ok {
+        prompt.push_str("Rewrite the caption using English letters only. ");
+    } else if !caption_english_ok {
+        prompt.push_str(&format!(
+            "Rewrite the caption to {caption_min}–{caption_max} characters using English letters only. "
+        ));
     } else {
         prompt.push_str(&format!(
             "Rewrite the caption to {caption_min}–{caption_max} characters. "
@@ -194,7 +242,7 @@ pub fn retry_prompt(
     }
     if keywords_short {
         prompt.push_str(&format!(
-            "Return exactly {target} unique single-word keywords, adding enough new terms that were not in the previous list. Previous keywords: {}. ",
+            "Return at least {minimum_keywords} unique single-word keywords, adding enough new terms that were not in the previous list. Previous keywords: {}. ",
             previous.keywords.join(", ")
         ));
     } else {
@@ -205,12 +253,12 @@ pub fn retry_prompt(
 }
 
 /// Prompt used when a reply could not be parsed at all. It repeats the original
-/// request, restates the four labelled lines, and shows the model its previous
+/// request, restates the five labelled lines, and shows the model its previous
 /// reply so a formatting mistake can be corrected instead of failing the image.
 pub fn unparsable_reply_prompt(base: &str, previous_raw: &str) -> String {
     let mut prompt = String::from(base);
     prompt.push_str(
-        "\n\nYour previous reply could not be read because it was missing one or more of the four labelled fields. Reply again with only these lines, each label followed by a colon:\nTitle: ...\nEditorial Status: ...\nCaption: ...\nKeywords: ...\n\nPrevious reply:\n",
+        "\n\nYour previous reply could not be read because it was missing one or more of the five labelled fields. Reply again with only these lines, each label followed by a colon:\nTitle: ...\nEditorial Status: ...\nCaption: ...\nKeywords: ...\nReview: ...\n\nPrevious reply:\n",
     );
     prompt.push_str(&super::snippet(previous_raw));
     prompt
@@ -266,7 +314,7 @@ fn field_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:^|[\s,;])(?:\d+[.)]\s*)?(?:[*#>\-]+\s*)?(Title|Editorial\s+Status|Editorial|Caption|Description|Keywords?)\s*\**\s*[:\u{FF1A}]",
+            r"(?i)(?:^|[\s,;])(?:\d+[.)]\s*)?(?:[*#>\-]+\s*)?(Title|Editorial\s+Status|Editorial|Caption|Description|Keywords?|Review|Safety)\s*\**\s*[:\u{FF1A}]",
         )
         .expect("valid field regex")
     })
@@ -280,6 +328,8 @@ fn label_key(label: &str) -> &'static str {
         "editorial"
     } else if lower.starts_with("caption") || lower.starts_with("description") {
         "caption"
+    } else if lower.starts_with("review") || lower.starts_with("safety") {
+        "review"
     } else {
         "keywords"
     }
@@ -300,6 +350,8 @@ fn clean_value(value: &str) -> String {
                 cleaned.push(' ');
             }
             last_space = true;
+        } else if ch.is_control() {
+            continue;
         } else {
             cleaned.push(ch);
             last_space = false;
@@ -366,6 +418,7 @@ fn parse_response_inner(
         .get("editorial")
         .cloned()
         .unwrap_or_else(|| "Commercial".to_string());
+    let review_raw = fields.get("review").cloned().unwrap_or_default();
 
     let keywords = normalize_keywords_with_target(&keyword_raw, target);
 
@@ -399,6 +452,7 @@ fn parse_response_inner(
         caption,
         keywords,
         editorial,
+        review_reasons: parse_review_reasons(&review_raw),
     })
 }
 
@@ -411,6 +465,196 @@ pub fn normalize_keywords(raw: &str) -> Vec<String> {
 /// Same as [`normalize_keywords`], but uses the user's target. Exact duplicates
 /// and singular/plural pairs are removed before the list is capped, so excess
 /// terms do not crowd out valid alternatives.
+const KEYWORD_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "had", "has", "have", "her",
+    "his", "i", "in", "into", "is", "it", "its", "of", "on", "onto", "or", "our", "over", "that",
+    "the", "their", "they", "this", "to", "under", "was", "we", "were", "with", "you", "your",
+];
+
+const GENERIC_KEYWORDS: &[&str] = &[
+    "adobe",
+    "alamy",
+    "background",
+    "concept",
+    "copy",
+    "depositphotos",
+    "dreamstime",
+    "getty",
+    "image",
+    "istock",
+    "photo",
+    "photograph",
+    "photography",
+    "picture",
+    "pond5",
+    "shutterstock",
+    "space",
+    "stock",
+];
+
+fn is_noise_keyword(keyword: &str) -> bool {
+    let lower = keyword.to_ascii_lowercase();
+    KEYWORD_STOPWORDS.contains(&lower.as_str()) || GENERIC_KEYWORDS.contains(&lower.as_str())
+}
+
+/// Parse the optional `Review:` field into human-facing review reasons.
+fn parse_review_reasons(raw: &str) -> Vec<String> {
+    let mut reasons: Vec<String> = raw
+        .split([';', '|', '\n', '\r'])
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| {
+            reason
+                .trim_matches(|c: char| c == '.' || c == '*' || c == '`')
+                .trim()
+        })
+        .filter(|reason| {
+            !reason.is_empty()
+                && !reason.eq_ignore_ascii_case("none")
+                && !reason.eq_ignore_ascii_case("no review")
+        })
+        .map(ToString::to_string)
+        .collect();
+    reasons.dedup();
+    reasons
+}
+
+/// Convert common EXIF capture-date forms into the editorial caption date.
+pub fn format_capture_date(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let prefix: String = raw.chars().take(10).collect();
+    for pattern in ["%Y:%m:%d", "%Y-%m-%d", "%Y/%m/%d"] {
+        if let Ok(date) = NaiveDate::parse_from_str(&prefix, pattern) {
+            return Some(format!(
+                "{} {}, {}",
+                date.format("%B"),
+                date.day(),
+                date.year()
+            ));
+        }
+    }
+    for pattern in ["%B %d, %Y", "%b %d, %Y", "%B %e, %Y"] {
+        if let Ok(date) = NaiveDate::parse_from_str(raw, pattern) {
+            return Some(format!(
+                "{} {}, {}",
+                date.format("%B"),
+                date.day(),
+                date.year()
+            ));
+        }
+    }
+    None
+}
+
+fn contains_contact_info(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("www.")
+        || lower.contains('@')
+        || lower.contains('#')
+        || lower.contains("tel:")
+        || lower.contains("phone")
+}
+
+fn is_all_caps(text: &str) -> bool {
+    let letters: Vec<char> = text.chars().filter(|ch| ch.is_ascii_alphabetic()).collect();
+    letters.len() >= 6 && letters.iter().all(|ch| ch.is_ascii_uppercase())
+}
+
+fn looks_like_keyword_list(title: &str) -> bool {
+    title.matches(',').count() >= 2
+}
+
+fn contains_promotional_language(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "buy",
+        "sale",
+        "discount",
+        "best ",
+        "amazing",
+        "stunning",
+        "beautiful",
+        "click here",
+        "subscribe",
+        "follow us",
+        "stock photo",
+        "image of",
+        "photo of",
+        "picture of",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+fn is_editorial_caption(caption: &str) -> bool {
+    let Some((head, _body)) = caption.split_once(':') else {
+        return false;
+    };
+    let Some((place, date)) = head.rsplit_once('–').or_else(|| head.rsplit_once('-')) else {
+        return false;
+    };
+    let place = place.trim();
+    let date = date.trim().to_ascii_lowercase();
+    place.contains(',')
+        && [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ]
+        .iter()
+        .any(|month| date.contains(month))
+}
+
+/// Deterministic stock-safety checks that do not need another model request.
+/// These become review reasons rather than silent rewrites when the problem is
+/// factual or policy-related.
+pub fn stock_review_reasons(
+    title: &str,
+    caption: &str,
+    keywords: &[String],
+    editorial: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    if editorial {
+        reasons.push("Verify editorial date, location, and releases before saving".to_string());
+    }
+    if contains_contact_info(title) || contains_contact_info(caption) {
+        reasons.push("Remove URLs, contact details, hashtags, or promotional links".to_string());
+    }
+    if is_all_caps(title) {
+        reasons.push("Title is all caps".to_string());
+    }
+    if looks_like_keyword_list(title) {
+        reasons.push("Title looks like a comma-separated keyword list".to_string());
+    }
+    if contains_promotional_language(title) || contains_promotional_language(caption) {
+        reasons.push("Remove promotional or subjective sales language".to_string());
+    }
+    if editorial && !is_editorial_caption(caption) {
+        reasons.push(
+            "Editorial caption must use CITY, STATE/COUNTRY – MONTH DAY, YEAR: format".to_string(),
+        );
+    }
+    if keywords.iter().any(|keyword| is_noise_keyword(keyword)) {
+        reasons.push("Remove generic or stopword keywords".to_string());
+    }
+
+    reasons.dedup();
+    reasons
+}
+
 pub fn normalize_keywords_with_target(raw: &str, keyword_target: usize) -> Vec<String> {
     let target = clamp_keyword_target(keyword_target);
     let mut keywords: Vec<String> = Vec::with_capacity(target);
@@ -420,8 +664,13 @@ pub fn normalize_keywords_with_target(raw: &str, keyword_target: usize) -> Vec<S
         raw.split(|c: char| c == ',' || c == ';' || c == '\n' || c == '\r' || c == '|' || c == '/')
     {
         for word in chunk.split_whitespace() {
-            let cleaned: String = word.chars().filter(|c| c.is_alphabetic()).collect();
-            if cleaned.chars().count() < 2 {
+            // Drop the whole keyword rather than truncating an accented or
+            // non-English word into a misleading ASCII fragment.
+            if word.chars().any(|c| !c.is_ascii()) {
+                continue;
+            }
+            let cleaned: String = word.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            if cleaned.chars().count() < 2 || is_noise_keyword(&cleaned) {
                 continue;
             }
             if seen.insert(cleaned.to_lowercase()) {
@@ -550,8 +799,16 @@ pub fn is_plural_of(plural: &str, singular: &str) -> bool {
         .any(|candidate| candidate == &singular)
 }
 
+/// True when text contains letters outside the English ASCII alphabet.
+/// ASCII digits, punctuation and whitespace are allowed; accented letters,
+/// Cyrillic, CJK and other non-English letters are not.
+pub fn contains_non_english_letters(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch.is_alphabetic() && !ch.is_ascii_alphabetic())
+}
+
 pub fn is_valid_keyword(word: &str) -> bool {
-    word.chars().count() >= 2 && word.chars().all(|c| c.is_alphabetic())
+    word.chars().count() >= 2 && word.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 pub fn title_word_count(title: &str) -> usize {
@@ -594,6 +851,10 @@ pub fn validate_with_constraints(
         ));
     }
 
+    if contains_non_english_letters(title) {
+        warnings.push("Title contains non-English characters".to_string());
+    }
+
     let chars = caption_char_count(caption);
     if !(caption_min..=caption_max).contains(&chars) {
         warnings.push(format!(
@@ -601,15 +862,20 @@ pub fn validate_with_constraints(
         ));
     }
 
-    if keywords.len() != target {
+    if contains_non_english_letters(caption) {
+        warnings.push("Caption contains non-English characters".to_string());
+    }
+
+    let minimum_keywords = minimum_keyword_count(target);
+    if keywords.len() < minimum_keywords {
         warnings.push(format!(
-            "{} keywords (needs exactly {target})",
+            "{} keywords (needs at least {minimum_keywords} of {target})",
             keywords.len()
         ));
     }
 
     if let Some(bad) = keywords.iter().find(|k| !is_valid_keyword(k)) {
-        warnings.push(format!("Keyword “{bad}” is not a single alphabetic word"));
+        warnings.push(format!("Keyword “{bad}” is not a single English word"));
     }
 
     warnings
@@ -683,6 +949,61 @@ mod tests {
                 .filter(|k| k.eq_ignore_ascii_case("orange"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn non_english_keywords_are_removed_and_text_is_flagged() {
+        assert_eq!(
+            normalize_keywords("Sunset, café, 東京, naïve, blue, cafe"),
+            vec!["Sunset", "blue", "cafe"]
+        );
+        assert!(contains_non_english_letters("Café at dawn"));
+        assert!(contains_non_english_letters("東京"));
+        assert!(!contains_non_english_letters("Cafe - dawn, 2026"));
+        assert!(!is_valid_keyword("café"));
+        assert!(is_valid_keyword("cafe"));
+
+        let keywords = unique_words(KEYWORD_TARGET);
+        assert!(validate("Café at dawn", &"a".repeat(50), &keywords)
+            .iter()
+            .any(|warning| warning.contains("Title contains non-English")));
+        assert!(validate(
+            "Three Word Title",
+            &format!("café {}", "a".repeat(50)),
+            &keywords
+        )
+        .iter()
+        .any(|warning| warning.contains("Caption contains non-English")));
+    }
+
+    #[test]
+    fn review_field_and_stock_safety_checks_are_parsed() {
+        let reply = "Title: London Street Scene\nEditorial Status: Editorial\nCaption: London, UK – April 19, 2026: A factual street scene with people walking past shops.\nKeywords: apple, banana, cherry\nReview: face; uncertain-location";
+        let parsed = parse_response(reply).expect("parse review field");
+        assert_eq!(parsed.review_reasons, vec!["face", "uncertain-location"]);
+        assert_eq!(
+            format_capture_date("2026:04:19 20:14:03"),
+            Some("April 19, 2026".to_string())
+        );
+        assert_eq!(format_capture_date("not a date"), None);
+
+        let reasons = stock_review_reasons(
+            "London Street Scene",
+            "London, UK – April 19, 2026: A factual street scene with people walking past shops.",
+            &["apple".to_string(), "banana".to_string()],
+            true,
+        );
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("Verify editorial")));
+        assert!(!reasons
+            .iter()
+            .any(|reason| reason.contains("must use CITY")));
+
+        assert_eq!(
+            normalize_keywords("the, photo, sunset, image, mountain"),
+            vec!["sunset", "mountain"]
         );
     }
 
@@ -778,7 +1099,7 @@ mod tests {
     fn system_prompt_omits_extra_section_when_blank() {
         let prompt = system_prompt("November 5, 2026", "   \n  ");
         assert!(!prompt.contains("Additional instructions"));
-        assert!(prompt.contains("Shutterstock standard format"));
+        assert!(prompt.contains("exact caption structure"));
         assert!(prompt.contains("November 5, 2026"));
     }
 
@@ -856,10 +1177,7 @@ mod tests {
     fn normalisation_handles_empty_unicode_and_separators() {
         assert!(normalize_keywords("").is_empty());
         assert!(normalize_keywords(" , ; | \n ").is_empty());
-        assert_eq!(
-            normalize_keywords("Café, naïve, 北京"),
-            vec!["Café", "naïve", "北京"]
-        );
+        assert!(normalize_keywords("Café, naïve, 北京").is_empty());
         assert_eq!(
             normalize_keywords("aa, bb; cc|dd\nee/ff"),
             vec!["aa", "bb", "cc", "dd", "ee", "ff"]
@@ -879,9 +1197,40 @@ mod tests {
         assert!(!is_valid_keyword(""));
         assert!(!is_valid_keyword("two words"));
         assert!(!is_valid_keyword("abc1"));
+        assert!(!is_valid_keyword("Café"));
+        assert!(!is_valid_keyword("北京"));
         assert!(is_valid_keyword("AB"));
-        assert!(is_valid_keyword("Café"));
-        assert!(is_valid_keyword("北京"));
+        assert!(is_valid_keyword("Cafe"));
+    }
+
+    #[test]
+    fn keyword_floor_is_ninety_percent_rounded_up() {
+        assert_eq!(minimum_keyword_count(0), 1);
+        assert_eq!(minimum_keyword_count(1), 1);
+        assert_eq!(minimum_keyword_count(3), 3);
+        assert_eq!(minimum_keyword_count(10), 9);
+        assert_eq!(minimum_keyword_count(11), 10);
+        assert_eq!(minimum_keyword_count(49), 45);
+        assert_eq!(minimum_keyword_count(50), 45);
+    }
+
+    #[test]
+    fn keyword_validation_accepts_ninety_percent_of_target() {
+        let validate_count = |count| {
+            validate_with_constraints(
+                "Three Word Title",
+                &"a".repeat(80),
+                &unique_words(count),
+                10,
+                (3, 5),
+                (50, 180),
+            )
+        };
+
+        assert!(validate_count(9).is_empty(), "9 of 10 is 90%");
+        assert!(validate_count(8)
+            .iter()
+            .any(|warning| warning.contains("needs at least 9 of 10")));
     }
 
     #[test]
@@ -913,12 +1262,12 @@ mod tests {
         keywords[0] = "two words".to_string();
         let warnings = validate("Three Word Title", &"a".repeat(80), &keywords);
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
-        assert!(warnings[0].contains("not a single alphabetic word"));
+        assert!(warnings[0].contains("not a single English word"));
 
-        let warnings = validate("Three Word Title", &"a".repeat(80), &unique_words(49));
+        let warnings = validate("Three Word Title", &"a".repeat(80), &unique_words(44));
         assert!(warnings
             .iter()
-            .any(|warning| warning.contains("49 keywords")));
+            .any(|warning| warning.contains("44 keywords")));
     }
 
     #[test]
@@ -978,10 +1327,12 @@ mod tests {
             caption: "short".to_string(),
             keywords: vec!["apple".to_string()],
             editorial: false,
+            review_reasons: Vec::new(),
         };
         let prompt = retry_prompt(None, None, 5, (3, 5), (50, 180), &previous);
         assert!(prompt.contains("Only 1 usable keyword was returned"));
-        assert!(prompt.contains("exactly 5"));
+        assert!(prompt.contains("at least 5 are required"));
+        assert!(prompt.contains("target 5"));
         assert!(prompt.contains("apple"));
         assert!(prompt.contains("keep the singular"));
         assert!(prompt.contains("title has 6 words"));
@@ -995,7 +1346,7 @@ mod tests {
     #[test]
     fn unparsable_reply_prompt_restates_labels_and_previous_reply() {
         let prompt = unparsable_reply_prompt(
-            "Analyze the attached image and return the four labelled fields exactly as specified.",
+            "Analyze the attached image and return the five labelled fields exactly as specified.",
             "Sure! Here is a photo of a bridge.\nIt looks nice.",
         );
         assert!(prompt.starts_with("Analyze the attached image"));
@@ -1003,6 +1354,7 @@ mod tests {
         assert!(prompt.contains("Editorial Status: ..."));
         assert!(prompt.contains("Caption: ..."));
         assert!(prompt.contains("Keywords: ..."));
+        assert!(prompt.contains("Review: ..."));
         assert!(prompt.contains("Sure! Here is a photo of a bridge. It looks nice."));
     }
 

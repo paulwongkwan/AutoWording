@@ -1,4 +1,4 @@
-use crate::ai::prompt::GeneratedMetadata;
+use crate::ai::prompt::{minimum_keyword_count, GeneratedMetadata};
 use crate::config::Provider;
 use crate::metadata::{ExifTool, ExistingMetadata, Metadata};
 use gpui_kit::RenderImage;
@@ -14,6 +14,7 @@ pub enum Status {
     Queued,
     Processing,
     Generated,
+    Review,
     Saved,
     Error,
 }
@@ -25,6 +26,7 @@ impl Status {
             Status::Queued => "In queue",
             Status::Processing => "Processing",
             Status::Generated => "Generated",
+            Status::Review => "Review",
             Status::Saved => "Saved",
             Status::Error => "Failed",
         }
@@ -37,7 +39,8 @@ impl Status {
             Status::Processing => 2,
             Status::Error => 3,
             Status::Generated => 4,
-            Status::Saved => 5,
+            Status::Review => 5,
+            Status::Saved => 6,
         }
     }
 }
@@ -50,18 +53,20 @@ pub enum StatusFilter {
     Queued,
     Processing,
     Generated,
+    Review,
     Saved,
     Failed,
     Modified,
 }
 
 impl StatusFilter {
-    pub const ALL: [StatusFilter; 8] = [
+    pub const ALL: [StatusFilter; 9] = [
         StatusFilter::All,
         StatusFilter::Pending,
         StatusFilter::Queued,
         StatusFilter::Processing,
         StatusFilter::Generated,
+        StatusFilter::Review,
         StatusFilter::Saved,
         StatusFilter::Failed,
         StatusFilter::Modified,
@@ -74,6 +79,7 @@ impl StatusFilter {
             StatusFilter::Queued => "Queued",
             StatusFilter::Processing => "Processing",
             StatusFilter::Generated => "Generated",
+            StatusFilter::Review => "Review",
             StatusFilter::Saved => "Saved",
             StatusFilter::Failed => "Failed",
             StatusFilter::Modified => "Modified",
@@ -87,10 +93,15 @@ impl StatusFilter {
             StatusFilter::Queued => item.status == Status::Queued,
             StatusFilter::Processing => item.status == Status::Processing,
             StatusFilter::Generated => item.status == Status::Generated,
+            StatusFilter::Review => item.status == Status::Review,
             StatusFilter::Saved => item.status == Status::Saved,
             StatusFilter::Failed => item.status == Status::Error,
             StatusFilter::Modified => {
-                item.dirty && matches!(item.status, Status::Generated | Status::Saved)
+                item.dirty
+                    && matches!(
+                        item.status,
+                        Status::Generated | Status::Review | Status::Saved
+                    )
             }
         }
     }
@@ -125,8 +136,8 @@ impl SortMode {
 
 /// Whether a generation run should leave this image alone. Saved images stay
 /// untouched even when their metadata is partial; Force regenerate overrides.
-pub fn should_skip_generation(item: &ImageItem) -> bool {
-    item.should_skip_generation()
+pub fn should_skip_generation(item: &ImageItem, keyword_target: usize) -> bool {
+    item.should_skip_generation(keyword_target)
 }
 
 /// Split requested paths into (skipped, targets) for a generation run.
@@ -137,13 +148,17 @@ pub fn partition_generation_targets(
     paths: Vec<PathBuf>,
     items: &HashMap<PathBuf, ImageItem>,
     force: bool,
+    keyword_target: usize,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if force {
         return (Vec::new(), paths);
     }
-    paths
-        .into_iter()
-        .partition(|path| items.get(path).map(should_skip_generation).unwrap_or(false))
+    paths.into_iter().partition(|path| {
+        items
+            .get(path)
+            .map(|item| should_skip_generation(item, keyword_target))
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -171,6 +186,7 @@ pub fn apply_generated_metadata(item: &mut ImageItem, generated: GeneratedMetada
     if !item.locks.keywords {
         item.keywords = generated.keywords;
     }
+    item.review_reasons = generated.review_reasons;
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +198,8 @@ pub struct ImageItem {
     pub keywords: Vec<String>,
     pub editorial: bool,
     pub dirty: bool,
+    /// Stock-policy or factual risks that must be reviewed before saving.
+    pub review_reasons: Vec<String>,
     pub locks: FieldLocks,
     pub message: Option<String>,
     pub dims: Option<(u32, u32)>,
@@ -205,6 +223,7 @@ impl ImageItem {
             keywords: Vec::new(),
             editorial: false,
             dirty: false,
+            review_reasons: Vec::new(),
             locks: FieldLocks::default(),
             message: None,
             dims: None,
@@ -236,33 +255,34 @@ impl ImageItem {
         !self.title.trim().is_empty()
     }
 
-    /// True when the full set of generated fields is present.
-    pub fn is_complete(&self) -> bool {
+    /// True when the full set of generated fields is present, including at
+    /// least 90% of the configured keyword target (rounded up).
+    pub fn is_complete(&self, keyword_target: usize) -> bool {
         !self.title.trim().is_empty()
             && !self.caption.trim().is_empty()
-            && !self.keywords.is_empty()
+            && self.keywords.len() >= minimum_keyword_count(keyword_target)
     }
 
     /// Fill empty fields from metadata read out of the file. A file that
-    /// already has a title, caption and keywords is marked `Saved` instead of
-    /// `Pending`, because nothing is left to generate for it; partially filled
-    /// files stay `Pending` so AI can complete them.
-    pub fn adopt_existing_metadata(&mut self, meta: ExistingMetadata) {
+    /// already has a title, caption and at least 90% of the keyword target is
+    /// marked `Saved`; files below that floor stay `Pending` so AI can complete
+    /// them. Partially filled files also stay `Pending`.
+    pub fn adopt_existing_metadata(&mut self, meta: ExistingMetadata, keyword_target: usize) {
         if self.title.is_empty() && self.caption.is_empty() && self.keywords.is_empty() {
             self.title = meta.title.unwrap_or_default();
             self.caption = meta.caption.unwrap_or_default();
             self.keywords = meta.keywords;
             self.dirty = false;
         }
-        if self.status == Status::Pending && self.is_complete() {
+        if self.status == Status::Pending && self.is_complete(keyword_target) {
             self.status = Status::Saved;
         }
     }
 
     /// Already written to disk with a full metadata set and untouched since,
     /// so batch generation can skip it instead of spending a model request.
-    pub fn is_finished(&self) -> bool {
-        self.status == Status::Saved && !self.dirty && self.is_complete()
+    pub fn is_finished(&self, keyword_target: usize) -> bool {
+        self.status == Status::Saved && !self.dirty && self.is_complete(keyword_target)
     }
 
     /// True while a fresh card is waiting for its folder metadata read. Once
@@ -272,9 +292,10 @@ impl ImageItem {
     }
 
     /// The queue sweep's rule: never generate for a saved image or one that
-    /// already has a full metadata set. Force regenerate overrides this.
-    pub fn should_skip_generation(&self) -> bool {
-        self.status == Status::Saved || self.is_complete()
+    /// already has a full metadata set for the configured keyword target.
+    /// Force regenerate overrides this.
+    pub fn should_skip_generation(&self, keyword_target: usize) -> bool {
+        self.status == Status::Saved || self.is_complete(keyword_target)
     }
 
     #[allow(dead_code)]
@@ -359,6 +380,7 @@ pub fn sort_image_paths(
 pub struct BatchProgress {
     pub total: usize,
     pub done: usize,
+    pub failed: usize,
     pub saving: bool,
     /// Duration of the most recently finished image attempt, used to estimate
     /// the time left without averaging in stale work.
@@ -432,6 +454,11 @@ impl<T> AiQueue<T> {
 
     pub fn next(&mut self) -> Option<AiQueueEntry<T>> {
         self.queue.pop_front()
+    }
+
+    /// Add a fresh attempt to the back of the queue.
+    pub fn push(&mut self, item: T) {
+        self.queue.push_back(AiQueueEntry { item, retries: 0 });
     }
 
     /// Requeue a failed entry. Returns the retry number when accepted, or
@@ -624,11 +651,12 @@ impl Selection {
 pub enum WorkerEvent {
     Thumbnail {
         path: PathBuf,
-        image: DecodedImage,
+        image: Arc<RenderImage>,
     },
     Preview {
         path: PathBuf,
-        image: DecodedImage,
+        image: Arc<RenderImage>,
+        generation: u64,
     },
     ImageFailed {
         path: PathBuf,
@@ -662,6 +690,11 @@ pub enum WorkerEvent {
     BatchSaved {
         ok: usize,
         failed: usize,
+    },
+    FolderScanned {
+        dir: PathBuf,
+        files: Vec<PathBuf>,
+        generation: u64,
     },
     MetaLoaded {
         path: PathBuf,
@@ -810,7 +843,7 @@ pub fn append_keywords_with_target(
             break;
         }
         let keyword = keyword.trim();
-        if keyword.is_empty() {
+        if keyword.is_empty() || !crate::ai::prompt::is_valid_keyword(keyword) {
             continue;
         }
         if existing
@@ -848,14 +881,15 @@ pub struct DecodedImage {
 
 impl DecodedImage {
     /// Convert the decoded pixels into a GPUI image. GPUI stores BGRA, so the
-    /// red and blue channels are swapped once here rather than on every frame.
-    pub fn to_render_image(&self) -> Arc<RenderImage> {
-        let mut pixels = self.pixels.clone();
-        for pixel in pixels.chunks_exact_mut(4) {
+    /// red and blue channels are swapped once here. This consumes the pixel
+    /// buffer so the worker thread can hand the UI an image without copying it.
+    pub fn into_render_image(mut self) -> Arc<RenderImage> {
+        for pixel in self.pixels.chunks_exact_mut(4) {
             pixel.swap(0, 2);
         }
-        let buffer = image::RgbaImage::from_raw(self.size[0] as u32, self.size[1] as u32, pixels)
-            .expect("decoded image dimensions match its pixel buffer");
+        let buffer =
+            image::RgbaImage::from_raw(self.size[0] as u32, self.size[1] as u32, self.pixels)
+                .expect("decoded image dimensions match its pixel buffer");
         Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
     }
 }
@@ -911,6 +945,10 @@ mod tests {
 
     fn paths(names: &[&str]) -> Vec<PathBuf> {
         names.iter().map(PathBuf::from).collect()
+    }
+
+    fn keyword_list(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("keyword{index}")).collect()
     }
 
     #[test]
@@ -1047,6 +1085,11 @@ mod tests {
         assert!(image_matches(&item, "", StatusFilter::Failed));
         assert!(!image_matches(&item, "", StatusFilter::Pending));
 
+        item.status = Status::Review;
+        item.dirty = true;
+        assert!(image_matches(&item, "", StatusFilter::Review));
+        assert!(image_matches(&item, "", StatusFilter::Modified));
+
         item.status = Status::Saved;
         item.dirty = true;
         assert!(image_matches(&item, "", StatusFilter::Modified));
@@ -1100,6 +1143,7 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
+                review_reasons: Vec::new(),
             },
         );
 
@@ -1116,6 +1160,7 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
+                review_reasons: Vec::new(),
             },
         );
         assert_eq!(item.title, "Generated Title");
@@ -1184,41 +1229,70 @@ mod tests {
     #[test]
     fn complete_existing_metadata_loads_as_saved() {
         let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Ready.jpg"));
-        item.adopt_existing_metadata(ExistingMetadata {
-            title: Some("Existing Title".into()),
-            caption: Some("Existing caption.".into()),
-            keywords: vec!["existing".into()],
-            gps: None,
-            date: None,
-            dims: None,
-        });
+        item.adopt_existing_metadata(
+            ExistingMetadata {
+                title: Some("Existing Title".into()),
+                caption: Some("Existing caption.".into()),
+                keywords: keyword_list(9),
+                gps: None,
+                date: None,
+                dims: None,
+            },
+            10,
+        );
         assert_eq!(item.status, Status::Saved);
         assert!(!item.dirty);
+        assert!(item.is_complete(10));
         assert_eq!(item.title, "Existing Title");
         assert_eq!(item.caption, "Existing caption.");
 
+        let mut below_floor = ImageItem::new(PathBuf::from(r"C:\photos\BelowFloor.jpg"));
+        below_floor.adopt_existing_metadata(
+            ExistingMetadata {
+                title: Some("Below Floor".into()),
+                caption: Some("A caption below the keyword floor.".into()),
+                keywords: keyword_list(8),
+                gps: None,
+                date: None,
+                dims: None,
+            },
+            10,
+        );
+        assert_eq!(
+            below_floor.status,
+            Status::Pending,
+            "8 of 10 keywords is below the 90% floor"
+        );
+        assert!(!below_floor.is_complete(10));
+
         let mut partial = ImageItem::new(PathBuf::from(r"C:\photos\Partial.jpg"));
-        partial.adopt_existing_metadata(ExistingMetadata {
-            title: Some("Title only".into()),
-            caption: Some(String::new()),
-            keywords: Vec::new(),
-            gps: None,
-            date: None,
-            dims: None,
-        });
+        partial.adopt_existing_metadata(
+            ExistingMetadata {
+                title: Some("Title only".into()),
+                caption: Some(String::new()),
+                keywords: Vec::new(),
+                gps: None,
+                date: None,
+                dims: None,
+            },
+            10,
+        );
         assert_eq!(partial.status, Status::Pending);
         assert_eq!(partial.title, "Title only");
 
         let mut edited = ImageItem::new(PathBuf::from(r"C:\photos\Edited.jpg"));
         edited.title = "Manual".into();
-        edited.adopt_existing_metadata(ExistingMetadata {
-            title: Some("Existing Title".into()),
-            caption: Some("Existing caption.".into()),
-            keywords: vec!["existing".into()],
-            gps: None,
-            date: None,
-            dims: None,
-        });
+        edited.adopt_existing_metadata(
+            ExistingMetadata {
+                title: Some("Existing Title".into()),
+                caption: Some("Existing caption.".into()),
+                keywords: keyword_list(9),
+                gps: None,
+                date: None,
+                dims: None,
+            },
+            10,
+        );
         assert_eq!(
             edited.title, "Manual",
             "existing values are not overwritten"
@@ -1232,31 +1306,38 @@ mod tests {
         item.status = Status::Saved;
         item.title = "Title".into();
         item.caption = "Caption.".into();
-        item.keywords = vec!["keyword".into()];
-        assert!(item.is_finished());
+        item.keywords = keyword_list(9);
+        assert!(item.is_finished(10));
 
         item.dirty = true;
         assert!(
-            !item.is_finished(),
+            !item.is_finished(10),
             "an edited saved image still needs work"
         );
 
         item.dirty = false;
         item.status = Status::Generated;
         assert!(
-            !item.is_finished(),
+            !item.is_finished(10),
             "generated but unwritten is not finished"
         );
 
         item.status = Status::Saved;
         item.caption.clear();
         assert!(
-            !item.is_finished(),
+            !item.is_finished(10),
             "a saved file with missing fields can still be completed by AI"
         );
 
+        item.caption = "Caption.".into();
+        item.keywords.truncate(8);
+        assert!(
+            !item.is_finished(10),
+            "a saved file below the keyword floor is not finished"
+        );
+
         item.status = Status::Pending;
-        assert!(!item.is_finished());
+        assert!(!item.is_finished(10));
     }
 
     #[test]
@@ -1265,12 +1346,13 @@ mod tests {
         let saved_partial = PathBuf::from("saved-partial.jpg");
         let generated = PathBuf::from("generated.jpg");
         let partial = PathBuf::from("partial.jpg");
+        let below_floor = PathBuf::from("below-floor.jpg");
         let mut items = HashMap::new();
         let mut completed = ImageItem::new(ready.clone());
         completed.status = Status::Saved;
         completed.title = "Title".into();
         completed.caption = "Caption.".into();
-        completed.keywords = vec!["keyword".into()];
+        completed.keywords = keyword_list(9);
         items.insert(ready.clone(), completed);
         let mut saved_partial_item = ImageItem::new(saved_partial.clone());
         saved_partial_item.status = Status::Saved;
@@ -1281,23 +1363,29 @@ mod tests {
         unwritten.dirty = true;
         unwritten.title = "Title".into();
         unwritten.caption = "Caption.".into();
-        unwritten.keywords = vec!["keyword".into()];
+        unwritten.keywords = keyword_list(9);
         items.insert(generated.clone(), unwritten);
         items.insert(partial.clone(), ImageItem::new(partial.clone()));
+        let mut short = ImageItem::new(below_floor.clone());
+        short.title = "Title".into();
+        short.caption = "Caption.".into();
+        short.keywords = keyword_list(8);
+        items.insert(below_floor.clone(), short);
 
         let requested = vec![
             ready.clone(),
             saved_partial.clone(),
             generated.clone(),
             partial.clone(),
+            below_floor.clone(),
         ];
-        let (skipped, targets) = partition_generation_targets(requested.clone(), &items, false);
+        let (skipped, targets) = partition_generation_targets(requested.clone(), &items, false, 10);
         assert_eq!(skipped, vec![ready, saved_partial, generated]);
-        assert_eq!(targets, vec![partial]);
+        assert_eq!(targets, vec![partial, below_floor]);
 
-        let (skipped, targets) = partition_generation_targets(requested, &items, true);
+        let (skipped, targets) = partition_generation_targets(requested, &items, true, 10);
         assert!(skipped.is_empty());
-        assert_eq!(targets.len(), 4);
+        assert_eq!(targets.len(), 5);
     }
 
     #[test]
@@ -1350,6 +1438,7 @@ mod tests {
             BatchProgress {
                 total: 0,
                 done: 0,
+                failed: 0,
                 saving: false,
                 last_image: None
             }
@@ -1360,6 +1449,7 @@ mod tests {
             BatchProgress {
                 total: 4,
                 done: 0,
+                failed: 0,
                 saving: false,
                 last_image: None
             }
@@ -1370,6 +1460,7 @@ mod tests {
             BatchProgress {
                 total: 4,
                 done: 2,
+                failed: 0,
                 saving: false,
                 last_image: None
             }
@@ -1380,6 +1471,7 @@ mod tests {
             BatchProgress {
                 total: 4,
                 done: 4,
+                failed: 0,
                 saving: true,
                 last_image: None
             }
@@ -1393,6 +1485,7 @@ mod tests {
         let mut batch = BatchProgress {
             total: 4,
             done: 1,
+            failed: 0,
             saving: false,
             last_image: Some(Duration::from_secs(10)),
         };
@@ -1615,6 +1708,10 @@ mod tests {
             ],
         );
         assert_eq!(existing, vec!["sunset", "Bay", "fog"]);
+
+        let mut existing = vec!["sunset".to_string()];
+        append_keywords(&mut existing, &["café".to_string(), "東京".to_string()]);
+        assert_eq!(existing, vec!["sunset"]);
 
         let mut full: Vec<String> = (0..50).map(|index| format!("kw{index}")).collect();
         append_keywords(&mut full, &["extra".to_string()]);

@@ -229,6 +229,16 @@ fn lmstudio_endpoint_normalises_v1() {
     );
 }
 
+fn unique_keywords(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let first = (b'a' + (i / 26) as u8) as char;
+            let second = (b'a' + (i % 26) as u8) as char;
+            format!("{first}{second}")
+        })
+        .collect()
+}
+
 #[test]
 fn snippet_collapses_whitespace_and_truncates_long_text() {
     assert_eq!(snippet("a\n\t b   c"), "a b c");
@@ -237,6 +247,75 @@ fn snippet_collapses_whitespace_and_truncates_long_text() {
     assert_eq!(short.chars().count(), 401);
     assert!(short.ends_with('…'));
     assert!(!snippet("short").ends_with('…'));
+}
+
+#[tokio::test]
+async fn generate_accepts_ninety_percent_of_keyword_target() {
+    let keywords = unique_keywords(9).join(", ");
+    let reply = format!(
+        r#"{{"choices":[{{"message":{{"content":"Title: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: {keywords}"}}}}]}}"#
+    );
+    let server = mock_server_sequence(vec![("200 OK", Box::leak(reply.into_boxed_str()))]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 10,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("9 of 10 keywords should be accepted without a retry");
+
+    assert_eq!(result.keywords.len(), 9);
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
+}
+
+#[tokio::test]
+async fn generate_fails_when_a_retry_stays_below_ninety_percent() {
+    let keywords = unique_keywords(8).join(", ");
+    let reply = format!(
+        r#"{{"choices":[{{"message":{{"content":"Title: A Short Title\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: {keywords}"}}}}]}}"#
+    );
+    let server = mock_server_sequence(vec![
+        ("200 OK", Box::leak(reply.clone().into_boxed_str())),
+        ("200 OK", Box::leak(reply.into_boxed_str())),
+    ]);
+
+    let error = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 10,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect_err("8 of 10 keywords should fail after the corrective retry");
+
+    assert!(error
+        .to_string()
+        .contains("at least 9 are required (target 10)"));
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
 }
 
 #[tokio::test]
@@ -304,6 +383,147 @@ async fn generate_retries_out_of_range_title_and_caption() {
     assert!(requests.contains("Rewrite the title to 3–5 words"));
     assert!(requests.contains("Rewrite the caption to 50–180 characters"));
     assert!(requests.contains("Keep the keywords unchanged"));
+}
+
+#[tokio::test]
+async fn generate_retries_non_english_title_and_caption() {
+    let first = r#"{"choices":[{"message":{"content":"Title: Café At Dawn\nEditorial Status: Commercial\nCaption: A charming café scene with people sitting outside in the morning light.\nKeywords: apple, banana, cherry"}}]}"#;
+    let second = r#"{"choices":[{"message":{"content":"Title: Cafe At Dawn\nEditorial Status: Commercial\nCaption: A charming cafe scene with people sitting outside in the morning light.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", first), ("200 OK", second)]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("generate should retry a non-English title and caption");
+
+    assert_eq!(result.title, "Cafe At Dawn");
+    assert!(result.caption.contains("charming cafe"));
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+    assert!(requests.contains("contains non-English letters"));
+    assert!(requests.contains("using English letters only"));
+}
+
+#[tokio::test]
+async fn generate_fails_when_non_english_title_survives_retry() {
+    let reply = r#"{"choices":[{"message":{"content":"Title: Café At Dawn\nEditorial Status: Commercial\nCaption: A charming café scene with people sitting outside in the morning light.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", reply), ("200 OK", reply)]);
+
+    let error = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect_err("a non-English title should fail after the corrective retry");
+
+    assert!(format!("{error:#}").contains("non-English letters"));
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 2);
+}
+
+#[tokio::test]
+async fn generate_marks_editorial_metadata_for_review() {
+    let reply = r#"{"choices":[{"message":{"content":"Title: London Street Scene\nEditorial Status: Editorial\nCaption: London, UK – April 19, 2026: A factual street scene with people walking past shops.\nKeywords: apple, banana, cherry\nReview: None"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", reply)]);
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: None,
+        existing: crate::metadata::ExistingMetadata::default(),
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("editorial metadata should generate");
+
+    assert!(result.editorial);
+    assert!(result
+        .review_reasons
+        .iter()
+        .any(|reason| reason.contains("capture date is missing")));
+    assert!(result
+        .review_reasons
+        .iter()
+        .any(|reason| reason.contains("location source is missing")));
+    let requests = server.finish();
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
+}
+
+#[tokio::test]
+async fn generate_uses_capture_date_for_editorial_prompt() {
+    let reply = r#"{"choices":[{"message":{"content":"Title: London Street Scene\nEditorial Status: Editorial\nCaption: London, UK – April 19, 2026: A factual street scene with people walking past shops.\nKeywords: apple, banana, cherry\nReview: None"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", reply)]);
+    let existing = crate::metadata::ExistingMetadata {
+        date: Some("2026:04:19 20:14:03".to_string()),
+        ..Default::default()
+    };
+
+    let result = generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: Some("London".to_string()),
+        existing,
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("editorial metadata should generate");
+
+    assert!(result.editorial);
+    assert!(!result
+        .review_reasons
+        .iter()
+        .any(|reason| reason.contains("capture date is missing")));
+    assert!(!result
+        .review_reasons
+        .iter()
+        .any(|reason| reason.contains("location source is missing")));
+    let requests = server.finish();
+    assert!(requests.contains("April 19, 2026"));
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
 }
 
 #[tokio::test]

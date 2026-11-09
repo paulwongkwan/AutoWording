@@ -85,6 +85,22 @@ impl Marketplace {
         }
     }
 
+    /// Minimum keywords a stock agency will accept.
+    pub fn keyword_min(self) -> usize {
+        match self {
+            Marketplace::Shutterstock => 7,
+            _ => KEYWORD_TARGET_MIN,
+        }
+    }
+
+    /// Minimum title words a stock agency requires.
+    pub fn title_words_min(self) -> usize {
+        match self {
+            Marketplace::Shutterstock => 5,
+            _ => TITLE_WORDS_MIN,
+        }
+    }
+
     /// Maximum keywords the agency accepts. Adobe Stock is the only agency
     /// here below the app's 50-keyword writer cap.
     pub fn keyword_max(self) -> usize {
@@ -348,6 +364,8 @@ pub struct Config {
     pub theme: ThemePreference,
     /// Browser grid and metadata inspector density.
     pub density: LayoutDensity,
+    /// Whether the inspector rail was collapsed on the last run.
+    pub inspector_collapsed: bool,
     /// Marketplace output profile that caps the generated metadata lengths.
     pub marketplace: Marketplace,
     /// Desired number of keywords per image (clamped to 1..=50 at use).
@@ -380,6 +398,7 @@ impl Default for Config {
             last_folder: String::new(),
             theme: ThemePreference::System,
             density: LayoutDensity::Comfortable,
+            inspector_collapsed: false,
             marketplace: Marketplace::General,
             keyword_target: KEYWORD_TARGET_DEFAULT,
             title_min_words: TITLE_WORDS_DEFAULT_MIN,
@@ -494,17 +513,20 @@ impl Config {
 
     /// The persisted target, clamped to the active marketplace and the app bounds.
     pub fn keyword_target(&self) -> usize {
-        clamp_keyword_target(self.keyword_target).min(self.marketplace.keyword_max())
+        clamp_keyword_target(self.keyword_target)
+            .max(self.marketplace.keyword_min())
+            .min(self.marketplace.keyword_max())
     }
 
     /// The persisted title range, clamped to the active marketplace, ordered,
     /// and bounded by the app limits in case an old or hand-edited config is invalid.
     pub fn title_word_range(&self) -> (usize, usize) {
         let (min, max) = clamp_title_word_range(self.title_min_words, self.title_max_words);
-        (
-            min.min(self.marketplace.title_words_max()),
-            max.min(self.marketplace.title_words_max()),
-        )
+        let min = min
+            .max(self.marketplace.title_words_min())
+            .min(self.marketplace.title_words_max());
+        let max = max.min(self.marketplace.title_words_max()).max(min);
+        (min, max)
     }
 
     /// The persisted caption range, clamped to the active marketplace, ordered,
@@ -652,6 +674,7 @@ mod tests {
         assert!(cfg.last_folder.is_empty());
         assert_eq!(cfg.theme, ThemePreference::System);
         assert_eq!(cfg.density, LayoutDensity::Comfortable);
+        assert!(!cfg.inspector_collapsed);
         assert_eq!(cfg.marketplace, Marketplace::General);
         assert_eq!(cfg.keyword_target, KEYWORD_TARGET_DEFAULT);
         assert_eq!(cfg.keyword_target(), KEYWORD_TARGET_DEFAULT);
@@ -759,6 +782,8 @@ mod tests {
         }
 
         assert_eq!(Marketplace::AdobeStock.keyword_max(), 49);
+        assert_eq!(Marketplace::Shutterstock.keyword_min(), 7);
+        assert_eq!(Marketplace::Shutterstock.title_words_min(), 5);
         assert_eq!(Marketplace::Alamy.caption_chars_max(), 150);
         assert_eq!(Marketplace::Pond5.title_words_max(), 10);
         assert_eq!(Marketplace::General.title_words_max(), TITLE_WORDS_MAX);
@@ -799,6 +824,16 @@ mod tests {
         assert_eq!(cfg.keyword_target(), 50);
         assert_eq!(cfg.title_word_range(), (3, 12), "Alamy shorter title cap");
         assert_eq!(cfg.caption_char_range(), (50, 150), "Alamy caption cap");
+
+        cfg.apply_marketplace(Marketplace::Shutterstock);
+        cfg.keyword_target = 1;
+        cfg.title_min_words = 1;
+        assert_eq!(cfg.keyword_target(), 7, "Shutterstock requires 7 keywords");
+        assert_eq!(
+            cfg.title_word_range().0,
+            5,
+            "Shutterstock needs 5 title words"
+        );
 
         cfg.apply_marketplace(Marketplace::General);
         assert_eq!(cfg.keyword_target(), 50);
@@ -842,6 +877,7 @@ mod tests {
         cfg.caption_max_chars = 240;
         cfg.backup_originals = false;
         cfg.verify_writes = false;
+        cfg.inspector_collapsed = true;
 
         cfg.save().expect("save config");
         assert!(path.is_file());
@@ -863,6 +899,7 @@ mod tests {
         assert_eq!(reloaded.caption_char_range(), (70, 240));
         assert!(!reloaded.backup_originals);
         assert!(!reloaded.verify_writes);
+        assert!(reloaded.inspector_collapsed);
         assert!(reloaded.path.is_none(), "path is not serialized");
 
         // Saving twice overwrites cleanly.

@@ -1,6 +1,6 @@
 [package]
 name = "autowording"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 description = "AI-powered JPEG metadata keywording desktop app for microstock submissions"
@@ -18,8 +18,11 @@ base64 = "0.22"
 regex = "1.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
-image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.1", default-features = false, features = ["jpeg", "png", "tiff"] }
 gpui-kit = "0.9.0"
+
+[build-dependencies]
+embed-resource = "3.0.12"
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
@@ -27,3 +30,5 @@ gpui-pre-platform = { version = "=0.3.11", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2
+strip = true
+lto = "thin"

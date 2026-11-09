@@ -11,20 +11,18 @@ pub(crate) fn payload(
     model: &str,
     system: &str,
     user: &str,
-    image_base64: &str,
+    image_base64: Option<&str>,
     temperature: f64,
 ) -> Value {
+    // A keywords-only top-up sends no image, so the `images` field is omitted.
+    let mut message = json!({"role": "user", "content": user});
+    if let Some(image_base64) = image_base64 {
+        message["images"] = json!([image_base64]);
+    }
     json!({
         "model": model,
         "stream": false,
-        "messages": [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": user,
-                "images": [image_base64]
-            }
-        ],
+        "messages": [{"role": "system", "content": system}, message],
         "options": {"temperature": temperature}
     })
 }
@@ -35,7 +33,7 @@ pub async fn chat(
     model: &str,
     system: &str,
     user: &str,
-    image_base64: &str,
+    image_base64: Option<&str>,
     temperature: f64,
 ) -> Result<String> {
     let url = endpoint_for(base_url);

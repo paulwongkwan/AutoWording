@@ -1,8 +1,10 @@
+use crate::ai::prompt;
 use crate::app::{App, UiContext, WorkspaceMode};
 use crate::config::{LayoutDensity, Marketplace, Provider, ThemePreference};
 use crate::csv::Agency;
-use crate::state::{ImageItem, SelectModifiers, SortMode, Status, StatusFilter};
-use crate::ui::{CancelBatch, PauseBatch, ResumeBatch, ToggleInspector};
+use crate::state::{ImageItem, MediaKind, SelectModifiers, SortMode, Status, StatusFilter};
+use crate::ui::{CancelBatch, PauseBatch, ResumeBatch, ToggleInspector, UndoKeywordCleanup};
+use chrono::Datelike as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
@@ -49,9 +51,16 @@ pub struct AutoWordingView {
     title: Entity<InputState>,
     caption: Entity<TextareaState>,
     keywords: Entity<InputState>,
+    category: Entity<InputState>,
     batch_title: Entity<InputState>,
     batch_caption: Entity<TextareaState>,
     batch_keywords: Entity<InputState>,
+    item_creator: Entity<InputState>,
+    item_copyright: Entity<InputState>,
+    item_credit_line: Entity<InputState>,
+    item_usage_terms: Entity<InputState>,
+    keyword_find: Entity<InputState>,
+    keyword_replace: Entity<InputState>,
     context: Entity<TextareaState>,
     focus_handle: FocusHandle,
     base_url: Entity<InputState>,
@@ -59,7 +68,12 @@ pub struct AutoWordingView {
     api_key: Entity<InputState>,
     exiftool_path: Entity<InputState>,
     global_prompt: Entity<TextareaState>,
+    creator: Entity<InputState>,
+    copyright: Entity<InputState>,
+    credit_line: Entity<InputState>,
+    rights_usage_terms: Entity<InputState>,
     keyword_target: Entity<InputState>,
+    keyword_accept_percent: Entity<InputState>,
     title_min: Entity<InputState>,
     title_max: Entity<InputState>,
     caption_min: Entity<InputState>,
@@ -72,6 +86,7 @@ pub struct AutoWordingView {
     inspector_collapsed: bool,
     show_more: bool,
     show_about: bool,
+    show_prompt: bool,
     theme_dark: bool,
 }
 
@@ -86,6 +101,7 @@ impl AutoWordingView {
         let focus_handle = cx.focus_handle();
         let settings = core.cfg.settings(provider).clone();
         let keyword_target = core.cfg.keyword_target();
+        let keyword_accept_percent = core.cfg.keyword_accept_percent();
         let (title_min_value, title_max_value) = core.cfg.title_word_range();
         let (caption_min_value, caption_max_value) = core.cfg.caption_char_range();
 
@@ -97,12 +113,29 @@ impl AutoWordingView {
         });
         let keywords =
             cx.new(|cx| InputState::new(window, cx).placeholder("Comma-separated keywords"));
+        let category = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Stock category, such as Nature or Travel")
+        });
         let batch_title =
             cx.new(|cx| InputState::new(window, cx).placeholder("Title for selection"));
         let batch_caption =
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Caption for selection"));
         let batch_keywords =
             cx.new(|cx| InputState::new(window, cx).placeholder("Keywords to append or replace"));
+        let item_creator =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Blank uses the Settings creator"));
+        let item_copyright = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Blank uses the Settings copyright"));
+        let item_credit_line = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Blank uses the Settings credit line")
+        });
+        let item_usage_terms = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Blank uses the Settings usage terms")
+        });
+        let keyword_find =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Keyword to replace"));
+        let keyword_replace =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Replacement, or blank to remove"));
         let context = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("Context for the AI, e.g. location, subject, intended use")
@@ -132,8 +165,31 @@ impl AutoWordingView {
                 .default_value(core.cfg.global_prompt.clone())
                 .placeholder("Extra instructions applied to every generation")
         });
+        let creator = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(core.cfg.creator.clone())
+                .placeholder("Photographer or studio name")
+        });
+        let copyright = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(core.cfg.copyright.clone())
+                .placeholder("© 2026 Your Name")
+        });
+        let credit_line = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(core.cfg.credit_line.clone())
+                .placeholder("Credit shown when published")
+        });
+        let rights_usage_terms = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(core.cfg.rights_usage_terms.clone())
+                .placeholder("Licensed usage terms")
+        });
         let keyword_target =
             cx.new(|cx| InputState::new(window, cx).default_value(keyword_target.to_string()));
+        let keyword_accept_percent = cx.new(|cx| {
+            InputState::new(window, cx).default_value(keyword_accept_percent.to_string())
+        });
         let title_min =
             cx.new(|cx| InputState::new(window, cx).default_value(title_min_value.to_string()));
         let title_max =
@@ -197,6 +253,7 @@ impl AutoWordingView {
                     if let Some(item) = this.core.items.get_mut(&path) {
                         if item.keywords != parsed {
                             item.keywords = parsed;
+                            item.clear_keywords = item.keywords.is_empty();
                             item.dirty = true;
                             item.message = None;
                         }
@@ -205,6 +262,53 @@ impl AutoWordingView {
                 }
             },
         ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
+            &category,
+            |this, value, _, cx| {
+                if let Some(path) = this.core.active_path() {
+                    if let Some(item) = this.core.items.get_mut(&path) {
+                        if item.category != value {
+                            item.category = value;
+                            item.dirty = true;
+                            item.message = None;
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        ));
+        for (input, field) in [
+            (&item_creator, 0usize),
+            (&item_copyright, 1),
+            (&item_credit_line, 2),
+            (&item_usage_terms, 3),
+        ] {
+            subscriptions.push(Self::subscribe_input(
+                cx,
+                window,
+                input,
+                move |this, value, _, cx| {
+                    if let Some(path) = this.core.active_path() {
+                        if let Some(item) = this.core.items.get_mut(&path) {
+                            let slot = match field {
+                                0 => &mut item.creator,
+                                1 => &mut item.copyright,
+                                2 => &mut item.credit_line,
+                                _ => &mut item.usage_terms,
+                            };
+                            if *slot != value {
+                                *slot = value;
+                                item.dirty = true;
+                                item.message = None;
+                            }
+                        }
+                        cx.notify();
+                    }
+                },
+            ));
+        }
         subscriptions.push(Self::subscribe_input(
             cx,
             window,
@@ -297,10 +401,62 @@ impl AutoWordingView {
         subscriptions.push(Self::subscribe_input(
             cx,
             window,
+            &creator,
+            |this, value, _, cx| {
+                this.core.cfg.creator = value;
+                this.core.cfg_dirty = Some(Instant::now());
+                cx.notify();
+            },
+        ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
+            &copyright,
+            |this, value, _, cx| {
+                this.core.cfg.copyright = value;
+                this.core.cfg_dirty = Some(Instant::now());
+                cx.notify();
+            },
+        ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
+            &credit_line,
+            |this, value, _, cx| {
+                this.core.cfg.credit_line = value;
+                this.core.cfg_dirty = Some(Instant::now());
+                cx.notify();
+            },
+        ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
+            &rights_usage_terms,
+            |this, value, _, cx| {
+                this.core.cfg.rights_usage_terms = value;
+                this.core.cfg_dirty = Some(Instant::now());
+                cx.notify();
+            },
+        ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
             &keyword_target,
             |this, value, _, cx| {
                 if let Ok(value) = value.trim().parse::<usize>() {
                     this.core.cfg.keyword_target = value;
+                    this.core.cfg_dirty = Some(Instant::now());
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(Self::subscribe_input(
+            cx,
+            window,
+            &keyword_accept_percent,
+            |this, value, _, cx| {
+                if let Ok(value) = value.trim().parse::<usize>() {
+                    this.core.cfg.keyword_accept_percent = value;
                     this.core.cfg_dirty = Some(Instant::now());
                     cx.notify();
                 }
@@ -379,9 +535,16 @@ impl AutoWordingView {
             title,
             caption,
             keywords,
+            category,
             batch_title,
             batch_caption,
             batch_keywords,
+            item_creator,
+            item_copyright,
+            item_credit_line,
+            item_usage_terms,
+            keyword_find,
+            keyword_replace,
             context,
             focus_handle,
             base_url,
@@ -389,7 +552,12 @@ impl AutoWordingView {
             api_key,
             exiftool_path,
             global_prompt,
+            creator,
+            copyright,
+            credit_line,
+            rights_usage_terms,
             keyword_target,
+            keyword_accept_percent,
             title_min,
             title_max,
             caption_min,
@@ -402,6 +570,7 @@ impl AutoWordingView {
             inspector_collapsed,
             show_more: false,
             show_about: false,
+            show_prompt: false,
             theme_dark: false,
         };
 
@@ -409,6 +578,7 @@ impl AutoWordingView {
         window.on_window_should_close(cx, move |_window, cx| {
             let mut allow = true;
             let _ = weak.update(cx, |this, cx| {
+                this.core.flush_config();
                 this.core.flush_journal();
                 if this.core.unsaved_count() > 0 && !this.core.allow_close {
                     allow = false;
@@ -490,12 +660,33 @@ impl AutoWordingView {
                     self.keywords
                         .update(cx, |state, cx| state.set_value(keyword_text, window, cx));
                 }
+                if active_changed
+                    || (!self.category.read(cx).focus_handle(cx).is_focused(window)
+                        && self.category.read(cx).value().as_ref() != item.category.as_str())
+                {
+                    let value = item.category.clone();
+                    self.category
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                self.sync_text(&self.item_creator, &item.creator, window, cx);
+                self.sync_text(&self.item_copyright, &item.copyright, window, cx);
+                self.sync_text(&self.item_credit_line, &item.credit_line, window, cx);
+                self.sync_text(&self.item_usage_terms, &item.usage_terms, window, cx);
             } else if active_changed {
                 self.clear_metadata_inputs(window, cx);
             }
         } else if active_changed {
             self.clear_metadata_inputs(window, cx);
         }
+
+        let creator = self.core.cfg.creator.clone();
+        self.sync_text(&self.creator, &creator, window, cx);
+        let copyright = self.core.cfg.copyright.clone();
+        self.sync_text(&self.copyright, &copyright, window, cx);
+        let credit_line = self.core.cfg.credit_line.clone();
+        self.sync_text(&self.credit_line, &credit_line, window, cx);
+        let usage_terms = self.core.cfg.rights_usage_terms.clone();
+        self.sync_text(&self.rights_usage_terms, &usage_terms, window, cx);
 
         let provider = self.core.cfg.provider;
         if provider != self.settings_provider {
@@ -564,6 +755,12 @@ impl AutoWordingView {
             window,
             cx,
         );
+        self.sync_number(
+            &self.keyword_accept_percent,
+            self.core.cfg.keyword_accept_percent(),
+            window,
+            cx,
+        );
         let (title_min, title_max) = self.core.cfg.title_word_range();
         self.sync_number(&self.title_min, title_min, window, cx);
         self.sync_number(&self.title_max, title_max, window, cx);
@@ -587,8 +784,30 @@ impl AutoWordingView {
         }
     }
 
+    fn sync_text(
+        &self,
+        input: &Entity<InputState>,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !input.read(cx).focus_handle(cx).is_focused(window)
+            && input.read(cx).value().as_ref() != value
+        {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+    }
+
     fn clear_metadata_inputs(&self, window: &mut Window, cx: &mut Context<Self>) {
-        for input in [&self.title, &self.keywords] {
+        for input in [
+            &self.title,
+            &self.keywords,
+            &self.category,
+            &self.item_creator,
+            &self.item_copyright,
+            &self.item_credit_line,
+            &self.item_usage_terms,
+        ] {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
         self.caption
@@ -602,7 +821,7 @@ impl AutoWordingView {
     }
 
     fn can_control_batch(&self) -> bool {
-        self.core.batch.map(|batch| !batch.saving).unwrap_or(false)
+        self.core.batch.map(|batch| !batch.saving).unwrap_or(false) && !self.core.batch_cancelling
     }
 
     fn pause_batch_from_shortcut(&mut self, paused: bool, cx: &mut Context<Self>) {
@@ -615,6 +834,13 @@ impl AutoWordingView {
     fn cancel_batch_from_shortcut(&mut self, cx: &mut Context<Self>) {
         if self.can_control_batch() {
             self.core.cancel_batch();
+            cx.notify();
+        }
+    }
+
+    fn undo_keyword_cleanup_from_shortcut(&mut self, cx: &mut Context<Self>) {
+        if self.inspector == InspectorTab::Batch && self.core.has_keyword_cleanup_undo() {
+            self.core.undo_batch_keyword_cleanup();
             cx.notify();
         }
     }
@@ -1174,7 +1400,21 @@ impl AutoWordingView {
                 Status::Pending => cx.theme().muted_foreground,
             }
         };
-        let preview = if let Some(image) = thumb {
+        let preview = if item.media == MediaKind::Video {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(div().text_xs().font_bold().child("VIDEO"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Preview unavailable"),
+                )
+                .into_any_element()
+        } else if let Some(image) = thumb {
             img(ImageSource::Render(image))
                 .object_fit(ObjectFit::Cover)
                 .size_full()
@@ -1295,8 +1535,24 @@ impl AutoWordingView {
             self.core.request_thumb(&self.ui, &path);
             let thumb = self.core.thumbs.texture(&path).cloned();
             let selected = active.as_deref() == Some(path.as_path());
+            let is_video = self
+                .core
+                .items
+                .get(&path)
+                .map(|item| item.media == MediaKind::Video)
+                .unwrap_or_else(|| crate::state::is_supported_video(&path));
             let click_path = path.clone();
-            let preview = if let Some(image) = thumb {
+            let preview = if is_video {
+                v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_bold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("VIDEO")
+                    .into_any_element()
+            } else if let Some(image) = thumb {
                 img(ImageSource::Render(image))
                     .object_fit(ObjectFit::Cover)
                     .size_full()
@@ -1337,10 +1593,31 @@ impl AutoWordingView {
                 .filter(|(preview_path, _)| preview_path == path)
                 .map(|(_, image)| image.clone())
         });
-        if let Some(path) = active.as_ref() {
-            self.core.request_preview(&self.ui, path);
+        let active_is_video = active
+            .as_ref()
+            .and_then(|path| self.core.items.get(path))
+            .map(|item| item.media == MediaKind::Video)
+            .unwrap_or(false);
+        if !active_is_video {
+            if let Some(path) = active.as_ref() {
+                self.core.request_preview(&self.ui, path);
+            }
         }
-        let preview = if let Some(image) = image {
+        let preview = if active_is_video {
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(div().text_lg().font_bold().child("Video"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Video preview is not available yet. Metadata editing and CSV export are supported."),
+                )
+                .into_any_element()
+        } else if let Some(image) = image {
             img(ImageSource::Render(image))
                 .object_fit(ObjectFit::Contain)
                 .size_full()
@@ -1571,6 +1848,8 @@ impl AutoWordingView {
         let editorial_path = path.clone();
         let lock_weak = weak.clone();
         let editorial_weak = weak.clone();
+        let category_lock_weak = weak.clone();
+        let category_lock_path = path.clone();
 
         v_flex()
             .flex_1()
@@ -1628,6 +1907,32 @@ impl AutoWordingView {
                 Textarea::new(&self.caption).h(px(92.0)),
                 cx,
             ))
+            .child(labeled("Category", Input::new(&self.category), cx))
+            .child(section_label("Rights overrides — blank uses Settings", cx))
+            .child(rights_labeled(
+                "Creator",
+                !item.creator.trim().is_empty(),
+                Input::new(&self.item_creator),
+                cx,
+            ))
+            .child(rights_labeled(
+                "Copyright",
+                !item.copyright.trim().is_empty(),
+                Input::new(&self.item_copyright),
+                cx,
+            ))
+            .child(rights_labeled(
+                "Credit line",
+                !item.credit_line.trim().is_empty(),
+                Input::new(&self.item_credit_line),
+                cx,
+            ))
+            .child(rights_labeled(
+                "Usage terms",
+                !item.usage_terms.trim().is_empty(),
+                Input::new(&self.item_usage_terms),
+                cx,
+            ))
             .child(
                 h_flex()
                     .debug_selector(|| "metadata-locks".to_string())
@@ -1656,6 +1961,7 @@ impl AutoWordingView {
                                         if let Some(item) = this.core.items.get_mut(&path) {
                                             item.locks.title = *checked;
                                         }
+                                        this.core.persist_locks(&path);
                                         cx.notify();
                                     });
                                 }
@@ -1670,6 +1976,7 @@ impl AutoWordingView {
                                     if let Some(item) = this.core.items.get_mut(&lock_path) {
                                         item.locks.caption = *checked;
                                     }
+                                    this.core.persist_locks(&lock_path);
                                     cx.notify();
                                 });
                             }),
@@ -1683,6 +1990,22 @@ impl AutoWordingView {
                                     if let Some(item) = this.core.items.get_mut(&path) {
                                         item.locks.keywords = *checked;
                                     }
+                                    this.core.persist_locks(&path);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Checkbox::new("lock-category")
+                            .label(if compact { "Category" } else { "Lock category" })
+                            .checked(item.locks.category)
+                            .on_change(move |checked, _, cx| {
+                                let _ = category_lock_weak.update(cx, |this, cx| {
+                                    if let Some(item) = this.core.items.get_mut(&category_lock_path)
+                                    {
+                                        item.locks.category = *checked;
+                                    }
+                                    this.core.persist_locks(&category_lock_path);
                                     cx.notify();
                                 });
                             }),
@@ -1734,6 +2057,18 @@ impl AutoWordingView {
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.core.restore_from_backup_dialog(&this.ui);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("undo-save")
+                            .label("Undo last save")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(path) = this.core.active_path() {
+                                    this.core.undo_last_save(&path);
+                                }
                                 cx.notify();
                             })),
                     ),
@@ -1805,6 +2140,7 @@ impl AutoWordingView {
 
     fn batch_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let count = self.core.selection.count();
+        let can_undo_cleanup = self.core.has_keyword_cleanup_undo();
         let queue = self.batch_queue_panel(cx);
         v_flex()
             .flex_1()
@@ -1876,6 +2212,77 @@ impl AutoWordingView {
                 h_flex()
                     .gap_2()
                     .flex_wrap()
+                    .child(labeled("Find", Input::new(&self.keyword_find), cx))
+                    .child(labeled("Replace", Input::new(&self.keyword_replace), cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new("replace-keyword-term")
+                            .label("Replace term")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let find = this.keyword_find.read(cx).value().to_string();
+                                let replace = this.keyword_replace.read(cx).value().to_string();
+                                this.core.replace_batch_keyword_term(find, replace);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("dedupe-keywords")
+                            .label("Remove duplicates")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core.dedupe_batch_keywords();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("normalize-keywords")
+                            .label("Normalize")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core.normalize_batch_keywords();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sort-keywords")
+                            .label("Sort A–Z")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core.sort_batch_keywords();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-keywords")
+                            .label("Clear keywords")
+                            .danger()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core.clear_batch_keywords();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("undo-keyword-cleanup")
+                            .label("Undo cleanup")
+                            .ghost()
+                            .small()
+                            .disabled(!can_undo_cleanup)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core.undo_batch_keyword_cleanup();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
                     .child(
                         Button::new("generate-batch")
                             .label("Generate selected")
@@ -1933,13 +2340,14 @@ impl AutoWordingView {
     fn batch_queue_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let batch = self.core.batch?;
         let saving = batch.saving;
-        let paused = !saving && self.core.batch_paused;
+        let cancelling = !saving && self.core.batch_cancelling;
+        let paused = !saving && !cancelling && self.core.batch_paused;
         let processing = usize::from(self.core.batch_current.is_some());
         let waiting = batch
             .total
             .saturating_sub(batch.done)
             .saturating_sub(processing);
-        let eta = batch.eta().filter(|_| !paused);
+        let eta = batch.eta().filter(|_| !paused && !cancelling);
         let percent = (batch.fraction() * 100.0).round() as u32;
         let current = self.core.batch_current.as_deref().map(display_file_name);
         let queued_after_current: Vec<PathBuf> = self
@@ -1952,24 +2360,32 @@ impl AutoWordingView {
         let up_next_total = queued_after_current.len();
         let up_next = up_next_labels(&queued_after_current, BATCH_UP_NEXT_LIMIT);
         let up_next_remaining = up_next_total.saturating_sub(up_next.len());
-        let current_label = current
-            .map(|name| format!("Current: {name}"))
-            .unwrap_or_else(|| {
-                if saving {
-                    "Waiting for the next file".to_string()
-                } else {
-                    "Waiting for the next image".to_string()
-                }
-            });
+        let current_label = if cancelling {
+            current
+                .map(|name| format!("Stopping after: {name}"))
+                .unwrap_or_else(|| "Stopping before the next image".to_string())
+        } else {
+            current
+                .map(|name| format!("Current: {name}"))
+                .unwrap_or_else(|| {
+                    if saving {
+                        "Waiting for the next file".to_string()
+                    } else {
+                        "Waiting for the next image".to_string()
+                    }
+                })
+        };
         let title = if saving { "Save queue" } else { "AI queue" };
-        let action = if paused {
+        let action = if cancelling {
+            "Cancelling"
+        } else if paused {
             "Paused"
         } else if saving {
             "Writing"
         } else {
             "Working"
         };
-        let action_color = if paused {
+        let action_color = if cancelling || paused {
             cx.theme().warning
         } else {
             cx.theme().primary
@@ -2042,7 +2458,7 @@ impl AutoWordingView {
                         .text_color(cx.theme().muted_foreground)
                         .child(current_label),
                 )
-                .when(!up_next.is_empty(), |panel| {
+                .when(!up_next.is_empty() && !cancelling, |panel| {
                     let mut list = v_flex()
                         .debug_selector(|| "batch-up-next".to_string())
                         .gap_1()
@@ -2082,6 +2498,24 @@ impl AutoWordingView {
                         .child(self.queue_stat("Waiting", waiting, false, cx))
                         .child(self.queue_stat("Failed", batch.failed, batch.failed > 0, cx)),
                 )
+                .when(batch.failed > 0, |panel| {
+                    let summary = crate::state::failure_summary(self.core.items.values());
+                    if summary.is_empty() {
+                        return panel;
+                    }
+                    let text = summary
+                        .iter()
+                        .map(|(cause, count)| format!("{count} {}", cause.label()))
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    panel.child(
+                        div()
+                            .debug_selector(|| "batch-failure-why".to_string())
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(format!("Why: {text}")),
+                    )
+                })
                 .when(!saving, |panel| {
                     panel.child(
                         h_flex()
@@ -2092,6 +2526,7 @@ impl AutoWordingView {
                                         .label(if paused { "Resume" } else { "Pause" })
                                         .outline()
                                         .small()
+                                        .disabled(cancelling)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.core.set_batch_paused(!this.core.batch_paused);
                                             cx.notify();
@@ -2107,6 +2542,7 @@ impl AutoWordingView {
                                                 .label("Retry all failed")
                                                 .ghost()
                                                 .small()
+                                                .disabled(cancelling)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.core.retry_all_failed(&this.ui);
                                                     cx.notify();
@@ -2115,14 +2551,22 @@ impl AutoWordingView {
                                 )
                             })
                             .child(
-                                Button::new("batch-cancel")
-                                    .label("Cancel")
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.core.cancel_batch();
-                                        cx.notify();
-                                    })),
+                                div().debug_selector(|| "batch-cancel".to_string()).child(
+                                    Button::new("batch-cancel")
+                                        .label(if cancelling {
+                                            "Cancelling…"
+                                        } else {
+                                            "Cancel"
+                                        })
+                                        .ghost()
+                                        .small()
+                                        .loading(cancelling)
+                                        .disabled(cancelling)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.core.cancel_batch();
+                                            cx.notify();
+                                        })),
+                                ),
                             ),
                     )
                 })
@@ -2270,6 +2714,27 @@ impl AutoWordingView {
                 Textarea::new(&self.global_prompt).h(px(74.0)),
                 cx,
             ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("preview-system-prompt")
+                            .label("Preview system prompt")
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_prompt = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("The exact text sent for these settings"),
+                    ),
+            )
             .child(section_label("Marketplace output", cx))
             .child(marketplace_row)
             .child(
@@ -2279,6 +2744,11 @@ impl AutoWordingView {
                     .child(labeled("Title min", Input::new(&self.title_min), cx))
                     .child(labeled("Title max", Input::new(&self.title_max), cx)),
             )
+            .child(labeled(
+                "Accept %",
+                Input::new(&self.keyword_accept_percent),
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -2310,6 +2780,15 @@ impl AutoWordingView {
                             .child(self.core.exiftool_status.clone()),
                     ),
             )
+            .child(section_label("Rights metadata", cx))
+            .child(labeled("Creator", Input::new(&self.creator), cx))
+            .child(labeled("Copyright notice", Input::new(&self.copyright), cx))
+            .child(labeled("Credit line", Input::new(&self.credit_line), cx))
+            .child(labeled(
+                "Rights usage terms",
+                Input::new(&self.rights_usage_terms),
+                cx,
+            ))
             .child(section_label("Appearance", cx))
             .child(
                 h_flex()
@@ -2608,12 +3087,88 @@ impl AutoWordingView {
         )
     }
 
+    /// Show the fully rendered system prompt for the current settings, so the
+    /// text the model receives can be checked without reading the source.
+    fn prompt_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let now = chrono::Local::now();
+        let date = format!("{} {}, {}", now.format("%B"), now.day(), now.year());
+        let keyword_target = self.core.cfg.keyword_target();
+        let (title_min, title_max) = self.core.cfg.title_word_range();
+        let (caption_min, caption_max) = self.core.cfg.caption_char_range();
+        let prompt = prompt::system_prompt_with_constraints(
+            &date,
+            &self.core.cfg.global_prompt,
+            keyword_target,
+            (title_min, title_max),
+            (caption_min, caption_max),
+        );
+
+        let mut body = v_flex()
+            .gap_1()
+            .p_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary);
+        for line in prompt.lines() {
+            body = body.child(div().text_xs().child(if line.is_empty() {
+                " ".to_string()
+            } else {
+                line.to_string()
+            }));
+        }
+
+        modal_shell(
+            "System prompt",
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Sent for today ({date}) with {keyword_target} keywords, a {title_min}-{title_max} word title and a {caption_min}-{caption_max} character caption. Global instructions are appended at the end; the per-image context and existing metadata go in the user message."
+                        )),
+                )
+                .child({
+                    let mut editorial = v_flex()
+                        .gap_1()
+                        .p_2()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().accent)
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_bold()
+                                .text_color(cx.theme().accent)
+                                .child("Editorial caption prefix, excerpted from the prompt below"),
+                        );
+                    for line in prompt::editorial_caption_rule(&prompt) {
+                        editorial = editorial.child(div().text_xs().child(line));
+                    }
+                    editorial
+                })
+                .child(body)
+                .child(
+                    Button::new("prompt-close")
+                        .label("Close")
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_prompt = false;
+                            cx.notify();
+                        })),
+                ),
+            cx,
+        )
+    }
+
     fn about_modal(&self, cx: &mut Context<Self>) -> AnyElement {
         modal_shell(
             "AutoWording",
             v_flex()
                 .gap_3()
-                .child(div().text_sm().child("AI-powered JPEG metadata studio for stock submissions."))
+                .child(div().text_sm().child("AI-powered image metadata studio for stock submissions."))
                 .child(
                     div()
                         .text_sm()
@@ -2634,6 +3189,75 @@ impl AutoWordingView {
                             this.show_about = false;
                             cx.notify();
                         })),
+                ),
+            cx,
+        )
+    }
+
+    fn export_modal(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(pending) = &self.core.pending_export else {
+            return div().into_any_element();
+        };
+        let rows = pending
+            .issues
+            .iter()
+            .take(12)
+            .fold(v_flex().gap_1(), |list, issue| {
+                list.child(
+                    div()
+                        .text_xs()
+                        .child(format!("{}: {}", issue.filename, issue.message)),
+                )
+            });
+        let more = pending.issues.len().saturating_sub(12);
+        let category_warnings = pending
+            .issues
+            .iter()
+            .filter(|issue| issue.category_mapping)
+            .count();
+        modal_shell(
+            "Export preflight",
+            v_flex()
+                .gap_3()
+                .child(div().text_sm().child(format!(
+                    "{} file(s) with preflight issues for the {} export.",
+                    pending.issues.len(),
+                    pending.agency.label()
+                )))
+                .when(category_warnings > 0, |panel| {
+                    panel.child(div().text_sm().font_bold().child(format!(
+                        "Category warning: {category_warnings} file(s) have no {} category mapping. Their category cell will be blank.",
+                        pending.agency.label()
+                    )))
+                })
+                .child(rows)
+                .when(more > 0, |panel| {
+                    panel.child(div().text_xs().child(format!("…and {more} more")))
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("export-cancel")
+                                .label("Cancel")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.core.cancel_export_preflight();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("export-anyway")
+                                .label("Export anyway")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.core.export_pending();
+                                    cx.notify();
+                                })),
+                        ),
                 ),
             cx,
         )
@@ -2670,6 +3294,7 @@ impl AutoWordingView {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.core.allow_close = true;
                                     this.core.confirm_exit = false;
+                                    this.core.flush_config();
                                     this.core.flush_journal();
                                     window.remove_window();
                                     cx.notify();
@@ -2752,6 +3377,9 @@ impl Render for AutoWordingView {
             .on_action(cx.listener(|this, _: &CancelBatch, _, cx| {
                 this.cancel_batch_from_shortcut(cx);
             }))
+            .on_action(cx.listener(|this, _: &UndoKeywordCleanup, _, cx| {
+                this.undo_keyword_cleanup_from_shortcut(cx);
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
@@ -2780,8 +3408,14 @@ impl Render for AutoWordingView {
         if self.show_about {
             root = root.child(self.about_modal(cx));
         }
+        if self.show_prompt {
+            root = root.child(self.prompt_modal(cx));
+        }
         if self.core.confirm_exit {
             root = root.child(self.exit_modal(cx));
+        }
+        if self.core.pending_export.is_some() {
+            root = root.child(self.export_modal(cx));
         }
         root
     }
@@ -2844,6 +3478,49 @@ fn labeled(
                 .font_bold()
                 .text_color(cx.theme().muted_foreground)
                 .child(label),
+        )
+        .child(child)
+        .into_any_element()
+}
+
+fn rights_labeled(
+    label: &'static str,
+    from_file: bool,
+    child: impl IntoElement,
+    cx: &Context<AutoWordingView>,
+) -> AnyElement {
+    let (badge, background, foreground) = if from_file {
+        ("FILE", cx.theme().accent, cx.theme().accent_foreground)
+    } else {
+        ("SETTINGS", cx.theme().muted, cx.theme().muted_foreground)
+    };
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_bold()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .px_1()
+                        .rounded(px(999.0))
+                        .bg(background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .text_xs()
+                        .font_bold()
+                        .text_color(foreground)
+                        .child(badge),
+                ),
         )
         .child(child)
         .into_any_element()
@@ -3043,6 +3720,7 @@ mod tests {
                 title: "Complete Fixture".into(),
                 caption: "A complete fixture caption for the folder-open test.".into(),
                 keywords: (0..45).map(|index| format!("fixture{index}")).collect(),
+                category: String::new(),
             },
         )
         .expect("write complete fixture metadata");
@@ -3052,6 +3730,7 @@ mod tests {
                 title: "Partial Fixture".into(),
                 caption: String::new(),
                 keywords: Vec::new(),
+                category: String::new(),
             },
         )
         .expect("write partial fixture metadata");
@@ -3109,21 +3788,22 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.core.folder_images.len(), 3);
             let keyword_target = view.core.cfg.keyword_target();
+            let keyword_accept_percent = view.core.cfg.keyword_accept_percent();
             let complete_item = fixture_item(view, "complete.jpg").expect("complete item");
             let partial_item = fixture_item(view, "partial.jpg").expect("partial item");
             let untagged_item = fixture_item(view, "untagged.jpg").expect("untagged item");
 
             assert_eq!(complete_item.status, Status::Saved);
             assert_eq!(complete_item.status.label(), "Saved");
-            assert!(complete_item.is_complete(keyword_target));
+            assert!(complete_item.is_complete(keyword_target, keyword_accept_percent));
 
             assert_eq!(partial_item.status, Status::Pending);
             assert_eq!(partial_item.status.label(), "Pending");
-            assert!(!partial_item.is_complete(keyword_target));
+            assert!(!partial_item.is_complete(keyword_target, keyword_accept_percent));
 
             assert_eq!(untagged_item.status, Status::Pending);
             assert_eq!(untagged_item.status.label(), "Pending");
-            assert!(!untagged_item.is_complete(keyword_target));
+            assert!(!untagged_item.is_complete(keyword_target, keyword_accept_percent));
         });
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3380,8 +4060,23 @@ mod tests {
             .expect("the queue panel should expose a pause button");
         cx.simulate_click(pause.center(), Modifiers::default());
         cx.run_until_parked();
-
         assert!(cx.update(|_, cx| view.read(cx).core.batch_paused));
+
+        let cancel = cx
+            .debug_bounds("batch-cancel")
+            .expect("the queue panel should expose a cancel button");
+        cx.simulate_click(cancel.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            cx.update(|_, cx| view.read(cx).core.batch_cancelling),
+            "cancel should immediately enter its pending state"
+        );
+        assert!(
+            !cx.update(|_, cx| view.read(cx).core.batch_paused),
+            "cancelling should clear a paused batch"
+        );
+        assert!(!cx.update(|_, cx| view.read(cx).can_control_batch()));
     }
 
     #[gpui_kit::test]
@@ -3447,6 +4142,73 @@ mod tests {
         );
     }
 
+    #[gpui_kit::test]
+    async fn batch_tab_shortcut_undoes_keyword_cleanup(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::init_keybindings(cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            AutoWordingView::new_with_core(App::from_config(Config::default(), None), window, cx)
+        });
+        cx.simulate_resize(size(px(1280.0), px(800.0)));
+        cx.run_until_parked();
+
+        let path = PathBuf::from("D:/photos/first.jpg");
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut item = ImageItem::new(path.clone());
+                item.keywords = vec!["harbour".into(), "sunrise".into()];
+                view.core.items.insert(path.clone(), item);
+                view.core.folder_images = vec![path.clone()];
+                view.core.selection.select_all(&view.core.folder_images);
+                view.inspector = InspectorTab::Batch;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.core.append_batch_keywords("extra".into())
+            });
+        });
+        assert_eq!(
+            cx.update(|_, cx| view.read(cx).core.items[&path].keywords.clone()),
+            vec!["harbour", "sunrise", "extra"]
+        );
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| view.read(cx).core.items[&path].keywords.clone()),
+            vec!["harbour", "sunrise"],
+            "Ctrl+Z on the Batch tab should undo the last keyword edit"
+        );
+        assert!(!cx.update(|_, cx| view.read(cx).core.has_keyword_cleanup_undo()));
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.core.append_batch_keywords("extra".into())
+            });
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.inspector = InspectorTab::Metadata;
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-z");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| view.read(cx).core.items[&path].keywords.clone()),
+            vec!["harbour", "sunrise", "extra"],
+            "Ctrl+Z outside the Batch tab must not touch keywords"
+        );
+        assert!(cx.update(|_, cx| view.read(cx).core.has_keyword_cleanup_undo()));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn inspector_tabs_match_snapshots() {
@@ -3458,10 +4220,11 @@ mod tests {
         const SNAPSHOT_SCALE: f32 = 2.0;
         const SNAPSHOT_HEIGHT: u32 = 184;
 
-        fn assert_snapshot(name: &str, actual: &image::RgbaImage) {
-            let path = Path::new(SNAPSHOT_DIR).join(format!("{name}.png"));
+        fn assert_snapshot(scale: f32, name: &str, actual: &image::RgbaImage) {
+            let directory = Path::new(SNAPSHOT_DIR).join(format!("{scale:.1}"));
+            let path = directory.join(format!("{name}.png"));
             if std::env::var_os("UPDATE_INSPECTOR_SNAPSHOTS").is_some() {
-                std::fs::create_dir_all(SNAPSHOT_DIR).expect("create inspector snapshot directory");
+                std::fs::create_dir_all(&directory).expect("create inspector snapshot directory");
                 actual.save(&path).expect("write inspector snapshot");
                 return;
             }
@@ -3469,7 +4232,7 @@ mod tests {
             let expected = image::open(&path)
                 .unwrap_or_else(|error| {
                     panic!(
-                        "missing inspector snapshot {}: {error}; run UPDATE_INSPECTOR_SNAPSHOTS=1 cargo test inspector_tabs_match_snapshots",
+                        "missing inspector snapshot {} for display scale {scale:.1}: {error}; run UPDATE_INSPECTOR_SNAPSHOTS=1 cargo test inspector_tabs_match_snapshots",
                         path.display()
                     )
                 })
@@ -3547,6 +4310,7 @@ mod tests {
                                             format!("{first}{second}")
                                         })
                                         .collect();
+                                    item.creator = "Inspector Creator".to_string();
                                     item.status = Status::Generated;
                                     item.dims = Some((64, 48));
                                     item.meta_loaded = true;
@@ -3611,7 +4375,7 @@ mod tests {
                                 SNAPSHOT_HEIGHT,
                                 image::imageops::FilterType::Triangle,
                             );
-                            captures.push((format!("{prefix}-{slug}"), header));
+                            captures.push((scale, format!("{prefix}-{slug}"), header));
 
                             if tab == InspectorTab::Metadata {
                                 let full_height_points = height - INSPECTOR_TOP - STATUS_BAR_HEIGHT;
@@ -3633,7 +4397,7 @@ mod tests {
                                     snapshot_full_height,
                                     image::imageops::FilterType::Triangle,
                                 );
-                                captures.push((format!("{prefix}-{slug}-full"), full));
+                                captures.push((scale, format!("{prefix}-{slug}-full"), full));
                             }
                         }
                         cx.update_window(handle, |_, window, _| window.remove_window())
@@ -3653,8 +4417,8 @@ mod tests {
             8,
             "capture every inspector tab at both widths plus the full metadata rail"
         );
-        for (name, image) in captures {
-            assert_snapshot(&name, &image);
+        for (scale, name, image) in captures {
+            assert_snapshot(scale, &name, &image);
         }
         let _ = std::fs::remove_dir_all(&fixture_dir);
     }

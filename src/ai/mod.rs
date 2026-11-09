@@ -11,8 +11,8 @@ mod tests;
 pub use prompt::GeneratedMetadata;
 
 use crate::config::{
-    clamp_caption_char_range, clamp_keyword_target, clamp_title_word_range, Provider,
-    ProviderSettings,
+    clamp_caption_char_range, clamp_keyword_accept_percent, clamp_keyword_target,
+    clamp_title_word_range, Provider, ProviderSettings,
 };
 use crate::metadata::ExistingMetadata;
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,14 +21,19 @@ use std::path::Path;
 use std::time::Duration;
 
 const MAX_IMAGE_DIM: u32 = 1600;
-/// First-pass sampling. Low temperature keeps the metadata literal.
-const DEFAULT_TEMPERATURE: f64 = 0.2;
+/// First-pass sampling. A moderate temperature adds variation while keeping
+/// the metadata grounded in the image.
+const DEFAULT_TEMPERATURE: f64 = 0.5;
 /// The corrective retry samples hotter than the first pass. At the first-pass
 /// temperature the model tends to reproduce the reply that already failed.
 const RETRY_TEMPERATURE: f64 = 0.7;
 /// Last-resort sampling after a retry that changed nothing.
 const ESCALATION_TEMPERATURE: f64 = 0.95;
 const JPEG_QUALITY: u8 = 85;
+/// Reply budget. 50 keywords plus three sentences fit in 900 tokens on most
+/// models, but reasoning-heavy local models spend part of the budget on a
+/// preamble and truncate the labelled lines, which then fails to parse.
+const MAX_REPLY_TOKENS: u32 = 1400;
 /// One initial request plus three retries before an image is marked failed.
 const MAX_ATTEMPTS: usize = 4;
 /// Extra wait per attempt, so a busy local server is not hammered.
@@ -43,6 +48,7 @@ pub struct AiRequest {
     pub global_prompt: String,
     pub date: String,
     pub keyword_target: usize,
+    pub keyword_accept_percent: usize,
     pub title_range: (usize, usize),
     pub caption_range: (usize, usize),
 }
@@ -84,6 +90,7 @@ pub fn prepare_image(path: &Path) -> Result<String> {
 
 pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     let keyword_target = clamp_keyword_target(req.keyword_target);
+    let keyword_accept_percent = clamp_keyword_accept_percent(req.keyword_accept_percent);
     let title_range = clamp_title_word_range(req.title_range.0, req.title_range.1);
     let caption_range = clamp_caption_char_range(req.caption_range.0, req.caption_range.1);
     // Editorial captions need the capture date, not the upload/batch date.
@@ -134,7 +141,16 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             None => user.clone(),
         };
 
-        match chat(&client, &req, &system, &attempt_user, DEFAULT_TEMPERATURE).await {
+        match chat(
+            &client,
+            &req,
+            &system,
+            &attempt_user,
+            Some(&req.image_base64),
+            DEFAULT_TEMPERATURE,
+        )
+        .await
+        {
             Ok(raw) => match prompt::parse_response_allow_empty_keywords(&raw, keyword_target) {
                 Ok(result) => {
                     parsed = Some(result);
@@ -169,7 +185,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     // out-of-range title/caption values; keywords are always appended so the
     // first result is preserved and only new unique terms fill a short list.
     let first_valid = metadata_ok(&result, title_range, caption_range);
-    let minimum_keywords = prompt::minimum_keyword_count(keyword_target);
+    let minimum_keywords = prompt::minimum_keyword_count(keyword_target, keyword_accept_percent);
     let mut valid = first_valid && result.keywords.len() >= minimum_keywords;
     let mut repeated = false;
 
@@ -178,16 +194,31 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             req.context.as_deref(),
             Some(&req.existing),
             keyword_target,
+            keyword_accept_percent,
             title_range,
             caption_range,
             &result,
         );
-        if let Ok(retry_raw) = chat(&client, &req, &system, &retry_user, RETRY_TEMPERATURE).await {
+        if let Ok(retry_raw) = chat(
+            &client,
+            &req,
+            &system,
+            &retry_user,
+            Some(&req.image_base64),
+            RETRY_TEMPERATURE,
+        )
+        .await
+        {
             if let Ok(retry) = prompt::parse_response_with_target(&retry_raw, keyword_target) {
                 repeated = prompt::same_text(&result.title, &retry.title)
                     && prompt::same_text(&result.caption, &retry.caption);
-                let replace_text = !first_valid && metadata_ok(&retry, title_range, caption_range);
-                merge_candidate(&mut result, retry, replace_text, keyword_target);
+                merge_candidate(
+                    &mut result,
+                    retry,
+                    title_range,
+                    caption_range,
+                    keyword_target,
+                );
                 valid = metadata_ok(&result, title_range, caption_range)
                     && result.keywords.len() >= minimum_keywords;
             }
@@ -211,6 +242,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             req.context.as_deref(),
             Some(&req.existing),
             keyword_target,
+            keyword_accept_percent,
             title_range,
             caption_range,
             &result,
@@ -221,6 +253,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             &req,
             &escalated_system,
             &escalation_user,
+            Some(&req.image_base64),
             ESCALATION_TEMPERATURE,
         )
         .await
@@ -228,9 +261,44 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             if let Ok(candidate) =
                 prompt::parse_response_with_target(&escalated_raw, keyword_target)
             {
-                let replace_text = metadata_ok(&candidate, title_range, caption_range);
-                merge_candidate(&mut result, candidate, replace_text, keyword_target);
+                merge_candidate(
+                    &mut result,
+                    candidate,
+                    title_range,
+                    caption_range,
+                    keyword_target,
+                );
             }
+        }
+    }
+
+    // The keyword floor is the most common remaining miss: a 50-keyword target
+    // at 80% acceptance needs 40 distinct single-word terms, and an otherwise
+    // correct reply is thrown away over the last few. Ask for just the missing
+    // terms instead of regenerating the title and caption, which could lose
+    // fields that already passed. It runs text-only (`None` image) with a short
+    // system instruction, so the request is cheap and cannot rewrite the text.
+    if metadata_ok(&result, title_range, caption_range) && result.keywords.len() < minimum_keywords
+    {
+        let topup_user = prompt::keyword_topup_prompt(
+            req.context.as_deref(),
+            Some(&req.existing),
+            keyword_target,
+            keyword_accept_percent,
+            &result,
+        );
+        if let Ok(raw) = chat(
+            &client,
+            &req,
+            prompt::KEYWORD_TOPUP_SYSTEM,
+            &topup_user,
+            None,
+            RETRY_TEMPERATURE,
+        )
+        .await
+        {
+            let extra = prompt::parse_keywords_reply(&raw, keyword_target);
+            append_keywords(&mut result.keywords, &extra, keyword_target);
         }
     }
 
@@ -243,14 +311,21 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         );
     }
 
-    if !metadata_ok(&result, title_range, caption_range) {
+    if !title_ok(&result, title_range) {
         bail!(
-            "{} returned a title with {} words and a caption with {} characters after retries; {}–{} words and {}–{} characters are required.",
+            "{} returned a title with {} words after retries; {}–{} words are required.",
             req.provider.label(),
             prompt::title_word_count(&result.title),
-            prompt::caption_char_count(&result.caption),
             title_range.0,
-            title_range.1,
+            title_range.1
+        );
+    }
+
+    if !caption_ok(&result, caption_range) {
+        bail!(
+            "{} returned a caption with {} characters after retries; {}–{} characters are required.",
+            req.provider.label(),
+            prompt::caption_char_count(&result.caption),
             caption_range.0,
             caption_range.1
         );
@@ -269,45 +344,170 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     Ok(result)
 }
 
+/// Why the last attempt on an image failed, as far as the message can tell.
+/// The batch summary groups failures by this value so the constraint that is
+/// actually costing images is visible without opening each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FailureCause {
+    /// The reply had fewer usable keywords than the acceptance floor.
+    Keywords,
+    TitleLength,
+    CaptionLength,
+    NonEnglish,
+    /// The reply could not be parsed into the labelled fields at all.
+    Reply,
+    /// The provider could not be reached or returned a server error.
+    Connection,
+    /// Missing model, API key or an unusable image.
+    Setup,
+    Image,
+    Other,
+}
+
+impl FailureCause {
+    pub const ALL: [FailureCause; 9] = [
+        FailureCause::Keywords,
+        FailureCause::TitleLength,
+        FailureCause::CaptionLength,
+        FailureCause::NonEnglish,
+        FailureCause::Reply,
+        FailureCause::Connection,
+        FailureCause::Setup,
+        FailureCause::Image,
+        FailureCause::Other,
+    ];
+
+    /// Short label used in the batch summary.
+    pub fn label(self) -> &'static str {
+        match self {
+            FailureCause::Keywords => "keywords short",
+            FailureCause::TitleLength => "title length",
+            FailureCause::CaptionLength => "caption length",
+            FailureCause::NonEnglish => "non-English text",
+            FailureCause::Reply => "unreadable reply",
+            FailureCause::Connection => "connection",
+            FailureCause::Setup => "setup",
+            FailureCause::Image => "image",
+            FailureCause::Other => "other",
+        }
+    }
+}
+
+/// Classify a stored failure message. The messages come from this module and
+/// from the batch worker, so a marker scan is enough and keeps the error text
+/// readable for the user.
+pub fn classify_failure(message: &str) -> FailureCause {
+    let text = message.to_ascii_lowercase();
+    if text.contains("usable keywords") {
+        return FailureCause::Keywords;
+    }
+    if text.contains("non-english letters") {
+        return FailureCause::NonEnglish;
+    }
+    if text.contains("a title with") {
+        return FailureCause::TitleLength;
+    }
+    if text.contains("a caption with") {
+        return FailureCause::CaptionLength;
+    }
+    if text.contains("no model configured")
+        || text.contains("needs an api key")
+        || text.contains("could not be encoded")
+    {
+        return FailureCause::Setup;
+    }
+    if text.contains("could not read image") || text.contains("image preparation failed") {
+        return FailureCause::Image;
+    }
+    if text.contains("reply was missing")
+        || text.contains("empty reply")
+        || text.contains("could not be read")
+    {
+        return FailureCause::Reply;
+    }
+    if text.contains("error sending request")
+        || text.contains("connection")
+        || text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("refused")
+        || text.contains("unreachable")
+        || text.contains("builder error")
+        || text.contains("dns")
+    {
+        return FailureCause::Connection;
+    }
+    FailureCause::Other
+}
+
 fn within_range(value: usize, range: (usize, usize)) -> bool {
     (range.0..=range.1).contains(&value)
 }
 
-/// A title or caption is valid when it fits the configured range and contains
+/// A title is valid when it fits the configured word range and contains English
+/// letters only.
+fn title_ok(metadata: &prompt::GeneratedMetadata, title_range: (usize, usize)) -> bool {
+    within_range(prompt::title_word_count(&metadata.title), title_range)
+        && !prompt::contains_non_english_letters(&metadata.title)
+}
+
+/// A caption is valid when it fits the configured character range and contains
 /// English letters only.
+fn caption_ok(metadata: &prompt::GeneratedMetadata, caption_range: (usize, usize)) -> bool {
+    within_range(prompt::caption_char_count(&metadata.caption), caption_range)
+        && !prompt::contains_non_english_letters(&metadata.caption)
+}
+
+/// A reply is valid when both text fields are valid.
 fn metadata_ok(
     metadata: &prompt::GeneratedMetadata,
     title_range: (usize, usize),
     caption_range: (usize, usize),
 ) -> bool {
-    within_range(prompt::title_word_count(&metadata.title), title_range)
-        && within_range(prompt::caption_char_count(&metadata.caption), caption_range)
-        && !prompt::contains_non_english_letters(&metadata.title)
-        && !prompt::contains_non_english_letters(&metadata.caption)
+    title_ok(metadata, title_range) && caption_ok(metadata, caption_range)
 }
 
 /// Keep the first reply's keywords and let the candidate fill a short list, so a
-/// second pass can only add usable terms. `replace_text` swaps in the candidate
-/// title/caption when the candidate pair is valid.
+/// second pass can only add usable terms.
+///
+/// Each text field is accepted on its own: a retry that fixes the title while
+/// overshooting the caption length (or the reverse) must not throw the repaired
+/// field away, otherwise one stubborn field keeps costing whole attempts.
 fn merge_candidate(
     result: &mut prompt::GeneratedMetadata,
     candidate: prompt::GeneratedMetadata,
-    replace_text: bool,
+    title_range: (usize, usize),
+    caption_range: (usize, usize),
     keyword_target: usize,
 ) {
-    if replace_text {
+    let take_title = title_ok(&candidate, title_range);
+    let take_caption = caption_ok(&candidate, caption_range);
+    if take_title {
         result.title = candidate.title;
+    }
+    if take_caption {
         result.caption = candidate.caption;
+        // The editorial flag describes the caption that is actually kept.
         result.editorial = candidate.editorial;
     }
-    let combined = result
-        .keywords
+    if (take_title && take_caption) || result.category.trim().is_empty() {
+        result.category = candidate.category;
+    }
+    append_keywords(&mut result.keywords, &candidate.keywords, keyword_target);
+}
+
+/// Add new terms to an accepted list, keeping its order and re-running the same
+/// duplicate, singular/plural and cap rules used for a fresh reply.
+fn append_keywords(keywords: &mut Vec<String>, extra: &[String], keyword_target: usize) {
+    if extra.is_empty() {
+        return;
+    }
+    let combined = keywords
         .iter()
-        .chain(candidate.keywords.iter())
+        .chain(extra.iter())
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    result.keywords = prompt::normalize_keywords_with_target(&combined, keyword_target);
+    *keywords = prompt::normalize_keywords_with_target(&combined, keyword_target);
 }
 
 async fn chat(
@@ -315,6 +515,7 @@ async fn chat(
     req: &AiRequest,
     system: &str,
     user: &str,
+    image: Option<&str>,
     temperature: f64,
 ) -> Result<String> {
     let settings = &req.settings;
@@ -323,28 +524,10 @@ async fn chat(
 
     match req.provider {
         Provider::Ollama => {
-            ollama::chat(
-                client,
-                base_url,
-                model,
-                system,
-                user,
-                &req.image_base64,
-                temperature,
-            )
-            .await
+            ollama::chat(client, base_url, model, system, user, image, temperature).await
         }
         Provider::LmStudio => {
-            lmstudio::chat(
-                client,
-                base_url,
-                model,
-                system,
-                user,
-                &req.image_base64,
-                temperature,
-            )
-            .await
+            lmstudio::chat(client, base_url, model, system, user, image, temperature).await
         }
         Provider::OpenAi => {
             let url = endpoint(base_url, "/chat/completions");
@@ -355,7 +538,7 @@ async fn chat(
                 model,
                 system,
                 user,
-                &req.image_base64,
+                image,
                 temperature,
             )
             .await
@@ -369,7 +552,7 @@ async fn chat(
                 model,
                 system,
                 user,
-                &req.image_base64,
+                image,
                 temperature,
             )
             .await

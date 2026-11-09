@@ -2,7 +2,7 @@ pub mod tags;
 pub mod writer;
 
 pub use tags::ExistingMetadata;
-pub use writer::Metadata;
+pub use writer::{Metadata, Rights};
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -59,14 +59,25 @@ impl ExifTool {
         output.with_context(|| format!("Could not run exiftool at {}", self.program.display()))
     }
 
-    /// Read title, caption, keywords, GPS location, capture date and dimensions from a JPEG.
+    /// Read title, caption, keywords, GPS location, capture date and dimensions.
+    /// Video files use group-qualified XMP/QuickTime Keys tags; images keep the
+    /// existing XMP-first, IPTC/EXIF-fallback read.
     pub fn read(&self, path: &Path) -> Result<ExistingMetadata> {
+        let video = is_video_path(path);
         let mut args: Vec<String> = vec![
             "-j".to_string(),
             "-charset".to_string(),
             "iptc=utf8".to_string(),
         ];
-        args.extend(tags::READ_TAGS.iter().map(|tag| tag.to_string()));
+        if video {
+            args.push("-G1".to_string());
+        }
+        let read_tags = if video {
+            tags::VIDEO_READ_TAGS
+        } else {
+            tags::READ_TAGS
+        };
+        args.extend(read_tags.iter().map(|tag| tag.to_string()));
         args.push(path.to_string_lossy().to_string());
 
         let output = self.run(args)?;
@@ -81,36 +92,63 @@ impl ExifTool {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // ExifTool normally reports Orientation from EXIF or XMP. When it does
-        // not, read the JPEG's own tags so an XMP-only orientation still
-        // swaps the reported dimensions.
-        let fallback = if tags::has_orientation(&stdout) {
-            None
+        let parsed = if video {
+            tags::parse_video_read_json(&stdout)
         } else {
-            std::fs::read(path)
-                .ok()
-                .and_then(|bytes| crate::orientation::from_jpeg(&bytes))
-        };
-        let parsed = match fallback {
-            Some(orientation) => tags::parse_read_json_with_orientation(&stdout, Some(orientation)),
-            None => tags::parse_read_json(&stdout),
+            // ExifTool normally reports Orientation from EXIF or XMP. When it
+            // does not, read the JPEG's own tags so an XMP-only orientation
+            // still swaps the reported dimensions.
+            let fallback = if tags::has_orientation(&stdout) {
+                None
+            } else {
+                std::fs::read(path)
+                    .ok()
+                    .and_then(|bytes| crate::orientation::from_jpeg(&bytes))
+            };
+            match fallback {
+                Some(orientation) => {
+                    tags::parse_read_json_with_orientation(&stdout, Some(orientation))
+                }
+                None => tags::parse_read_json(&stdout),
+            }
         };
         parsed.with_context(|| format!("Could not parse metadata for {}", path.display()))
     }
 
-    /// Read metadata for a whole folder in one exiftool invocation. Entries
-    /// that exiftool cannot read are omitted; the caller marks them failed.
+    /// Read metadata for a whole folder, splitting video and image files so
+    /// each gets the correct tag groups and parser.
     pub fn read_many(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, ExistingMetadata>> {
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
 
+        let (videos, images): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.iter().cloned().partition(|path| is_video_path(path));
+        let mut metadata = HashMap::new();
+        if !images.is_empty() {
+            metadata.extend(self.read_many_group(&images, tags::READ_TAGS, false)?);
+        }
+        if !videos.is_empty() {
+            metadata.extend(self.read_many_group(&videos, tags::VIDEO_READ_TAGS, true)?);
+        }
+        Ok(metadata)
+    }
+
+    fn read_many_group(
+        &self,
+        paths: &[PathBuf],
+        read_tags: &[&str],
+        grouped: bool,
+    ) -> Result<HashMap<PathBuf, ExistingMetadata>> {
         let mut args: Vec<String> = vec![
             "-j".to_string(),
             "-charset".to_string(),
             "iptc=utf8".to_string(),
         ];
-        args.extend(tags::READ_TAGS.iter().map(|tag| tag.to_string()));
+        if grouped {
+            args.push("-G1".to_string());
+        }
+        args.extend(read_tags.iter().map(|tag| tag.to_string()));
         args.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
 
         let output = self.run(args)?;
@@ -136,6 +174,10 @@ impl ExifTool {
             let Some(path) = requested.remove(&path_key(Path::new(source))) else {
                 continue;
             };
+            if grouped {
+                metadata.insert(path, tags::parse_video_read_object(object));
+                continue;
+            }
             let fallback = if tags::has_orientation_in_object(object) {
                 None
             } else {
@@ -148,13 +190,49 @@ impl ExifTool {
         Ok(metadata)
     }
 
-    /// Write title, caption and keywords into EXIF / IPTC / XMP.
+    /// Write title, caption, keywords and category into EXIF / IPTC / XMP for
+    /// images, or XMP / QuickTime Keys for MP4/MOV video.
     pub fn write(&self, path: &Path, md: &Metadata) -> Result<()> {
+        let args = if is_video_path(path) {
+            writer::video_write_args(md, &Rights::default(), false)
+        } else {
+            writer::write_args(md)
+        };
+        self.write_with_args(path, args)
+    }
+
+    /// Write generated metadata plus the rights fields configured in Settings.
+    pub fn write_with_rights(&self, path: &Path, md: &Metadata, rights: &Rights) -> Result<()> {
+        self.write_with_rights_and_clear(path, md, rights, false)
+    }
+
+    /// Write metadata, the resolved rights fields, and optionally remove both
+    /// keyword tags when the user explicitly cleared the keyword list.
+    pub fn write_with_rights_and_clear(
+        &self,
+        path: &Path,
+        md: &Metadata,
+        rights: &Rights,
+        clear_keywords: bool,
+    ) -> Result<()> {
+        let args = if is_video_path(path) {
+            writer::video_write_args(md, rights, clear_keywords)
+        } else {
+            let mut args = writer::write_args(md);
+            args.extend(writer::rights_args(rights));
+            if clear_keywords {
+                args.extend(writer::clear_keyword_args());
+            }
+            args
+        };
+        self.write_with_args(path, args)
+    }
+
+    fn write_with_args(&self, path: &Path, mut args: Vec<String>) -> Result<()> {
         if !path.is_file() {
             bail!("File not found: {}", path.display());
         }
 
-        let mut args = writer::write_args(md);
         args.push(path.to_string_lossy().to_string());
 
         let output = self.run(args)?;
@@ -283,7 +361,74 @@ pub fn verify_written(md: &Metadata, read: &ExistingMetadata) -> Result<()> {
         );
     }
 
+    let expected_category = md.category.trim();
+    if !expected_category.is_empty() {
+        let read_category = read
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .with_context(|| "Saved category could not be read back")?;
+        if read_category != expected_category {
+            bail!(
+                "Saved category did not verify: expected {:?}, found {:?}",
+                expected_category,
+                read_category
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Verify the configured rights fields that ExifTool reads back after a write.
+/// Blank settings are not compared because they are not written.
+pub fn verify_rights(rights: &Rights, read: &ExistingMetadata) -> Result<()> {
+    let checks = [
+        ("Creator", rights.creator.trim(), read.creator.as_deref()),
+        (
+            "Copyright Notice",
+            rights.copyright.trim(),
+            read.copyright.as_deref(),
+        ),
+        (
+            "Credit Line",
+            rights.credit_line.trim(),
+            read.credit_line.as_deref(),
+        ),
+        (
+            "Rights Usage Terms",
+            rights.usage_terms.trim(),
+            read.usage_terms.as_deref(),
+        ),
+    ];
+    for (label, expected, found) in checks {
+        if expected.is_empty() {
+            continue;
+        }
+        let found = found
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("Saved {label} could not be read back"))?;
+        if found != expected {
+            bail!(
+                "Saved {label} did not verify: expected {:?}, found {:?}",
+                expected,
+                found
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_video_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov")
+    )
 }
 
 fn command_for(program: &Path) -> Command {
@@ -394,6 +539,7 @@ mod tests {
             title: "Golden Gate Sunrise".into(),
             caption: "Fog drifts under the Golden Gate Bridge at sunrise in San Francisco.".into(),
             keywords: vec!["bridge".into(), "sunrise".into(), "fog".into()],
+            category: "Nature".into(),
         };
 
         tool.write(&path, &metadata).expect("metadata write");
@@ -408,6 +554,7 @@ mod tests {
         assert!(read.keywords.iter().any(|keyword| keyword == "bridge"));
         assert!(read.keywords.iter().any(|keyword| keyword == "sunrise"));
         assert!(read.keywords.iter().any(|keyword| keyword == "fog"));
+        assert_eq!(read.category.as_deref(), Some("Nature"));
         assert_eq!(read.dims, Some((64, 48)));
     }
 
@@ -504,11 +651,86 @@ mod tests {
     }
 
     #[test]
+    fn rights_fields_round_trip_and_verify() {
+        let Some(tool) = require_tool() else { return };
+        let path = temp_jpeg("rights", 32, 24);
+
+        let metadata = Metadata {
+            title: "Rights Round Trip".into(),
+            caption: String::new(),
+            keywords: vec!["rights".into()],
+            category: String::new(),
+        };
+        let rights = Rights {
+            creator: "Jane Doe".into(),
+            copyright: "© 2026 Jane Doe".into(),
+            credit_line: "Jane Doe".into(),
+            usage_terms: "Commercial use only".into(),
+        };
+        tool.write_with_rights(&path, &metadata, &rights)
+            .expect("write rights");
+
+        let read = tool.read(&path).expect("read rights");
+        verify_rights(&rights, &read).expect("rights verification");
+        assert_eq!(read.creator.as_deref(), Some("Jane Doe"));
+        assert_eq!(read.copyright.as_deref(), Some("© 2026 Jane Doe"));
+        assert_eq!(read.credit_line.as_deref(), Some("Jane Doe"));
+        assert_eq!(read.usage_terms.as_deref(), Some("Commercial use only"));
+    }
+
+    #[test]
+    fn clearing_keywords_removes_both_tag_lists() {
+        let Some(tool) = require_tool() else { return };
+        let path = temp_jpeg("clear-keywords", 32, 24);
+        let metadata = Metadata {
+            title: "Clear Keywords".into(),
+            caption: "A caption for the clearing test.".into(),
+            keywords: vec!["alpha".into(), "beta".into()],
+            category: "Nature".into(),
+        };
+        tool.write_with_rights(&path, &metadata, &Rights::default())
+            .expect("seed keywords");
+        assert!(!tool.read(&path).expect("read seeded").keywords.is_empty());
+
+        let cleared = Metadata {
+            keywords: Vec::new(),
+            ..metadata
+        };
+        tool.write_with_rights_and_clear(&path, &cleared, &Rights::default(), true)
+            .expect("clear keywords");
+        let read = tool.read(&path).expect("read cleared");
+        assert!(read.keywords.is_empty(), "got {:?}", read.keywords);
+    }
+
+    #[test]
+    fn png_round_trip_writes_xmp_metadata() {
+        let Some(tool) = require_tool() else { return };
+        let dir = std::env::temp_dir().join("autowording-tests");
+        std::fs::create_dir_all(&dir).expect("png test dir");
+        let path = dir.join(format!("round-trip-{}.png", std::process::id()));
+        image::RgbImage::from_pixel(32, 24, image::Rgb([10, 120, 200]))
+            .save(&path)
+            .expect("write png fixture");
+
+        let metadata = Metadata {
+            title: "Png Round Trip".into(),
+            caption: "A png caption for the metadata round-trip test.".into(),
+            keywords: vec!["png".into(), "alpha".into(), "beta".into()],
+            category: "Nature".into(),
+        };
+        tool.write(&path, &metadata).expect("write png metadata");
+        let read = tool.read(&path).expect("read png metadata");
+        verify_written(&metadata, &read).expect("png metadata verification");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn verify_written_accepts_caption_fallback_and_case_insensitive_keywords() {
         let metadata = Metadata {
             title: "Golden Gate Sunrise".into(),
             caption: String::new(),
             keywords: vec!["bridge".into(), "Sunrise".into()],
+            category: String::new(),
         };
         let read = ExistingMetadata {
             title: Some("Golden Gate Sunrise".into()),
@@ -534,6 +756,7 @@ mod tests {
             title: "First Title".into(),
             caption: "First caption that is long enough for the stock metadata round-trip.".into(),
             keywords: vec!["one".into(), "two".into(), "three".into()],
+            category: String::new(),
         };
         tool.write(&path, &first).expect("first write");
 
@@ -541,6 +764,7 @@ mod tests {
             title: "Second Title".into(),
             caption: "Second caption that is long enough for the stock metadata round-trip.".into(),
             keywords: vec!["alpha".into(), "beta".into()],
+            category: String::new(),
         };
         tool.write(&path, &second).expect("second write");
 
@@ -567,6 +791,7 @@ mod tests {
             title: "Café Terrace at Night".into(),
             caption: "Café tables under warm evening light in an old town square.".into(),
             keywords: vec!["café".into(), "terrace".into(), "naïve".into()],
+            category: String::new(),
         };
         tool.write(&path, &metadata).expect("unicode write");
         let read = tool.read(&path).expect("unicode read");
@@ -603,6 +828,7 @@ mod tests {
             caption: "A caption long enough to satisfy the microstock metadata requirements."
                 .into(),
             keywords: keywords.clone(),
+            category: String::new(),
         };
         tool.write(&path, &metadata).expect("write fifty keywords");
         let read = tool.read(&path).expect("read fifty keywords");
@@ -627,6 +853,7 @@ mod tests {
             title: "Missing".into(),
             caption: String::new(),
             keywords: vec![],
+            category: String::new(),
         };
         assert!(tool.write(&missing, &metadata).is_err());
         assert!(tool.read(&missing).is_err());
@@ -659,6 +886,7 @@ mod tests {
                 title: "Batch First".into(),
                 caption: "First batch caption long enough for stock metadata.".into(),
                 keywords: vec!["first".into(), "batch".into()],
+                category: String::new(),
             },
         )
         .expect("first metadata write");
@@ -668,6 +896,7 @@ mod tests {
                 title: "Batch Second".into(),
                 caption: "Second batch caption long enough for stock metadata.".into(),
                 keywords: vec!["second".into(), "batch".into()],
+                category: String::new(),
             },
         )
         .expect("second metadata write");
@@ -702,6 +931,7 @@ mod tests {
             title: "Café 北京 Titel".into(),
             caption: "Café 北京 description with enough characters to look realistic.".into(),
             keywords: vec!["café".into(), "北京".into()],
+            category: String::new(),
         };
         tool.write(&path, &metadata)
             .expect("write unicode filename");

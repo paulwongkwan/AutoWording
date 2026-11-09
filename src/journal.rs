@@ -17,6 +17,12 @@ pub struct JournalEntry {
     pub caption: String,
     pub keywords: Vec<String>,
     pub editorial: bool,
+    pub category: String,
+    pub creator: String,
+    pub copyright: String,
+    pub credit_line: String,
+    pub rights_usage_terms: String,
+    pub clear_keywords: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,6 +38,18 @@ struct StoredEntry {
     caption: String,
     keywords: Vec<String>,
     editorial: bool,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    creator: String,
+    #[serde(default)]
+    copyright: String,
+    #[serde(default)]
+    credit_line: String,
+    #[serde(default)]
+    rights_usage_terms: String,
+    #[serde(default)]
+    clear_keywords: bool,
 }
 
 /// Journal next to `config.toml`.
@@ -81,6 +99,12 @@ fn load_from(path: &Path) -> HashMap<PathBuf, JournalEntry> {
                     caption: stored.caption,
                     keywords: stored.keywords,
                     editorial: stored.editorial,
+                    category: stored.category,
+                    creator: stored.creator,
+                    copyright: stored.copyright,
+                    credit_line: stored.credit_line,
+                    rights_usage_terms: stored.rights_usage_terms,
+                    clear_keywords: stored.clear_keywords,
                 },
             ))
         })
@@ -106,6 +130,12 @@ fn save_to(entries: &HashMap<PathBuf, JournalEntry>, path: &Path) -> anyhow::Res
                 caption: entry.caption.clone(),
                 keywords: entry.keywords.clone(),
                 editorial: entry.editorial,
+                category: entry.category.clone(),
+                creator: entry.creator.clone(),
+                copyright: entry.copyright.clone(),
+                credit_line: entry.credit_line.clone(),
+                rights_usage_terms: entry.rights_usage_terms.clone(),
+                clear_keywords: entry.clear_keywords,
             })
             .collect(),
     };
@@ -133,6 +163,12 @@ mod tests {
             caption: "A caption that was never saved.".to_string(),
             keywords: vec!["harbour".to_string(), "dawn".to_string()],
             editorial: true,
+            category: "Travel".to_string(),
+            creator: "Jane Doe".to_string(),
+            copyright: "© 2026 Jane Doe".to_string(),
+            credit_line: "Jane Doe".to_string(),
+            rights_usage_terms: "Commercial use only".to_string(),
+            clear_keywords: false,
         }
     }
 

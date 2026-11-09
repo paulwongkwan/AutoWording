@@ -5,7 +5,13 @@ pub use app_view::AutoWordingView;
 
 gpui_kit::actions!(
     autowording,
-    [ToggleInspector, PauseBatch, ResumeBatch, CancelBatch]
+    [
+        ToggleInspector,
+        PauseBatch,
+        ResumeBatch,
+        CancelBatch,
+        UndoKeywordCleanup
+    ]
 );
 
 pub fn init_keybindings(cx: &mut gpui_kit::App) {
@@ -14,6 +20,7 @@ pub fn init_keybindings(cx: &mut gpui_kit::App) {
         gpui_kit::KeyBinding::new("ctrl-p", PauseBatch, Some("AutoWording")),
         gpui_kit::KeyBinding::new("ctrl-shift-p", ResumeBatch, Some("AutoWording")),
         gpui_kit::KeyBinding::new("ctrl-shift-c", CancelBatch, Some("AutoWording")),
+        gpui_kit::KeyBinding::new("ctrl-z", UndoKeywordCleanup, Some("AutoWording")),
     ]);
 }
 

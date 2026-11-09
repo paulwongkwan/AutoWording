@@ -6,6 +6,11 @@ pub struct ExistingMetadata {
     pub title: Option<String>,
     pub caption: Option<String>,
     pub keywords: Vec<String>,
+    pub category: Option<String>,
+    pub creator: Option<String>,
+    pub copyright: Option<String>,
+    pub credit_line: Option<String>,
+    pub usage_terms: Option<String>,
     pub gps: Option<String>,
     pub date: Option<String>,
     pub dims: Option<(u32, u32)>,
@@ -21,6 +26,12 @@ pub const READ_TAGS: &[&str] = &[
     "-XPTitle",
     "-IPTC:Keywords",
     "-Subject",
+    "-IPTC:Category",
+    "-XMP-photoshop:Category",
+    "-XMP-dc:Creator",
+    "-XMP-dc:Rights",
+    "-XMP-photoshop:Credit",
+    "-XMP-xmpRights:UsageTerms",
     "-GPSPosition",
     "-GPSLatitude",
     "-GPSLongitude",
@@ -29,6 +40,35 @@ pub const READ_TAGS: &[&str] = &[
     "-DateTime",
     "-ImageSize",
     "-Orientation#",
+];
+
+/// Group-qualified tags for MP4/MOV files. XMP is written by Adobe tools;
+/// QuickTime Keys is written by Apple tools. Reading both avoids depending on
+/// ExifTool's preferred-group order.
+pub const VIDEO_READ_TAGS: &[&str] = &[
+    "-XMP-dc:Title",
+    "-Keys:Title",
+    "-ItemList:Title",
+    "-UserData:Title",
+    "-XMP-dc:Description",
+    "-Keys:Description",
+    "-ItemList:Description",
+    "-UserData:Description",
+    "-XMP-dc:Subject",
+    "-Keys:Keywords",
+    "-XMP-photoshop:Category",
+    "-XMP-dc:Creator",
+    "-Keys:Author",
+    "-XMP-dc:Rights",
+    "-Keys:Copyright",
+    "-XMP-photoshop:Credit",
+    "-XMP-xmpRights:UsageTerms",
+    "-ImageSize",
+    "-CreateDate",
+    "-Keys:CreationDate",
+    "-GPSPosition",
+    "-GPSLatitude",
+    "-GPSLongitude",
 ];
 
 fn orientation_number(value: &Value) -> Option<u8> {
@@ -102,6 +142,87 @@ fn keyword_list(object: &Value, key: &str) -> Vec<String> {
     }
 }
 
+/// Parse the group-qualified JSON produced by `exiftool -j -G1` for video.
+pub fn parse_video_read_json(text: &str) -> Result<ExistingMetadata> {
+    let value: Value = serde_json::from_str(text)?;
+    let object = value
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or_else(|| anyhow!("exiftool returned no metadata"))?;
+    Ok(parse_video_read_object(object))
+}
+
+/// Parse one group-qualified video entry. XMP wins over QuickTime Keys, and
+/// both keyword sources are merged without case-insensitive duplicates.
+pub(crate) fn parse_video_read_object(object: &Value) -> ExistingMetadata {
+    let title = first_string(
+        object,
+        &[
+            "XMP-dc:Title",
+            "Keys:Title",
+            "ItemList:Title",
+            "UserData:Title",
+        ],
+    );
+    let caption = first_string(
+        object,
+        &[
+            "XMP-dc:Description",
+            "Keys:Description",
+            "ItemList:Description",
+            "UserData:Description",
+        ],
+    );
+    let category = first_string(object, &["XMP-photoshop:Category"]);
+    let creator = first_string(object, &["XMP-dc:Creator", "Keys:Author"]);
+    let copyright = first_string(object, &["XMP-dc:Rights", "Keys:Copyright"]);
+    let credit_line = first_string(object, &["XMP-photoshop:Credit"]);
+    let usage_terms = first_string(object, &["XMP-xmpRights:UsageTerms"]);
+
+    let mut keywords: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for source in ["XMP-dc:Subject", "Keys:Keywords"] {
+        for keyword in keyword_list(object, source) {
+            if seen.insert(keyword.to_lowercase()) {
+                keywords.push(keyword);
+            }
+        }
+    }
+
+    let dims = object
+        .get("ImageSize")
+        .or_else(|| object.get("Composite:ImageSize"))
+        .or_else(|| object.get("File:ImageSize"))
+        .or_else(|| object.get("QuickTime:ImageSize"))
+        .and_then(Value::as_str)
+        .and_then(|size| {
+            let (width, height) = size.split_once('x')?;
+            Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+        });
+
+    ExistingMetadata {
+        title,
+        caption,
+        keywords,
+        category,
+        creator,
+        copyright,
+        credit_line,
+        usage_terms,
+        gps: gps_location(object),
+        date: first_string(
+            object,
+            &[
+                "CreateDate",
+                "QuickTime:CreateDate",
+                "XMP-xmp:CreateDate",
+                "Keys:CreationDate",
+            ],
+        ),
+        dims,
+    }
+}
+
 /// Parse the `exiftool -json` output into the editable fields.
 pub fn parse_read_json(text: &str) -> Result<ExistingMetadata> {
     parse_read_json_with_orientation(text, None)
@@ -131,6 +252,12 @@ pub(crate) fn parse_read_object(
         object,
         &["Description", "Caption-Abstract", "ImageDescription"],
     );
+
+    let category = first_string(object, &["Category"]);
+    let creator = first_string(object, &["Creator"]);
+    let copyright = first_string(object, &["Rights"]);
+    let credit_line = first_string(object, &["Credit"]);
+    let usage_terms = first_string(object, &["UsageTerms"]);
 
     let mut keywords: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -168,6 +295,11 @@ pub(crate) fn parse_read_object(
         title,
         caption,
         keywords,
+        category,
+        creator,
+        copyright,
+        credit_line,
+        usage_terms,
         gps,
         date,
         dims,
@@ -177,6 +309,61 @@ pub(crate) fn parse_read_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_grouped_video_metadata_and_merges_keyword_sources() {
+        let json = r#"[{
+            "SourceFile": "D:/clips/harbour.mp4",
+            "XMP-dc:Title": "Harbour at Dawn",
+            "Keys:Title": "Fallback title",
+            "XMP-dc:Description": "Waves break against the stone pier.",
+            "Keys:Description": "Fallback description",
+            "XMP-dc:Subject": ["harbour", "dawn"],
+            "Keys:Keywords": "dawn, ocean, stone pier",
+            "XMP-photoshop:Category": "Nature",
+            "XMP-dc:Creator": "Jane Doe",
+            "Keys:Author": "Fallback author",
+            "XMP-dc:Rights": "Copyright 2026 Jane Doe",
+            "Keys:Copyright": "Fallback copyright",
+            "XMP-photoshop:Credit": "Jane Doe",
+            "XMP-xmpRights:UsageTerms": "Commercial use",
+            "Composite:ImageSize": "1920x1080",
+            "CreateDate": "2026:11:09 10:00:00"
+        }]"#;
+        let parsed = parse_video_read_json(json).expect("valid video json");
+        assert_eq!(parsed.title.as_deref(), Some("Harbour at Dawn"));
+        assert_eq!(
+            parsed.caption.as_deref(),
+            Some("Waves break against the stone pier.")
+        );
+        assert_eq!(
+            parsed.keywords,
+            vec!["harbour", "dawn", "ocean", "stone pier"]
+        );
+        assert_eq!(parsed.category.as_deref(), Some("Nature"));
+        assert_eq!(parsed.creator.as_deref(), Some("Jane Doe"));
+        assert_eq!(parsed.copyright.as_deref(), Some("Copyright 2026 Jane Doe"));
+        assert_eq!(parsed.credit_line.as_deref(), Some("Jane Doe"));
+        assert_eq!(parsed.usage_terms.as_deref(), Some("Commercial use"));
+        assert_eq!(parsed.dims, Some((1920, 1080)));
+        assert_eq!(parsed.date.as_deref(), Some("2026:11:09 10:00:00"));
+    }
+
+    #[test]
+    fn video_read_falls_back_to_quicktime_keys_and_rejects_empty_payloads() {
+        let json = r#"[{
+            "Keys:Title": "Keys title",
+            "Keys:Description": "Keys description",
+            "Keys:Keywords": "one, two",
+            "XMP-xmp:CreateDate": "2026:11:09 10:00:00"
+        }]"#;
+        let parsed = parse_video_read_json(json).expect("keys fallback");
+        assert_eq!(parsed.title.as_deref(), Some("Keys title"));
+        assert_eq!(parsed.caption.as_deref(), Some("Keys description"));
+        assert_eq!(parsed.keywords, vec!["one", "two"]);
+        assert_eq!(parsed.date.as_deref(), Some("2026:11:09 10:00:00"));
+        assert!(parse_video_read_json("[]").is_err());
+    }
 
     #[test]
     fn orientation_tag_swaps_dimensions_for_rotated_photos() {
@@ -232,6 +419,28 @@ mod tests {
                 .dims,
             Some((6000, 4000)),
             "EXIF says upright, so the XMP rotation must not be applied"
+        );
+    }
+
+    #[test]
+    fn reads_the_rights_fields_from_xmp() {
+        let json = r#"[{"Creator":"Jane Doe","Rights":"© 2026 Jane Doe","Credit":"Jane Doe","UsageTerms":"Commercial use only"}]"#;
+        let read = parse_read_json(json).expect("valid json");
+        assert_eq!(read.creator.as_deref(), Some("Jane Doe"));
+        assert_eq!(read.copyright.as_deref(), Some("© 2026 Jane Doe"));
+        assert_eq!(read.credit_line.as_deref(), Some("Jane Doe"));
+        assert_eq!(read.usage_terms.as_deref(), Some("Commercial use only"));
+    }
+
+    #[test]
+    fn reads_the_ipct_category() {
+        let json = r#"[{"Category":"Nature"}]"#;
+        assert_eq!(
+            parse_read_json(json)
+                .expect("valid json")
+                .category
+                .as_deref(),
+            Some("Nature")
         );
     }
 

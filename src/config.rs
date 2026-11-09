@@ -7,6 +7,11 @@ pub const KEYWORD_TARGET_DEFAULT: usize = 50;
 pub const KEYWORD_TARGET_MIN: usize = 1;
 pub const KEYWORD_TARGET_MAX: usize = 50;
 
+/// Default and safe bounds for the share of the keyword target accepted.
+pub const KEYWORD_ACCEPT_DEFAULT: usize = 80;
+pub const KEYWORD_ACCEPT_MIN: usize = 1;
+pub const KEYWORD_ACCEPT_MAX: usize = 100;
+
 /// Default and safe bounds for the configurable title word range.
 pub const TITLE_WORDS_DEFAULT_MIN: usize = 3;
 pub const TITLE_WORDS_DEFAULT_MAX: usize = 5;
@@ -21,6 +26,10 @@ pub const CAPTION_CHARS_MAX: usize = 1000;
 
 pub fn clamp_keyword_target(target: usize) -> usize {
     target.clamp(KEYWORD_TARGET_MIN, KEYWORD_TARGET_MAX)
+}
+
+pub fn clamp_keyword_accept_percent(percent: usize) -> usize {
+    percent.clamp(KEYWORD_ACCEPT_MIN, KEYWORD_ACCEPT_MAX)
 }
 
 fn clamp_range(min: usize, max: usize, floor: usize, ceiling: usize) -> (usize, usize) {
@@ -356,6 +365,14 @@ pub struct Config {
     pub anthropic: ProviderSettings,
     /// Extra instructions appended to the built-in system prompt.
     pub global_prompt: String,
+    /// Creator name written to XMP-dc:Creator and IPTC:By-line.
+    pub creator: String,
+    /// Copyright notice written to XMP-dc:Rights and IPTC:CopyrightNotice.
+    pub copyright: String,
+    /// Credit line written to XMP-photoshop:Credit and IPTC:Credit.
+    pub credit_line: String,
+    /// Usage terms written to XMP-xmpRights:UsageTerms.
+    pub rights_usage_terms: String,
     /// Optional explicit path to exiftool. Empty means auto-detect.
     pub exiftool_path: String,
     /// Last folder opened in the browser, restored on next launch.
@@ -370,6 +387,8 @@ pub struct Config {
     pub marketplace: Marketplace,
     /// Desired number of keywords per image (clamped to 1..=50 at use).
     pub keyword_target: usize,
+    /// Percentage of the keyword target accepted as complete (clamped to 1..=100).
+    pub keyword_accept_percent: usize,
     /// Desired title word range (clamped to 1..=20 at use).
     pub title_min_words: usize,
     pub title_max_words: usize,
@@ -380,6 +399,8 @@ pub struct Config {
     pub backup_originals: bool,
     /// Read metadata back after writing and fail the save if it does not match.
     pub verify_writes: bool,
+    /// Field-lock choices by lowercased absolute path, restored at startup.
+    pub field_locks: std::collections::HashMap<String, crate::state::FieldLocks>,
     /// Where this config was loaded from / will be saved to.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -394,6 +415,10 @@ impl Default for Config {
             openai: ProviderSettings::for_provider(Provider::OpenAi),
             anthropic: ProviderSettings::for_provider(Provider::Anthropic),
             global_prompt: String::new(),
+            creator: String::new(),
+            copyright: String::new(),
+            credit_line: String::new(),
+            rights_usage_terms: String::new(),
             exiftool_path: String::new(),
             last_folder: String::new(),
             theme: ThemePreference::System,
@@ -401,18 +426,30 @@ impl Default for Config {
             inspector_collapsed: false,
             marketplace: Marketplace::General,
             keyword_target: KEYWORD_TARGET_DEFAULT,
+            keyword_accept_percent: KEYWORD_ACCEPT_DEFAULT,
             title_min_words: TITLE_WORDS_DEFAULT_MIN,
             title_max_words: TITLE_WORDS_DEFAULT_MAX,
             caption_min_chars: CAPTION_CHARS_DEFAULT_MIN,
             caption_max_chars: CAPTION_CHARS_DEFAULT_MAX,
             backup_originals: true,
             verify_writes: true,
+            field_locks: std::collections::HashMap::new(),
             path: None,
         }
     }
 }
 
 impl Config {
+    /// Rights and identity fields stamped onto every saved image.
+    pub fn rights(&self) -> crate::metadata::Rights {
+        crate::metadata::Rights {
+            creator: self.creator.clone(),
+            copyright: self.copyright.clone(),
+            credit_line: self.credit_line.clone(),
+            usage_terms: self.rights_usage_terms.clone(),
+        }
+    }
+
     /// `%APPDATA%\AutoWording\config.toml` on Windows, next to the exe as a fallback.
     pub fn config_path() -> PathBuf {
         if let Some(dirs) = directories::ProjectDirs::from("", "", "AutoWording") {
@@ -516,6 +553,11 @@ impl Config {
         clamp_keyword_target(self.keyword_target)
             .max(self.marketplace.keyword_min())
             .min(self.marketplace.keyword_max())
+    }
+
+    /// The persisted keyword acceptance percentage, clamped to the app bounds.
+    pub fn keyword_accept_percent(&self) -> usize {
+        clamp_keyword_accept_percent(self.keyword_accept_percent)
     }
 
     /// The persisted title range, clamped to the active marketplace, ordered,
@@ -670,6 +712,10 @@ mod tests {
             Provider::Anthropic.default_base_url()
         );
         assert!(cfg.global_prompt.is_empty());
+        assert!(cfg.creator.is_empty());
+        assert!(cfg.copyright.is_empty());
+        assert!(cfg.credit_line.is_empty());
+        assert!(cfg.rights_usage_terms.is_empty());
         assert!(cfg.exiftool_path.is_empty());
         assert!(cfg.last_folder.is_empty());
         assert_eq!(cfg.theme, ThemePreference::System);
@@ -678,6 +724,8 @@ mod tests {
         assert_eq!(cfg.marketplace, Marketplace::General);
         assert_eq!(cfg.keyword_target, KEYWORD_TARGET_DEFAULT);
         assert_eq!(cfg.keyword_target(), KEYWORD_TARGET_DEFAULT);
+        assert_eq!(cfg.keyword_accept_percent, KEYWORD_ACCEPT_DEFAULT);
+        assert_eq!(cfg.keyword_accept_percent(), KEYWORD_ACCEPT_DEFAULT);
         assert_eq!(cfg.title_min_words, TITLE_WORDS_DEFAULT_MIN);
         assert_eq!(cfg.title_max_words, TITLE_WORDS_DEFAULT_MAX);
         assert_eq!(cfg.caption_min_chars, CAPTION_CHARS_DEFAULT_MIN);
@@ -686,6 +734,58 @@ mod tests {
         assert_eq!(cfg.caption_char_range(), (50, 180));
         assert!(cfg.backup_originals);
         assert!(cfg.verify_writes);
+        assert!(cfg.field_locks.is_empty());
+    }
+
+    #[test]
+    fn keyword_accept_percent_is_clamped() {
+        let mut cfg = Config::default();
+        cfg.keyword_accept_percent = 0;
+        assert_eq!(cfg.keyword_accept_percent(), KEYWORD_ACCEPT_MIN);
+        cfg.keyword_accept_percent = 150;
+        assert_eq!(cfg.keyword_accept_percent(), KEYWORD_ACCEPT_MAX);
+        cfg.keyword_accept_percent = 65;
+        assert_eq!(cfg.keyword_accept_percent(), 65);
+    }
+
+    #[test]
+    fn rights_fields_round_trip_through_toml() {
+        let cfg = Config {
+            creator: "Jane Doe".into(),
+            copyright: "© 2026 Jane Doe".into(),
+            credit_line: "Jane Doe".into(),
+            rights_usage_terms: "Commercial use only".into(),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&cfg).expect("serialize rights");
+        let back: Config = toml::from_str(&text).expect("deserialize rights");
+        assert_eq!(back.rights(), cfg.rights());
+        assert_eq!(back.rights().creator, "Jane Doe");
+        assert_eq!(back.rights().copyright, "© 2026 Jane Doe");
+        assert_eq!(back.rights().usage_terms, "Commercial use only");
+    }
+
+    #[test]
+    fn field_locks_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        cfg.field_locks.insert(
+            "c:/photos/one.jpg".to_string(),
+            crate::state::FieldLocks {
+                title: true,
+                category: true,
+                ..Default::default()
+            },
+        );
+        let text = toml::to_string_pretty(&cfg).expect("serialize locks");
+        let back: Config = toml::from_str(&text).expect("deserialize locks");
+        assert_eq!(
+            back.field_locks.get("c:/photos/one.jpg"),
+            Some(&crate::state::FieldLocks {
+                title: true,
+                category: true,
+                ..Default::default()
+            })
+        );
     }
 
     #[test]
@@ -871,6 +971,7 @@ mod tests {
         cfg.exiftool_path = "C:\\tools\\exiftool.exe".into();
         cfg.last_folder = "C:\\Photos\\2026_Stock".into();
         cfg.keyword_target = 37;
+        cfg.keyword_accept_percent = 65;
         cfg.title_min_words = 4;
         cfg.title_max_words = 9;
         cfg.caption_min_chars = 70;
@@ -895,6 +996,7 @@ mod tests {
         assert_eq!(reloaded.exiftool_path, "C:\\tools\\exiftool.exe");
         assert_eq!(reloaded.last_folder, "C:\\Photos\\2026_Stock");
         assert_eq!(reloaded.keyword_target, 37);
+        assert_eq!(reloaded.keyword_accept_percent(), 65);
         assert_eq!(reloaded.title_word_range(), (4, 9));
         assert_eq!(reloaded.caption_char_range(), (70, 240));
         assert!(!reloaded.backup_originals);

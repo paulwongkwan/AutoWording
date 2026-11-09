@@ -9,28 +9,30 @@ pub(crate) fn payload(
     model: &str,
     system: &str,
     user: &str,
-    image_base64: &str,
+    image_base64: Option<&str>,
     temperature: f64,
 ) -> Value {
+    // A keywords-only top-up sends no image, so the content holds one text block.
+    let content = match image_base64 {
+        Some(image_base64) => json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": image_base64
+                }
+            },
+            {"type": "text", "text": user}
+        ]),
+        None => json!([{"type": "text", "text": user}]),
+    };
     json!({
         "model": model,
-        "max_tokens": 900,
+        "max_tokens": super::MAX_REPLY_TOKENS,
         "temperature": temperature,
         "system": system,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": image_base64
-                    }
-                },
-                {"type": "text", "text": user}
-            ]
-        }]
+        "messages": [{"role": "user", "content": content}]
     })
 }
 
@@ -41,7 +43,7 @@ pub async fn chat(
     model: &str,
     system: &str,
     user: &str,
-    image_base64: &str,
+    image_base64: Option<&str>,
     temperature: f64,
 ) -> Result<String> {
     let body = payload(model, system, user, image_base64, temperature);

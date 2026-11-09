@@ -1,7 +1,9 @@
 use crate::ai::prompt::{minimum_keyword_count, GeneratedMetadata};
+use crate::ai::{classify_failure, FailureCause};
 use crate::config::Provider;
-use crate::metadata::{ExifTool, ExistingMetadata, Metadata};
+use crate::metadata::{ExifTool, ExistingMetadata, Metadata, Rights};
 use gpui_kit::RenderImage;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,8 +127,12 @@ impl SortMode {
 
 /// Whether a generation run should leave this image alone. Saved images stay
 /// untouched even when their metadata is partial; Force regenerate overrides.
-pub fn should_skip_generation(item: &ImageItem, keyword_target: usize) -> bool {
-    item.should_skip_generation(keyword_target)
+pub fn should_skip_generation(
+    item: &ImageItem,
+    keyword_target: usize,
+    keyword_accept_percent: usize,
+) -> bool {
+    item.should_skip_generation(keyword_target, keyword_accept_percent)
 }
 
 /// Split requested paths into (skipped, targets) for a generation run.
@@ -138,6 +144,7 @@ pub fn partition_generation_targets(
     items: &HashMap<PathBuf, ImageItem>,
     force: bool,
     keyword_target: usize,
+    keyword_accept_percent: usize,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if force {
         return (Vec::new(), paths);
@@ -145,21 +152,23 @@ pub fn partition_generation_targets(
     paths.into_iter().partition(|path| {
         items
             .get(path)
-            .map(|item| should_skip_generation(item, keyword_target))
+            .map(|item| should_skip_generation(item, keyword_target, keyword_accept_percent))
             .unwrap_or(false)
     })
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FieldLocks {
     pub title: bool,
     pub caption: bool,
     pub keywords: bool,
+    pub category: bool,
 }
 
 impl FieldLocks {
     pub fn all(self) -> bool {
-        self.title && self.caption && self.keywords
+        self.title && self.caption && self.keywords && self.category
     }
 }
 
@@ -175,18 +184,56 @@ pub fn apply_generated_metadata(item: &mut ImageItem, generated: GeneratedMetada
     if !item.locks.keywords {
         item.keywords = generated.keywords;
     }
+    if !item.locks.category {
+        item.category = generated.category;
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct ImageItem {
-    pub path: PathBuf,
+/// Metadata restored by "Undo last save".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageItemSnapshot {
     pub status: Status,
     pub title: String,
     pub caption: String,
     pub keywords: Vec<String>,
     pub editorial: bool,
+    pub category: String,
+    pub creator: String,
+    pub copyright: String,
+    pub credit_line: String,
+    pub usage_terms: String,
+    pub clear_keywords: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageItem {
+    pub path: PathBuf,
+    pub media: MediaKind,
+    pub status: Status,
+    pub title: String,
+    pub caption: String,
+    pub keywords: Vec<String>,
+    pub editorial: bool,
+    pub category: String,
+    /// Per-image rights overrides; empty means use the Settings value.
+    pub creator: String,
+    pub copyright: String,
+    pub credit_line: String,
+    pub usage_terms: String,
+    /// An empty keyword list should remove the file's keyword tags on save.
+    pub clear_keywords: bool,
     pub dirty: bool,
     pub locks: FieldLocks,
+    /// Previous metadata, newest last, captured before each successful write.
+    pub save_history: Vec<ImageItemSnapshot>,
+    /// Snapshot awaiting the result of the in-flight write.
+    pub pending_snapshot: Option<ImageItemSnapshot>,
     pub message: Option<String>,
     pub dims: Option<(u32, u32)>,
     pub gps: Option<String>,
@@ -201,15 +248,25 @@ pub struct ImageItem {
 
 impl ImageItem {
     pub fn new(path: PathBuf) -> Self {
+        let media = media_kind(&path).unwrap_or(MediaKind::Image);
         Self {
             path,
+            media,
             status: Status::Pending,
             title: String::new(),
             caption: String::new(),
             keywords: Vec::new(),
             editorial: false,
+            category: String::new(),
+            creator: String::new(),
+            copyright: String::new(),
+            credit_line: String::new(),
+            usage_terms: String::new(),
+            clear_keywords: false,
             dirty: false,
             locks: FieldLocks::default(),
+            save_history: Vec::new(),
+            pending_snapshot: None,
             message: None,
             dims: None,
             gps: None,
@@ -228,46 +285,159 @@ impl ImageItem {
             .unwrap_or_else(|| self.path.display().to_string())
     }
 
+    pub fn is_video(&self) -> bool {
+        self.media == MediaKind::Video
+    }
+
     pub fn to_metadata(&self) -> Metadata {
         Metadata {
             title: self.title.trim().to_string(),
             caption: self.caption.trim().to_string(),
             keywords: self.keywords.clone(),
+            category: self.category.trim().to_string(),
         }
+    }
+
+    /// Resolve the four rights fields, falling back to Settings when the image
+    /// has no override.
+    pub fn rights(&self, defaults: &Rights) -> Rights {
+        Rights {
+            creator: override_or(&self.creator, &defaults.creator),
+            copyright: override_or(&self.copyright, &defaults.copyright),
+            credit_line: override_or(&self.credit_line, &defaults.credit_line),
+            usage_terms: override_or(&self.usage_terms, &defaults.usage_terms),
+        }
+    }
+
+    pub fn snapshot(&self) -> ImageItemSnapshot {
+        ImageItemSnapshot {
+            status: self.status,
+            title: self.title.clone(),
+            caption: self.caption.clone(),
+            keywords: self.keywords.clone(),
+            editorial: self.editorial,
+            category: self.category.clone(),
+            creator: self.creator.clone(),
+            copyright: self.copyright.clone(),
+            credit_line: self.credit_line.clone(),
+            usage_terms: self.usage_terms.clone(),
+            clear_keywords: self.clear_keywords,
+        }
+    }
+
+    /// Capture the pre-write state so a successful save can be undone.
+    pub fn begin_save(&mut self) {
+        self.pending_snapshot = Some(self.snapshot());
+    }
+
+    /// Keep the snapshot once the write succeeds and clear the keyword-removal
+    /// request because the empty list is now on disk.
+    pub fn commit_save(&mut self) {
+        if let Some(snapshot) = self.pending_snapshot.take() {
+            self.save_history.push(snapshot);
+            if self.save_history.len() > 5 {
+                self.save_history.remove(0);
+            }
+        }
+        self.clear_keywords = false;
+    }
+
+    pub fn discard_save(&mut self) {
+        self.pending_snapshot = None;
+    }
+
+    /// Restore the metadata from before the last successful save. The item is
+    /// marked dirty so the user can review it and save again.
+    pub fn undo_last_save(&mut self) -> bool {
+        let Some(snapshot) = self.save_history.pop() else {
+            return false;
+        };
+        self.status = snapshot.status;
+        self.title = snapshot.title;
+        self.caption = snapshot.caption;
+        self.keywords = snapshot.keywords;
+        self.editorial = snapshot.editorial;
+        self.category = snapshot.category;
+        self.creator = snapshot.creator;
+        self.copyright = snapshot.copyright;
+        self.credit_line = snapshot.credit_line;
+        self.usage_terms = snapshot.usage_terms;
+        self.clear_keywords = snapshot.clear_keywords;
+        self.dirty = true;
+        true
     }
 
     pub fn has_metadata(&self) -> bool {
         !self.title.trim().is_empty()
     }
 
-    /// True when the full set of generated fields is present, including at
-    /// least 90% of the configured keyword target (rounded up).
-    pub fn is_complete(&self, keyword_target: usize) -> bool {
+    /// True when the full set of generated fields is present, including the
+    /// configured acceptance percentage of the keyword target (rounded up).
+    pub fn is_complete(&self, keyword_target: usize, keyword_accept_percent: usize) -> bool {
         !self.title.trim().is_empty()
             && !self.caption.trim().is_empty()
-            && self.keywords.len() >= minimum_keyword_count(keyword_target)
+            && self.keywords.len() >= minimum_keyword_count(keyword_target, keyword_accept_percent)
     }
 
     /// Fill empty fields from metadata read out of the file. A file that
-    /// already has a title, caption and at least 90% of the keyword target is
-    /// marked `Saved`; files below that floor stay `Pending` so AI can complete
-    /// them. Partially filled files also stay `Pending`.
-    pub fn adopt_existing_metadata(&mut self, meta: ExistingMetadata, keyword_target: usize) {
+    /// already has a title, caption and the configured share of the keyword
+    /// target is marked `Saved`; files below that floor stay `Pending` so AI
+    /// can complete them. Partially filled files also stay `Pending`.
+    pub fn adopt_existing_metadata(
+        &mut self,
+        meta: ExistingMetadata,
+        keyword_target: usize,
+        keyword_accept_percent: usize,
+    ) {
+        let ExistingMetadata {
+            title,
+            caption,
+            keywords,
+            category,
+            creator,
+            copyright,
+            credit_line,
+            usage_terms,
+            ..
+        } = meta;
         if self.title.is_empty() && self.caption.is_empty() && self.keywords.is_empty() {
-            self.title = meta.title.unwrap_or_default();
-            self.caption = meta.caption.unwrap_or_default();
-            self.keywords = meta.keywords;
+            self.title = title.unwrap_or_default();
+            self.caption = caption.unwrap_or_default();
+            self.keywords = keywords;
+            self.category = category.unwrap_or_default();
             self.dirty = false;
         }
-        if self.status == Status::Pending && self.is_complete(keyword_target) {
+        // File-specific rights become per-image overrides so saving preserves
+        // them. Blank tags stay blank and therefore fall back to Settings.
+        // Skip this for an item with unsaved edits, where a blank override may
+        // be a deliberate choice to use the Settings value.
+        if !self.dirty {
+            for (slot, value) in [
+                (&mut self.creator, creator),
+                (&mut self.copyright, copyright),
+                (&mut self.credit_line, credit_line),
+                (&mut self.usage_terms, usage_terms),
+            ] {
+                if slot.trim().is_empty() {
+                    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                        *slot = value.trim().to_string();
+                    }
+                }
+            }
+        }
+        if self.status == Status::Pending
+            && self.is_complete(keyword_target, keyword_accept_percent)
+        {
             self.status = Status::Saved;
         }
     }
 
     /// Already written to disk with a full metadata set and untouched since,
     /// so batch generation can skip it instead of spending a model request.
-    pub fn is_finished(&self, keyword_target: usize) -> bool {
-        self.status == Status::Saved && !self.dirty && self.is_complete(keyword_target)
+    pub fn is_finished(&self, keyword_target: usize, keyword_accept_percent: usize) -> bool {
+        self.status == Status::Saved
+            && !self.dirty
+            && self.is_complete(keyword_target, keyword_accept_percent)
     }
 
     /// True while a fresh card is waiting for its folder metadata read. Once
@@ -279,8 +449,12 @@ impl ImageItem {
     /// The queue sweep's rule: never generate for a saved image or one that
     /// already has a full metadata set for the configured keyword target.
     /// Force regenerate overrides this.
-    pub fn should_skip_generation(&self, keyword_target: usize) -> bool {
-        self.status == Status::Saved || self.is_complete(keyword_target)
+    pub fn should_skip_generation(
+        &self,
+        keyword_target: usize,
+        keyword_accept_percent: usize,
+    ) -> bool {
+        self.status == Status::Saved || self.is_complete(keyword_target, keyword_accept_percent)
     }
 
     #[allow(dead_code)]
@@ -291,6 +465,15 @@ impl ImageItem {
 
 /// Match the browser's text and status filters. The query is trimmed and
 /// matched case-insensitively against filename, title, caption and keywords.
+fn override_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.trim().to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 pub fn image_matches(item: &ImageItem, query: &str, status: StatusFilter) -> bool {
     if !status.matches(item) {
         return false;
@@ -306,6 +489,7 @@ pub fn image_matches(item: &ImageItem, query: &str, status: StatusFilter) -> boo
             .keywords
             .iter()
             .any(|keyword| keyword.to_lowercase().contains(&query))
+        || item.category.to_lowercase().contains(&query)
 }
 
 fn modified_time(path: &Path) -> SystemTime {
@@ -387,6 +571,36 @@ impl BatchProgress {
         let remaining = self.total.saturating_sub(self.done);
         (remaining > 0).then(|| last.mul_f64(remaining as f64))
     }
+}
+
+/// Failed images grouped by the cause of their last error, largest group first
+/// so the reason that is actually costing images is visible at a glance.
+pub fn failure_summary<'a>(
+    items: impl IntoIterator<Item = &'a ImageItem>,
+) -> Vec<(FailureCause, usize)> {
+    let mut counts: Vec<(FailureCause, usize)> =
+        FailureCause::ALL.iter().map(|cause| (*cause, 0)).collect();
+    for item in items
+        .into_iter()
+        .filter(|item| item.status == Status::Error)
+    {
+        let cause = item
+            .message
+            .as_deref()
+            .map(classify_failure)
+            .unwrap_or(FailureCause::Other);
+        if let Some(slot) = counts.iter_mut().find(|(known, _)| *known == cause) {
+            slot.1 += 1;
+        }
+    }
+    counts.retain(|(_, count)| *count > 0);
+    counts.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.label().cmp(right.0.label()))
+    });
+    counts
 }
 
 /// Extra AI attempts after the first failure. Two retries means an image gets
@@ -699,23 +913,49 @@ pub enum WorkerEvent {
     },
 }
 
-pub fn is_jpeg(path: &Path) -> bool {
+pub fn is_supported_image(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase())
             .as_deref(),
-        Some("jpg" | "jpeg" | "jpe" | "jfif")
+        Some("jpg" | "jpeg" | "jpe" | "jfif" | "png" | "tif" | "tiff")
     )
 }
 
-/// Expand dropped files/folders into a sorted list of JPEG paths.
-pub fn collect_jpegs(path: &Path) -> Vec<PathBuf> {
+/// MP4/MOV are the common video formats accepted by Adobe Stock and
+/// Shutterstock. MPG remains unsupported until its metadata path is tested.
+pub fn is_supported_video(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov")
+    )
+}
+
+pub fn is_supported_media(path: &Path) -> bool {
+    is_supported_image(path) || is_supported_video(path)
+}
+
+pub fn media_kind(path: &Path) -> Option<MediaKind> {
+    if is_supported_image(path) {
+        Some(MediaKind::Image)
+    } else if is_supported_video(path) {
+        Some(MediaKind::Video)
+    } else {
+        None
+    }
+}
+
+/// Expand dropped files/folders into a sorted list of supported media paths.
+pub fn collect_images(path: &Path) -> Vec<PathBuf> {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut files = Vec::new();
 
     if absolute.is_file() {
-        if is_jpeg(&absolute) {
+        if is_supported_media(&absolute) {
             files.push(absolute);
         }
         return files;
@@ -730,7 +970,7 @@ pub fn collect_jpegs(path: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|entry| entry.ok())
     {
-        if entry.file_type().is_file() && is_jpeg(entry.path()) {
+        if entry.file_type().is_file() && is_supported_media(entry.path()) {
             files.push(entry.into_path());
         }
     }
@@ -738,9 +978,9 @@ pub fn collect_jpegs(path: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// JPEGs directly inside a folder (no recursion), sorted case-insensitively.
-/// This is what the ACDSee-style folder grid displays.
-pub fn collect_folder_jpegs(dir: &Path) -> Vec<PathBuf> {
+/// Supported images directly inside a folder (no recursion), sorted
+/// case-insensitively. This is what the ACDSee-style folder grid displays.
+pub fn collect_folder_images(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -748,7 +988,7 @@ pub fn collect_folder_jpegs(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_jpeg(path))
+        .filter(|path| path.is_file() && is_supported_media(path))
         .collect();
 
     files.sort_by_key(|path| {
@@ -913,6 +1153,43 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[test]
+    fn failure_summary_ranks_the_most_common_reason_first() {
+        let mut items = Vec::new();
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            items.push(ImageItem::new(PathBuf::from(name)));
+        }
+        items[0].status = Status::Error;
+        items[0].message = Some(
+            "LM Studio returned 33 usable keywords after a retry; at least 40 are required (target 50)."
+                .to_string(),
+        );
+        items[1].status = Status::Error;
+        items[1].message = Some(
+            "LM Studio returned 30 usable keywords after a retry; at least 40 are required (target 50)."
+                .to_string(),
+        );
+        items[2].status = Status::Error;
+        items[2].message = Some(
+            "OpenAI failed after 4 attempts: error sending request for url (https://api.openai.com/v1/chat/completions)"
+                .to_string(),
+        );
+        // A saved image keeps no failure even when an old message is still set.
+        items[3].status = Status::Saved;
+        items[3].message = Some(
+            "OpenAI returned a caption with 41 characters after retries; 50-180 characters are required."
+                .to_string(),
+        );
+
+        assert_eq!(
+            failure_summary(&items),
+            vec![
+                (crate::ai::FailureCause::Keywords, 2),
+                (crate::ai::FailureCause::Connection, 1),
+            ]
+        );
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join("autowording-state-tests")
@@ -937,39 +1214,72 @@ mod tests {
     }
 
     #[test]
-    fn recognises_jpeg_extensions_case_insensitively() {
-        for name in [
-            "a.jpg", "b.JPG", "c.jpeg", "d.JPEG", "e.jpe", "f.JpE", "g.jfif",
-        ] {
-            assert!(is_jpeg(Path::new(name)), "{name} should be a JPEG");
+    fn recognises_supported_media_extensions_case_insensitively() {
+        for name in ["clip.mp4", "clip.MP4", "clip.mov", "clip.MOV"] {
+            assert!(
+                is_supported_video(Path::new(name)),
+                "{name} should be a supported video"
+            );
+            assert_eq!(
+                media_kind(Path::new(name)),
+                Some(MediaKind::Video),
+                "{name} should classify as video"
+            );
         }
-        for name in ["a.png", "b.gif", "c.txt", "noext", "d.jpg.txt", "e.tiff"] {
-            assert!(!is_jpeg(Path::new(name)), "{name} should not be a JPEG");
+        for name in ["clip.mpg", "clip.m4v", "clip.avi"] {
+            assert!(
+                !is_supported_video(Path::new(name)),
+                "{name} is outside the first video slice"
+            );
+        }
+        assert_eq!(media_kind(Path::new("photo.jpg")), Some(MediaKind::Image));
+        assert_eq!(media_kind(Path::new("notes.txt")), None);
+    }
+
+    #[test]
+    fn recognises_supported_image_extensions_case_insensitively() {
+        for name in [
+            "a.jpg", "b.JPG", "c.jpeg", "d.JPEG", "e.jpe", "f.JpE", "g.jfif", "h.png", "i.PNG",
+            "j.tif", "k.TIFF",
+        ] {
+            assert!(
+                is_supported_image(Path::new(name)),
+                "{name} should be supported"
+            );
+        }
+        for name in ["a.gif", "c.txt", "noext", "d.jpg.txt"] {
+            assert!(
+                !is_supported_image(Path::new(name)),
+                "{name} should not be supported"
+            );
         }
     }
 
     #[test]
-    fn collect_jpegs_walks_directories_recursively() {
+    fn collect_images_walks_directories_recursively() {
         let root = temp_dir("collect");
         std::fs::write(root.join("a.jpg"), b"jpeg").unwrap();
         std::fs::write(root.join("b.JPEG"), b"jpeg").unwrap();
         std::fs::write(root.join("c.png"), b"png").unwrap();
+        std::fs::write(root.join("clip.MP4"), b"mp4").unwrap();
         std::fs::write(root.join("notes.txt"), b"text").unwrap();
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested").join("d.JpE"), b"jpeg").unwrap();
         std::fs::write(root.join("nested").join("e.jpeg"), b"jpeg").unwrap();
 
-        let found = collect_jpegs(&root);
+        let found = collect_images(&root);
         let names: HashSet<String> = found
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(found.len(), 4, "got: {names:?}");
+        assert_eq!(found.len(), 6, "got: {names:?}");
         assert_eq!(
             names,
             HashSet::from([
                 "a.jpg".to_string(),
                 "b.JPEG".to_string(),
+                "c.png".to_string(),
+                "clip.MP4".to_string(),
                 "d.JpE".to_string(),
                 "e.jpeg".to_string(),
             ])
@@ -978,38 +1288,71 @@ mod tests {
     }
 
     #[test]
-    fn collect_folder_jpegs_is_non_recursive_and_sorted() {
+    fn collect_folder_images_is_non_recursive_and_sorted() {
         let root = temp_dir("folder-only");
         std::fs::write(root.join("b.JPG"), b"jpeg").unwrap();
         std::fs::write(root.join("a.jpg"), b"jpeg").unwrap();
         std::fs::write(root.join("c.png"), b"png").unwrap();
+        std::fs::write(root.join("clip.MOV"), b"mov").unwrap();
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested").join("d.jpg"), b"jpeg").unwrap();
 
-        let found = collect_folder_jpegs(&root);
+        let found = collect_folder_images(&root);
         let names: Vec<String> = found
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["a.jpg", "b.JPG"]);
-        assert!(collect_folder_jpegs(&root.join("missing")).is_empty());
+        assert_eq!(names, vec!["a.jpg", "b.JPG", "c.png", "clip.MOV"]);
+        assert!(collect_folder_images(&root.join("missing")).is_empty());
     }
 
     #[test]
-    fn collect_jpegs_handles_single_files_and_missing_paths() {
+    fn video_items_are_classified_and_default_to_video() {
+        let item = ImageItem::new(PathBuf::from(r"C:\clips\harbour.MP4"));
+        assert_eq!(item.media, MediaKind::Video);
+        assert!(item.is_video());
+
+        let image = ImageItem::new(PathBuf::from(r"C:\photos\harbour.jpg"));
+        assert_eq!(image.media, MediaKind::Image);
+        assert!(!image.is_video());
+    }
+
+    #[test]
+    fn collect_images_handles_single_files_and_missing_paths() {
         let root = temp_dir("single");
         let jpeg = root.join("one.jpg");
         std::fs::write(&jpeg, b"jpeg").unwrap();
 
-        let found = collect_jpegs(&jpeg);
+        let found = collect_images(&jpeg);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file_name().unwrap(), "one.jpg");
 
         let png = root.join("one.png");
         std::fs::write(&png, b"png").unwrap();
-        assert!(collect_jpegs(&png).is_empty());
-        assert!(collect_jpegs(&root.join("missing")).is_empty());
-        assert!(collect_jpegs(&root.join("missing.jpg")).is_empty());
+        assert_eq!(collect_images(&png).len(), 1);
+
+        let video = root.join("one.mov");
+        std::fs::write(&video, b"mov").unwrap();
+        assert_eq!(collect_images(&video).len(), 1);
+        assert!(collect_images(&root.join("missing")).is_empty());
+        assert!(collect_images(&root.join("missing.jpg")).is_empty());
+    }
+
+    #[test]
+    fn decode_reads_png_and_tiff_images() {
+        let root = temp_dir("decode-formats");
+        for (name, format) in [
+            ("sample.png", image::ImageFormat::Png),
+            ("sample.tif", image::ImageFormat::Tiff),
+        ] {
+            let path = root.join(name);
+            let mut buffer = std::fs::File::create(&path).expect("create image");
+            image::RgbImage::from_pixel(40, 24, image::Rgb([90, 110, 130]))
+                .write_to(&mut buffer, format)
+                .expect("write image");
+            let (_image, dims) = decode(&path, 500).expect("decode supported image");
+            assert_eq!(dims, (40, 24), "{name}");
+        }
     }
 
     #[test]
@@ -1114,10 +1457,12 @@ mod tests {
         item.caption = "Manual caption that should stay put.".into();
         item.keywords = vec!["manual".into()];
         item.editorial = true;
+        item.category = "Manual Category".into();
         item.locks = FieldLocks {
             title: true,
             caption: true,
             keywords: true,
+            category: true,
         };
 
         apply_generated_metadata(
@@ -1127,6 +1472,7 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
+                category: "Nature".into(),
             },
         );
 
@@ -1134,6 +1480,7 @@ mod tests {
         assert_eq!(item.caption, "Manual caption that should stay put.");
         assert_eq!(item.keywords, vec!["manual"]);
         assert!(item.editorial);
+        assert_eq!(item.category, "Manual Category");
 
         item.locks = FieldLocks::default();
         apply_generated_metadata(
@@ -1143,12 +1490,86 @@ mod tests {
                 caption: "Generated caption.".into(),
                 keywords: vec!["generated".into()],
                 editorial: false,
+                category: "Nature".into(),
             },
         );
         assert_eq!(item.title, "Generated Title");
         assert_eq!(item.caption, "Generated caption.");
         assert_eq!(item.keywords, vec!["generated"]);
         assert!(!item.editorial);
+        assert_eq!(item.category, "Nature");
+    }
+
+    #[test]
+    fn per_image_rights_fall_back_to_settings_and_undo_restores_metadata() {
+        let defaults = Rights {
+            creator: "Settings Creator".into(),
+            copyright: "Settings Copyright".into(),
+            credit_line: "Settings Credit".into(),
+            usage_terms: "Settings Terms".into(),
+        };
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Rights.jpg"));
+        item.copyright = "Image Copyright".into();
+        let rights = item.rights(&defaults);
+        assert_eq!(rights.creator, "Settings Creator");
+        assert_eq!(rights.copyright, "Image Copyright");
+        assert_eq!(rights.credit_line, "Settings Credit");
+
+        item.title = "Before save".into();
+        item.category = "Travel".into();
+        item.begin_save();
+        item.title = "After save".into();
+        item.category = "Nature".into();
+        item.commit_save();
+        assert!(item.undo_last_save());
+        assert_eq!(item.title, "Before save");
+        assert_eq!(item.category, "Travel");
+        assert!(item.dirty);
+        assert!(!item.undo_last_save(), "history holds one snapshot");
+    }
+
+    #[test]
+    fn adopt_existing_metadata_loads_file_category_and_rights() {
+        let mut item = ImageItem::new(PathBuf::from(r"C:\photos\Saved.jpg"));
+        item.adopt_existing_metadata(
+            ExistingMetadata {
+                title: Some("Saved Title".into()),
+                caption: Some("Saved caption.".into()),
+                keywords: keyword_list(9),
+                gps: None,
+                date: None,
+                dims: None,
+                category: Some("Nature".into()),
+                creator: Some("File Creator".into()),
+                copyright: Some("File Copyright".into()),
+                credit_line: None,
+                usage_terms: Some("File Terms".into()),
+                ..ExistingMetadata::default()
+            },
+            10,
+            80,
+        );
+        assert_eq!(item.category, "Nature");
+        assert_eq!(item.status, Status::Saved);
+        assert_eq!(item.creator, "File Creator");
+        assert_eq!(item.copyright, "File Copyright");
+        assert_eq!(
+            item.credit_line, "",
+            "a blank file credit keeps the Settings fallback"
+        );
+        assert_eq!(item.usage_terms, "File Terms");
+
+        let defaults = Rights {
+            creator: "Settings Creator".into(),
+            copyright: "Settings Copyright".into(),
+            credit_line: "Settings Credit".into(),
+            usage_terms: "Settings Terms".into(),
+        };
+        let rights = item.rights(&defaults);
+        assert_eq!(rights.creator, "File Creator");
+        assert_eq!(rights.copyright, "File Copyright");
+        assert_eq!(rights.credit_line, "Settings Credit");
+        assert_eq!(rights.usage_terms, "File Terms");
     }
 
     #[test]
@@ -1162,10 +1583,12 @@ mod tests {
         item.title = "  Sunset Over Bay  ".into();
         item.caption = "  Fog over the water.  ".into();
         item.keywords = vec!["sunset".into(), "bay".into()];
+        item.category = "  Travel  ".into();
         let metadata = item.to_metadata();
         assert_eq!(metadata.title, "Sunset Over Bay");
         assert_eq!(metadata.caption, "Fog over the water.");
         assert_eq!(metadata.keywords, vec!["sunset", "bay"]);
+        assert_eq!(metadata.category, "Travel");
         assert!(item.has_metadata());
 
         item.title = "   ".into();
@@ -1219,12 +1642,15 @@ mod tests {
                 gps: None,
                 date: None,
                 dims: None,
+                category: None,
+                ..ExistingMetadata::default()
             },
             10,
+            80,
         );
         assert_eq!(item.status, Status::Saved);
         assert!(!item.dirty);
-        assert!(item.is_complete(10));
+        assert!(item.is_complete(10, 80));
         assert_eq!(item.title, "Existing Title");
         assert_eq!(item.caption, "Existing caption.");
 
@@ -1233,19 +1659,26 @@ mod tests {
             ExistingMetadata {
                 title: Some("Below Floor".into()),
                 caption: Some("A caption below the keyword floor.".into()),
-                keywords: keyword_list(8),
+                keywords: keyword_list(7),
                 gps: None,
                 date: None,
                 dims: None,
+                category: None,
+                ..ExistingMetadata::default()
             },
             10,
+            80,
         );
         assert_eq!(
             below_floor.status,
             Status::Pending,
-            "8 of 10 keywords is below the 90% floor"
+            "7 of 10 keywords is below the 80% floor"
         );
-        assert!(!below_floor.is_complete(10));
+        assert!(!below_floor.is_complete(10, 80));
+        assert!(
+            below_floor.is_complete(10, 50),
+            "7 of 10 meets a 50% threshold"
+        );
 
         let mut partial = ImageItem::new(PathBuf::from(r"C:\photos\Partial.jpg"));
         partial.adopt_existing_metadata(
@@ -1256,8 +1689,11 @@ mod tests {
                 gps: None,
                 date: None,
                 dims: None,
+                category: None,
+                ..ExistingMetadata::default()
             },
             10,
+            80,
         );
         assert_eq!(partial.status, Status::Pending);
         assert_eq!(partial.title, "Title only");
@@ -1272,8 +1708,11 @@ mod tests {
                 gps: None,
                 date: None,
                 dims: None,
+                category: None,
+                ..ExistingMetadata::default()
             },
             10,
+            80,
         );
         assert_eq!(
             edited.title, "Manual",
@@ -1289,37 +1728,37 @@ mod tests {
         item.title = "Title".into();
         item.caption = "Caption.".into();
         item.keywords = keyword_list(9);
-        assert!(item.is_finished(10));
+        assert!(item.is_finished(10, 80));
 
         item.dirty = true;
         assert!(
-            !item.is_finished(10),
+            !item.is_finished(10, 80),
             "an edited saved image still needs work"
         );
 
         item.dirty = false;
         item.status = Status::Generated;
         assert!(
-            !item.is_finished(10),
+            !item.is_finished(10, 80),
             "generated but unwritten is not finished"
         );
 
         item.status = Status::Saved;
         item.caption.clear();
         assert!(
-            !item.is_finished(10),
+            !item.is_finished(10, 80),
             "a saved file with missing fields can still be completed by AI"
         );
 
         item.caption = "Caption.".into();
-        item.keywords.truncate(8);
+        item.keywords.truncate(7);
         assert!(
-            !item.is_finished(10),
+            !item.is_finished(10, 80),
             "a saved file below the keyword floor is not finished"
         );
 
         item.status = Status::Pending;
-        assert!(!item.is_finished(10));
+        assert!(!item.is_finished(10, 80));
     }
 
     #[test]
@@ -1351,7 +1790,7 @@ mod tests {
         let mut short = ImageItem::new(below_floor.clone());
         short.title = "Title".into();
         short.caption = "Caption.".into();
-        short.keywords = keyword_list(8);
+        short.keywords = keyword_list(7);
         items.insert(below_floor.clone(), short);
 
         let requested = vec![
@@ -1361,11 +1800,12 @@ mod tests {
             partial.clone(),
             below_floor.clone(),
         ];
-        let (skipped, targets) = partition_generation_targets(requested.clone(), &items, false, 10);
+        let (skipped, targets) =
+            partition_generation_targets(requested.clone(), &items, false, 10, 80);
         assert_eq!(skipped, vec![ready, saved_partial, generated]);
         assert_eq!(targets, vec![partial, below_floor]);
 
-        let (skipped, targets) = partition_generation_targets(requested, &items, true, 10);
+        let (skipped, targets) = partition_generation_targets(requested, &items, true, 10, 80);
         assert!(skipped.is_empty());
         assert_eq!(targets.len(), 5);
     }

@@ -4,7 +4,7 @@ use crate::cache::ThumbnailCache;
 use crate::config::{Config, LayoutDensity, Provider, ProviderSettings, ThemePreference};
 use crate::csv::{self, CsvRow};
 use crate::journal;
-use crate::metadata::{ExifTool, ExistingMetadata, Metadata};
+use crate::metadata::{ExifTool, ExistingMetadata, Metadata, Rights};
 use crate::state::{
     self, apply_generated_metadata, AiQueue, AiQueueEntry, BatchProgress, ImageItem,
     SelectModifiers, Selection, SortMode, Status, StatusFilter, WorkerEvent, AI_MAX_RETRIES,
@@ -56,6 +56,24 @@ pub struct Toast {
     pub at: Instant,
 }
 
+pub struct PendingExport {
+    pub agency: csv::Agency,
+    pub rows: Vec<CsvRow>,
+    pub issues: Vec<csv::ExportIssue>,
+}
+
+#[derive(Debug, Clone)]
+struct KeywordCleanupUndoEntry {
+    path: PathBuf,
+    keywords: Vec<String>,
+    clear_keywords: bool,
+}
+
+#[derive(Debug, Clone)]
+struct KeywordCleanupUndo {
+    entries: Vec<KeywordCleanupUndoEntry>,
+}
+
 #[derive(Default)]
 struct Shortcuts {
     step: Option<isize>,
@@ -96,6 +114,7 @@ pub struct App {
     pub context: String,
     pub batch: Option<BatchProgress>,
     pub batch_paused: bool,
+    pub batch_cancelling: bool,
     pub batch_current: Option<PathBuf>,
     /// Queue entries after the current item, in the order they will run.
     pub batch_up_next: Vec<PathBuf>,
@@ -119,6 +138,8 @@ pub struct App {
     pub batch_title: String,
     pub batch_caption: String,
     pub batch_keywords: String,
+    keyword_cleanup_undo: Option<KeywordCleanupUndo>,
+    pub pending_export: Option<PendingExport>,
     pub show_about: bool,
     pub dark: bool,
     auto_save_queue: Vec<PathBuf>,
@@ -142,6 +163,10 @@ pub struct App {
     rx: tokio::sync::mpsc::UnboundedReceiver<WorkerEvent>,
 }
 
+fn lock_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
 fn existing_metadata(item: &ImageItem) -> ExistingMetadata {
     let title = item.title.trim();
     let caption = item.caption.trim();
@@ -149,9 +174,11 @@ fn existing_metadata(item: &ImageItem) -> ExistingMetadata {
         title: (!title.is_empty()).then(|| title.to_string()),
         caption: (!caption.is_empty()).then(|| caption.to_string()),
         keywords: item.keywords.clone(),
+        category: (!item.category.trim().is_empty()).then(|| item.category.trim().to_string()),
         gps: item.gps.clone(),
         date: item.date.clone(),
         dims: item.dims,
+        ..ExistingMetadata::default()
     }
 }
 
@@ -162,6 +189,12 @@ fn apply_journal_entry(item: &mut ImageItem, entry: &journal::JournalEntry) {
     item.caption = entry.caption.clone();
     item.keywords = entry.keywords.clone();
     item.editorial = entry.editorial;
+    item.category = entry.category.clone();
+    item.creator = entry.creator.clone();
+    item.copyright = entry.copyright.clone();
+    item.credit_line = entry.credit_line.clone();
+    item.usage_terms = entry.rights_usage_terms.clone();
+    item.clear_keywords = entry.clear_keywords;
     item.dirty = true;
     item.status = Status::Generated;
 }
@@ -211,6 +244,7 @@ impl App {
             context: String::new(),
             batch: None,
             batch_paused: false,
+            batch_cancelling: false,
             batch_current: None,
             batch_up_next: Vec::new(),
             batch_failed_paths: Vec::new(),
@@ -233,6 +267,8 @@ impl App {
             batch_title: String::new(),
             batch_caption: String::new(),
             batch_keywords: String::new(),
+            keyword_cleanup_undo: None,
+            pending_export: None,
             show_about: false,
             dark,
             auto_save_queue: Vec::new(),
@@ -390,6 +426,9 @@ impl App {
             if let Some(entry) = self.journal.get(&path_buf) {
                 apply_journal_entry(&mut item, entry);
             }
+            if let Some(locks) = self.cfg.field_locks.get(&lock_key(&path_buf)).copied() {
+                item.locks = locks;
+            }
             self.items.insert(path_buf.clone(), item);
         }
         self.items
@@ -425,6 +464,12 @@ impl App {
                         caption: item.caption.clone(),
                         keywords: item.keywords.clone(),
                         editorial: item.editorial,
+                        category: item.category.clone(),
+                        creator: item.creator.clone(),
+                        copyright: item.copyright.clone(),
+                        credit_line: item.credit_line.clone(),
+                        rights_usage_terms: item.usage_terms.clone(),
+                        clear_keywords: item.clear_keywords,
                     },
                 );
             } else if item.meta_loaded {
@@ -449,6 +494,18 @@ impl App {
     /// Capture the latest keystrokes before the process exits.
     pub fn flush_journal(&mut self) {
         self.write_journal();
+    }
+
+    /// Save pending settings immediately, including field-lock choices, so a
+    /// quick close cannot lose changes waiting on the debounce.
+    pub fn flush_config(&mut self) {
+        if self.cfg_dirty.is_none() || self.cfg.path.is_none() {
+            return;
+        }
+        if let Err(error) = self.cfg.save() {
+            self.notify(format!("Could not save settings: {error}"), true);
+        }
+        self.cfg_dirty = None;
     }
 
     /// Images with in-memory edits that have not been written to disk.
@@ -482,6 +539,7 @@ impl App {
 
     /// Menu Exit and the window close button both land here.
     pub fn request_exit(&mut self, ctx: &UiContext) {
+        self.flush_config();
         self.flush_journal();
         if self.unsaved_count() > 0 {
             self.confirm_exit = true;
@@ -515,7 +573,12 @@ impl App {
 
     pub fn add_images_dialog(&mut self, ctx: &UiContext) {
         if let Some(files) = rfd::FileDialog::new()
-            .add_filter("JPEG images", &["jpg", "jpeg", "jpe", "jfif"])
+            .add_filter(
+                "Image and video files",
+                &[
+                    "jpg", "jpeg", "jpe", "jfif", "png", "tif", "tiff", "mp4", "mov",
+                ],
+            )
             .pick_files()
         {
             self.add_paths(ctx, files);
@@ -527,7 +590,7 @@ impl App {
     pub fn export_csv_dialog(&mut self, agency: crate::csv::Agency) {
         let paths = self.selected_paths();
         if paths.is_empty() {
-            self.notify("Select one or more images to export", true);
+            self.notify("Select one or more files to export", true);
             return;
         }
         let rows: Vec<CsvRow> = paths
@@ -537,6 +600,7 @@ impl App {
                 filename: item.file_name(),
                 title: item.title.clone(),
                 caption: item.caption.clone(),
+                category: item.category.clone(),
                 keywords: item.keywords.clone(),
                 editorial: Some(item.editorial),
             })
@@ -546,6 +610,21 @@ impl App {
             return;
         }
 
+        let issues = csv::preflight(agency, &rows);
+        if !issues.is_empty() {
+            self.pending_export = Some(PendingExport {
+                agency,
+                rows,
+                issues,
+            });
+            return;
+        }
+        self.export_csv_now(agency, rows);
+    }
+
+    /// Write the CSV after the preflight has been reviewed or was clean.
+    pub fn export_csv_now(&mut self, agency: csv::Agency, rows: Vec<CsvRow>) {
+        self.pending_export = None;
         let default_name = format!("autowording-{}.csv", agency.slug());
         let Some(path) = rfd::FileDialog::new()
             .add_filter("CSV", &["csv"])
@@ -557,10 +636,20 @@ impl App {
         let text = csv::export(agency, &rows);
         match crate::persist::write_atomic(&path, text.as_bytes()) {
             Ok(()) => self.notify(
-                format!("Exported {} image(s) to {}", rows.len(), path.display()),
+                format!("Exported {} file(s) to {}", rows.len(), path.display()),
                 false,
             ),
             Err(error) => self.notify(format!("CSV export failed: {error}"), true),
+        }
+    }
+
+    pub fn cancel_export_preflight(&mut self) {
+        self.pending_export = None;
+    }
+
+    pub fn export_pending(&mut self) {
+        if let Some(pending) = self.pending_export.take() {
+            self.export_csv_now(pending.agency, pending.rows);
         }
     }
 
@@ -594,6 +683,7 @@ impl App {
         }
 
         let keyword_target = self.cfg.keyword_target();
+        let keyword_accept_percent = self.cfg.keyword_accept_percent();
         let index = csv::filename_index(&self.folder_images);
         let mut applied: Vec<PathBuf> = Vec::new();
         let mut unmatched = 0usize;
@@ -614,6 +704,9 @@ impl App {
             if !row.caption.trim().is_empty() {
                 item.caption = row.caption.trim().to_string();
             }
+            if !row.category.trim().is_empty() {
+                item.category = row.category.trim().to_string();
+            }
             if !row.keywords.is_empty() {
                 item.keywords = row.keywords.clone();
             }
@@ -622,7 +715,7 @@ impl App {
             }
             item.dirty = true;
             item.message = None;
-            item.status = if item.is_complete(keyword_target) {
+            item.status = if item.is_complete(keyword_target, keyword_accept_percent) {
                 Status::Generated
             } else {
                 Status::Pending
@@ -696,6 +789,10 @@ impl App {
                         item.caption.clear();
                         item.keywords.clear();
                         item.editorial = false;
+                        item.creator.clear();
+                        item.copyright.clear();
+                        item.credit_line.clear();
+                        item.usage_terms.clear();
                         item.status = Status::Pending;
                         item.dirty = false;
                         item.message = None;
@@ -801,9 +898,10 @@ impl App {
         let scan_dir = dir.clone();
         self.rt.spawn(async move {
             let task_dir = scan_dir.clone();
-            let files = tokio::task::spawn_blocking(move || state::collect_folder_jpegs(&task_dir))
-                .await
-                .unwrap_or_default();
+            let files =
+                tokio::task::spawn_blocking(move || state::collect_folder_images(&task_dir))
+                    .await
+                    .unwrap_or_default();
             let _ = tx.send(WorkerEvent::FolderScanned {
                 dir: scan_dir,
                 files,
@@ -828,7 +926,7 @@ impl App {
                 opened_folder = true;
                 continue;
             }
-            for file in state::collect_jpegs(&path) {
+            for file in state::collect_images(&path) {
                 self.ensure_item(&file);
                 if !self.folder_images.contains(&file) {
                     self.folder_images.push(file.clone());
@@ -839,7 +937,7 @@ impl App {
 
         if added.is_empty() {
             if !opened_folder {
-                self.notify("No new JPEG images were found", true);
+                self.notify("No new media files were found", true);
             }
             return;
         }
@@ -865,7 +963,7 @@ impl App {
         }
         self.request_all_metadata(ctx);
         self.after_selection_change(ctx);
-        self.notify(format!("Added {} image(s)", added.len()), false);
+        self.notify(format!("Added {} file(s)", added.len()), false);
     }
 
     fn after_selection_change(&mut self, ctx: &UiContext) {
@@ -1043,6 +1141,9 @@ impl App {
     }
 
     pub fn request_thumb(&mut self, ctx: &UiContext, path: &Path) {
+        if state::is_supported_video(path) {
+            return;
+        }
         if !self.thumbs.needs_request(path) {
             return;
         }
@@ -1080,6 +1181,9 @@ impl App {
     }
 
     pub fn request_preview(&mut self, ctx: &UiContext, path: &Path) {
+        if state::is_supported_video(path) {
+            return;
+        }
         if self
             .preview
             .as_ref()
@@ -1211,7 +1315,7 @@ impl App {
         self.generate_paths(ctx, paths);
     }
 
-    pub fn generate_paths(&mut self, ctx: &UiContext, paths: Vec<PathBuf>) {
+    pub fn generate_paths(&mut self, ctx: &UiContext, mut paths: Vec<PathBuf>) {
         if self.batch.is_some() {
             self.notify("A batch job is already running", true);
             return;
@@ -1222,6 +1326,27 @@ impl App {
         if paths.is_empty() {
             self.notify("Nothing to process", true);
             return;
+        }
+
+        let video_count = paths
+            .iter()
+            .filter(|path| state::is_supported_video(path))
+            .count();
+        if video_count > 0 {
+            paths.retain(|path| !state::is_supported_video(path));
+            if paths.is_empty() {
+                self.notify(
+                    "AI video generation is not available yet; edit video metadata manually or export CSV",
+                    true,
+                );
+                return;
+            }
+            self.notify(
+                format!(
+                    "Skipping {video_count} video file(s): AI video generation is not available yet"
+                ),
+                true,
+            );
         }
 
         let provider = self.cfg.provider;
@@ -1254,6 +1379,7 @@ impl App {
         // already complete or saved while it was being assembled must not spend
         // a model request; Force regenerate is the explicit exception.
         let keyword_target = self.cfg.keyword_target();
+        let keyword_accept_percent = self.cfg.keyword_accept_percent();
         let mut queue = AiQueue::new(jobs);
         let mut skipped = 0usize;
         if !self.force_regenerate {
@@ -1261,7 +1387,9 @@ impl App {
             queue.retain(|(path, _)| {
                 self.items
                     .get(path)
-                    .map(|item| !state::should_skip_generation(item, keyword_target))
+                    .map(|item| {
+                        !state::should_skip_generation(item, keyword_target, keyword_accept_percent)
+                    })
                     .unwrap_or(true)
             });
             skipped = before.saturating_sub(queue.len());
@@ -1296,6 +1424,7 @@ impl App {
         self.batch_current = None;
         self.batch_started = Some(Instant::now());
         self.batch_paused = false;
+        self.batch_cancelling = false;
         self.batch_cancel.store(false, Ordering::Relaxed);
         self.batch_pause.store(false, Ordering::Relaxed);
         let cancel = self.batch_cancel.clone();
@@ -1354,6 +1483,7 @@ impl App {
                         global_prompt: global_prompt.clone(),
                         date: date.clone(),
                         keyword_target,
+                        keyword_accept_percent,
                         title_range,
                         caption_range,
                     }),
@@ -1418,8 +1548,13 @@ impl App {
 
     pub fn cancel_batch(&mut self) {
         if self.batch.is_none() {
+            self.batch_cancelling = false;
             return;
         }
+        if self.batch.is_some_and(|batch| batch.saving) || self.batch_cancelling {
+            return;
+        }
+        self.batch_cancelling = true;
         self.batch_cancel.store(true, Ordering::Relaxed);
         self.batch_pause.store(false, Ordering::Relaxed);
         self.batch_paused = false;
@@ -1539,7 +1674,15 @@ impl App {
             return false;
         };
 
-        let items: Vec<(PathBuf, Metadata, Option<u64>, Option<SystemTime>)> = paths
+        let defaults = self.cfg.rights();
+        let items: Vec<(
+            PathBuf,
+            Metadata,
+            Rights,
+            bool,
+            Option<u64>,
+            Option<SystemTime>,
+        )> = paths
             .iter()
             .filter_map(|path| {
                 self.items
@@ -1549,6 +1692,8 @@ impl App {
                         (
                             path.clone(),
                             item.to_metadata(),
+                            item.rights(&defaults),
+                            item.clear_keywords,
                             item.disk_len,
                             item.disk_modified,
                         )
@@ -1557,7 +1702,7 @@ impl App {
             .collect();
 
         if items.is_empty() {
-            self.notify("No images with a title are ready to save", true);
+            self.notify("No files with a title are ready to save", true);
             return false;
         }
 
@@ -1565,14 +1710,22 @@ impl App {
         if skipped > 0 {
             self.notify(
                 format!(
-                    "Saving {} image(s); {skipped} without a title were skipped",
+                    "Saving {} file(s); {skipped} without a title were skipped",
                     items.len()
                 ),
                 false,
             );
         }
 
-        self.batch_up_next = items.iter().map(|(path, _, _, _)| path.clone()).collect();
+        for (path, _, _, _, _, _) in &items {
+            if let Some(item) = self.items.get_mut(path) {
+                item.begin_save();
+            }
+        }
+        self.batch_up_next = items
+            .iter()
+            .map(|(path, _, _, _, _, _)| path.clone())
+            .collect();
         let total = items.len();
         self.batch = Some(BatchProgress {
             total,
@@ -1583,6 +1736,7 @@ impl App {
         });
         self.batch_current = None;
         self.batch_started = Some(Instant::now());
+        self.batch_cancelling = false;
 
         let backup_originals = self.cfg.backup_originals;
         let verify_writes = self.cfg.verify_writes;
@@ -1591,7 +1745,7 @@ impl App {
         self.rt.spawn(async move {
             let mut ok = 0usize;
             let mut failed = 0usize;
-            for (path, metadata, disk_len, disk_modified) in items {
+            for (path, metadata, rights, clear_keywords, disk_len, disk_modified) in items {
                 let _ = tx.send(WorkerEvent::SaveStarted { path: path.clone() });
                 ctx2.request_repaint();
                 let tool = tool.clone();
@@ -1601,10 +1755,16 @@ impl App {
                     if backup_originals {
                         crate::metadata::backup_original(&task_path)?;
                     }
-                    tool.write(&task_path, &metadata)?;
+                    tool.write_with_rights_and_clear(
+                        &task_path,
+                        &metadata,
+                        &rights,
+                        clear_keywords,
+                    )?;
                     if verify_writes {
                         let read = tool.read(&task_path)?;
                         crate::metadata::verify_written(&metadata, &read)?;
+                        crate::metadata::verify_rights(&rights, &read)?;
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -1624,6 +1784,54 @@ impl App {
             ctx2.request_repaint();
         });
         true
+    }
+
+    fn keyword_cleanup_snapshot(&self, paths: &[PathBuf]) -> KeywordCleanupUndo {
+        KeywordCleanupUndo {
+            entries: paths
+                .iter()
+                .filter_map(|path| {
+                    self.items.get(path).map(|item| KeywordCleanupUndoEntry {
+                        path: path.clone(),
+                        keywords: item.keywords.clone(),
+                        clear_keywords: item.clear_keywords,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn remember_keyword_cleanup(&mut self, undo: KeywordCleanupUndo) {
+        if !undo.entries.is_empty() {
+            self.keyword_cleanup_undo = Some(undo);
+        }
+    }
+
+    pub fn has_keyword_cleanup_undo(&self) -> bool {
+        self.keyword_cleanup_undo.is_some()
+    }
+
+    pub fn undo_batch_keyword_cleanup(&mut self) -> bool {
+        let Some(undo) = self.keyword_cleanup_undo.take() else {
+            self.notify("No keyword cleanup to undo", true);
+            return false;
+        };
+        let mut restored = 0usize;
+        for entry in undo.entries {
+            if let Some(item) = self.items.get_mut(&entry.path) {
+                item.keywords = entry.keywords;
+                item.clear_keywords = entry.clear_keywords;
+                item.dirty = true;
+                restored += 1;
+            }
+        }
+        if restored == 0 {
+            self.notify("The files from that cleanup are no longer loaded", true);
+            false
+        } else {
+            self.notify(format!("Restored keywords on {restored} image(s)"), false);
+            true
+        }
     }
 
     pub fn apply_batch_title(&mut self, value: String) {
@@ -1659,16 +1867,171 @@ impl App {
             return;
         }
         let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
         for path in &paths {
             if let Some(item) = self.items.get_mut(path) {
+                let before = item.keywords.clone();
                 state::append_keywords_with_target(&mut item.keywords, &additions, target);
-                item.dirty = true;
+                if item.keywords != before {
+                    item.dirty = true;
+                    changed += 1;
+                }
             }
         }
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
+        self.notify(format!("Keywords appended to {changed} image(s)"), false);
+    }
+
+    /// Remove every keyword from the selection. The save path then emits
+    /// explicit clear arguments so the file's existing tags are removed.
+    pub fn clear_batch_keywords(&mut self) {
+        let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                if !item.keywords.is_empty() || !item.clear_keywords {
+                    item.keywords.clear();
+                    item.clear_keywords = true;
+                    item.dirty = true;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
+        self.notify(format!("Keywords cleared on {changed} image(s)"), false);
+    }
+
+    pub fn normalize_batch_keywords(&mut self) {
+        let target = self.cfg.keyword_target();
+        let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                let normalized = crate::ai::prompt::normalize_keyword_list(&item.keywords, target);
+                let clear_keywords = normalized.is_empty();
+                if item.keywords != normalized || item.clear_keywords != clear_keywords {
+                    item.keywords = normalized;
+                    item.clear_keywords = clear_keywords;
+                    item.dirty = true;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
+        self.notify(format!("Keywords normalized on {changed} image(s)"), false);
+    }
+
+    pub fn replace_batch_keyword_term(&mut self, find: String, replace: String) -> bool {
+        if find.trim().is_empty() {
+            self.notify("Enter a keyword to replace", true);
+            return false;
+        }
+        let target = self.cfg.keyword_target();
+        let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                let before = item.keywords.clone();
+                crate::ai::prompt::replace_keyword(&mut item.keywords, &find, &replace, target);
+                if item.keywords != before {
+                    item.dirty = true;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
         self.notify(
-            format!("Keywords appended to {} image(s)", paths.len()),
+            format!("Replaced \"{}\" on {changed} image(s)", find.trim()),
             false,
         );
+        changed > 0
+    }
+
+    /// Remove exact (case-insensitive) duplicate keywords from the selection
+    /// without normalizing or reordering the remaining terms.
+    pub fn dedupe_batch_keywords(&mut self) {
+        let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
+        let mut removed = 0usize;
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                let count = crate::ai::prompt::dedupe_keywords(&mut item.keywords);
+                if count > 0 {
+                    removed += count;
+                    changed += 1;
+                    item.clear_keywords = item.keywords.is_empty();
+                    item.dirty = true;
+                }
+            }
+        }
+        if removed == 0 {
+            self.notify("No duplicate keywords found", false);
+        } else {
+            self.remember_keyword_cleanup(undo);
+            self.notify(
+                format!("Removed {removed} duplicate keyword(s) from {changed} image(s)"),
+                false,
+            );
+        }
+    }
+
+    pub fn sort_batch_keywords(&mut self) {
+        let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                let before = item.keywords.clone();
+                crate::ai::prompt::sort_keywords(&mut item.keywords);
+                if item.keywords != before {
+                    item.dirty = true;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
+        self.notify(format!("Keywords sorted on {changed} image(s)"), false);
+    }
+
+    pub fn undo_last_save(&mut self, path: &Path) {
+        let Some(item) = self.items.get_mut(path) else {
+            return;
+        };
+        if item.undo_last_save() {
+            self.journal_checked_at = None;
+            self.notify("Restored the metadata from before the last save", false);
+        } else {
+            self.notify("No saved metadata to undo for this image", true);
+        }
+    }
+
+    /// Persist this image's lock choices in config so they survive a restart.
+    pub fn persist_locks(&mut self, path: &Path) {
+        let Some(item) = self.items.get(path) else {
+            return;
+        };
+        let key = lock_key(path);
+        if item.locks == crate::state::FieldLocks::default() {
+            self.cfg.field_locks.remove(&key);
+        } else {
+            self.cfg.field_locks.insert(key, item.locks);
+        }
+        self.cfg_dirty = Some(Instant::now());
     }
 
     pub fn replace_batch_keywords(&mut self, raw: String) {
@@ -1679,16 +2042,21 @@ impl App {
             return;
         }
         let paths = self.selected_paths();
+        let undo = self.keyword_cleanup_snapshot(&paths);
+        let mut changed = 0usize;
         for path in &paths {
             if let Some(item) = self.items.get_mut(path) {
-                item.keywords = keywords.clone();
-                item.dirty = true;
+                if item.keywords != keywords {
+                    item.keywords = keywords.clone();
+                    item.dirty = true;
+                    changed += 1;
+                }
             }
         }
-        self.notify(
-            format!("Keywords replaced on {} image(s)", paths.len()),
-            false,
-        );
+        if changed > 0 {
+            self.remember_keyword_cleanup(undo);
+        }
+        self.notify(format!("Keywords replaced on {changed} image(s)"), false);
     }
 
     /// Apply an AI result to its item and queue the accepted metadata for the
@@ -1732,14 +2100,26 @@ impl App {
         };
         while !self.auto_save_queue.is_empty() {
             let path = self.auto_save_queue.remove(0);
-            let Some((metadata, disk_len, disk_modified)) = self
+            let defaults = self.cfg.rights();
+            let Some((metadata, rights, clear_keywords, disk_len, disk_modified)) = self
                 .items
                 .get(&path)
                 .filter(|item| item.has_metadata())
-                .map(|item| (item.to_metadata(), item.disk_len, item.disk_modified))
+                .map(|item| {
+                    (
+                        item.to_metadata(),
+                        item.rights(&defaults),
+                        item.clear_keywords,
+                        item.disk_len,
+                        item.disk_modified,
+                    )
+                })
             else {
                 continue;
             };
+            if let Some(item) = self.items.get_mut(&path) {
+                item.begin_save();
+            }
             let backup_originals = self.cfg.backup_originals;
             let verify_writes = self.cfg.verify_writes;
             let tx = self.tx.clone();
@@ -1752,10 +2132,16 @@ impl App {
                     if backup_originals {
                         crate::metadata::backup_original(&task_path)?;
                     }
-                    tool.write(&task_path, &metadata)?;
+                    tool.write_with_rights_and_clear(
+                        &task_path,
+                        &metadata,
+                        &rights,
+                        clear_keywords,
+                    )?;
                     if verify_writes {
                         let read = tool.read(&task_path)?;
                         crate::metadata::verify_written(&metadata, &read)?;
+                        crate::metadata::verify_rights(&rights, &read)?;
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -1894,6 +2280,7 @@ impl App {
                     self.batch_retry_tx = None;
                     self.batch_started = None;
                     self.batch_paused = false;
+                    self.batch_cancelling = false;
                     for item in self.items.values_mut() {
                         if item.status == Status::Queued {
                             item.status = Status::Pending;
@@ -1935,6 +2322,7 @@ impl App {
                     if let Some(item) = self.items.get_mut(&path) {
                         match result {
                             Ok(()) => {
+                                item.commit_save();
                                 item.status = Status::Saved;
                                 item.dirty = false;
                                 item.message = None;
@@ -1946,6 +2334,7 @@ impl App {
                                 counted = true;
                             }
                             Err(error) => {
+                                item.discard_save();
                                 item.message = Some(format!("Save failed: {error}"));
                                 counted = true;
                             }
@@ -1974,6 +2363,7 @@ impl App {
                     self.batch_failed_paths.clear();
                     self.batch_retry_tx = None;
                     self.batch_started = None;
+                    self.batch_cancelling = false;
                     if failed == 0 {
                         self.notify(format!("Metadata written to {ok} file(s)"), false);
                     } else {
@@ -1998,6 +2388,7 @@ impl App {
                 }
                 WorkerEvent::MetaLoaded { path, meta } => {
                     let keyword_target = self.cfg.keyword_target();
+                    let keyword_accept_percent = self.cfg.keyword_accept_percent();
                     if let Some(item) = self.items.get_mut(&path) {
                         item.meta_loaded = true;
                         item.meta_error = false;
@@ -2010,7 +2401,7 @@ impl App {
                         if item.dims.is_none() {
                             item.dims = meta.dims;
                         }
-                        item.adopt_existing_metadata(meta, keyword_target);
+                        item.adopt_existing_metadata(meta, keyword_target, keyword_accept_percent);
                     }
                 }
                 WorkerEvent::MetaFailed { path } => {
@@ -2078,10 +2469,7 @@ impl App {
         }
         if let Some(dirty_at) = self.cfg_dirty {
             if dirty_at.elapsed() >= CONFIG_SAVE_DELAY {
-                if let Err(err) = self.cfg.save() {
-                    self.notify(format!("Could not save settings: {err}"), true);
-                }
-                self.cfg_dirty = None;
+                self.flush_config();
             } else {
                 ctx.request_repaint_after(CONFIG_SAVE_DELAY);
             }
@@ -2156,6 +2544,82 @@ mod tests {
     }
 
     #[test]
+    fn field_locks_persist_per_path_and_restore_at_startup() {
+        let dir =
+            std::env::temp_dir().join(format!("autowording-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create lock test dir");
+        let config_path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.path = Some(config_path.clone());
+        cfg.field_locks.insert(
+            "d:/photos/locked.jpg".into(),
+            crate::state::FieldLocks {
+                title: true,
+                keywords: true,
+                ..Default::default()
+            },
+        );
+
+        let path = PathBuf::from("D:/photos/Locked.jpg");
+        let mut app = App::from_config(cfg, None);
+        assert_eq!(
+            app.ensure_item(&path).locks,
+            crate::state::FieldLocks {
+                title: true,
+                keywords: true,
+                ..Default::default()
+            },
+            "startup restores locks by case-insensitive path"
+        );
+
+        app.ensure_item(&path).locks.caption = true;
+        app.persist_locks(&path);
+        assert!(app.cfg_dirty.is_some());
+        app.flush_config();
+        assert!(app.cfg_dirty.is_none());
+
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read saved config"))
+                .expect("parse saved config");
+        assert_eq!(
+            saved.field_locks.get("d:/photos/locked.jpg"),
+            Some(&crate::state::FieldLocks {
+                title: true,
+                caption: true,
+                keywords: true,
+                category: false,
+            })
+        );
+
+        let mut reloaded = App::from_config(saved, None);
+        assert_eq!(
+            reloaded.ensure_item(&path).locks,
+            crate::state::FieldLocks {
+                title: true,
+                caption: true,
+                keywords: true,
+                ..Default::default()
+            },
+            "relaunch restores the saved lock choices"
+        );
+
+        app.ensure_item(&path).locks = crate::state::FieldLocks::default();
+        app.persist_locks(&path);
+        app.flush_config();
+        let cleared: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read cleared config"))
+                .expect("parse cleared config");
+        assert!(
+            !cleared.field_locks.contains_key("d:/photos/locked.jpg"),
+            "clearing every lock removes the persisted entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn journal_entry_restores_fields_as_modified() {
         let mut item = ImageItem::new(PathBuf::from("D:/photos/harbour.jpg"));
         let entry = journal::JournalEntry {
@@ -2163,6 +2627,12 @@ mod tests {
             caption: "Boats rest in the harbour before sunrise.".into(),
             keywords: vec!["harbour".into(), "dawn".into()],
             editorial: true,
+            category: "Travel".into(),
+            creator: "Jane Doe".into(),
+            copyright: "© 2026 Jane Doe".into(),
+            credit_line: "Jane Doe".into(),
+            rights_usage_terms: "Commercial use only".into(),
+            clear_keywords: false,
         };
 
         apply_journal_entry(&mut item, &entry);
@@ -2182,7 +2652,69 @@ mod tests {
             caption: "A factual caption that is long enough for this test.".to_string(),
             keywords: vec!["apple".into(), "banana".into(), "cherry".into()],
             editorial,
+            category: "Nature".to_string(),
         }
+    }
+
+    #[test]
+    fn batch_keyword_cleanup_undo_restores_the_whole_selection_once() {
+        let mut app = App::from_config(Config::default(), None);
+        let first = PathBuf::from("D:/photos/first.jpg");
+        let second = PathBuf::from("D:/photos/second.jpg");
+        let first_before = vec![
+            "harbour".to_string(),
+            "harbour".to_string(),
+            "sunrise".into(),
+        ];
+        let second_before = vec!["boats".to_string(), "boats".to_string(), "pier".into()];
+        for (path, keywords) in [
+            (&first, first_before.clone()),
+            (&second, second_before.clone()),
+        ] {
+            let mut item = ImageItem::new(path.clone());
+            item.keywords = keywords;
+            app.items.insert(path.clone(), item);
+        }
+        app.folder_images = vec![first.clone(), second.clone()];
+        app.selection.select_all(&app.folder_images);
+
+        app.normalize_batch_keywords();
+        assert_eq!(app.items[&first].keywords, vec!["harbour", "sunrise"]);
+        assert_eq!(app.items[&second].keywords, vec!["boats", "pier"]);
+        assert!(app.has_keyword_cleanup_undo());
+
+        assert!(app.undo_batch_keyword_cleanup());
+        assert_eq!(app.items[&first].keywords, first_before);
+        assert_eq!(app.items[&second].keywords, second_before);
+        assert!(!app.has_keyword_cleanup_undo(), "undo is a single step");
+
+        app.clear_batch_keywords();
+        assert!(app.items[&first].keywords.is_empty());
+        assert!(app.items[&first].clear_keywords);
+        assert!(app.undo_batch_keyword_cleanup());
+        assert_eq!(app.items[&first].keywords, first_before);
+        assert!(!app.items[&first].clear_keywords);
+
+        app.append_batch_keywords("extra".into());
+        assert_eq!(
+            app.items[&first].keywords,
+            vec!["harbour", "harbour", "sunrise", "extra"]
+        );
+        assert_eq!(
+            app.items[&second].keywords,
+            vec!["boats", "boats", "pier", "extra"]
+        );
+        assert!(app.undo_batch_keyword_cleanup());
+        assert_eq!(app.items[&first].keywords, first_before);
+        assert_eq!(app.items[&second].keywords, second_before);
+
+        app.replace_batch_keywords("alpha, beta".into());
+        assert_eq!(app.items[&first].keywords, vec!["alpha", "beta"]);
+        assert_eq!(app.items[&second].keywords, vec!["alpha", "beta"]);
+        app.replace_batch_keywords("alpha, beta".into());
+        assert!(app.undo_batch_keyword_cleanup());
+        assert_eq!(app.items[&first].keywords, first_before);
+        assert_eq!(app.items[&second].keywords, second_before);
     }
 
     #[test]

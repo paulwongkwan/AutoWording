@@ -664,6 +664,29 @@ fn batch(
         .wrap(),
     );
 
+    if failed > 0 {
+        let summary = crate::state::failure_summary(&items);
+        if !summary.is_empty() {
+            let text = summary
+                .iter()
+                .map(|(cause, count)| format!("{count} {}", cause.label()))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            gap(ui, compact, 3.0, 2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Why: {text}"))
+                        .size(9.0)
+                        .color(theme::warning()),
+                )
+                .wrap(),
+            )
+            .on_hover_text(
+                "Failure reasons of the failed images in this list, most common first",
+            );
+        }
+    }
+
     if let Some(batch) = app.batch {
         gap(ui, compact, 5.0, 4.0);
         ui.add(

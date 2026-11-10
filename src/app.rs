@@ -1887,6 +1887,29 @@ impl App {
         );
     }
 
+    /// Copy the photo context of the first selected image into the batch
+    /// context field, so one note can be reused across a shoot without
+    /// retyping it. Returns the copied text, or `None` when there is nothing
+    /// to copy.
+    pub fn copy_first_context_to_batch(&mut self) -> Option<String> {
+        let Some(path) = self.selected_paths().into_iter().next() else {
+            self.notify("Select an image with a context first", true);
+            return None;
+        };
+        let Some(item) = self.items.get(&path) else {
+            return None;
+        };
+        let context = item.context.trim().to_string();
+        let name = item.file_name();
+        if context.is_empty() {
+            self.notify(format!("{name} has no context to copy"), true);
+            return None;
+        }
+        self.batch_context = context.clone();
+        self.notify(format!("Copied the context from {name}"), false);
+        Some(context)
+    }
+
     pub fn append_batch_keywords(&mut self, raw: String) {
         let target = self.cfg.keyword_target();
         let additions = crate::ai::prompt::normalize_keywords_with_target(&raw, target);
@@ -2773,6 +2796,43 @@ mod tests {
         app.apply_batch_context("   ".into());
         assert!(app.items[&first].context.is_empty());
         assert!(app.items[&second].context.is_empty());
+    }
+
+    #[test]
+    fn batch_context_can_be_copied_from_the_first_selected_image() {
+        let mut app = App::from_config(Config::default(), None);
+        let first = PathBuf::from("D:/photos/first.jpg");
+        let second = PathBuf::from("D:/photos/second.jpg");
+        for (path, context) in [
+            (&first, "Shot for the harbour series."),
+            (&second, "Shot for the harbour series too."),
+        ] {
+            let mut item = ImageItem::new(path.clone());
+            item.context = context.to_string();
+            app.items.insert(path.clone(), item);
+        }
+        app.folder_images = vec![first.clone(), second.clone()];
+        app.selection.select_all(&app.folder_images);
+
+        let copied = app
+            .copy_first_context_to_batch()
+            .expect("the first image has a context to copy");
+
+        assert_eq!(copied, "Shot for the harbour series.");
+        assert_eq!(app.batch_context, "Shot for the harbour series.");
+        assert_eq!(
+            app.items[&first].context, "Shot for the harbour series.",
+            "copying fills the batch field, it does not rewrite the images"
+        );
+
+        app.batch_context.clear();
+        app.items.get_mut(&first).expect("first item").context = String::new();
+        assert_eq!(
+            app.copy_first_context_to_batch(),
+            None,
+            "an empty context leaves the batch field alone"
+        );
+        assert!(app.batch_context.is_empty());
     }
 
     #[test]

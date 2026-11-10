@@ -2250,6 +2250,19 @@ impl AutoWordingView {
                             })),
                     )
                     .child(
+                        Button::new("copy-first-context")
+                            .label("Copy from first")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(context) = this.core.copy_first_context_to_batch() {
+                                    this.batch_context.update(cx, |state, cx| {
+                                        state.set_value(context, window, cx)
+                                    });
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("apply-context")
                             .label("Apply context")
                             .small()

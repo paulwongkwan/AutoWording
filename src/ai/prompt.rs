@@ -226,6 +226,20 @@ pub fn user_prompt(context: Option<&str>, existing: Option<&ExistingMetadata>) -
     prompt
 }
 
+/// Merge the app-wide context (Settings) with the per-image context stored in
+/// the file. The image's own note comes first because it is the more specific
+/// ground truth; either part may be blank or missing.
+pub fn combined_context(global: Option<&str>, photo: Option<&str>) -> Option<String> {
+    let photo = photo.map(str::trim).filter(|value| !value.is_empty());
+    let global = global.map(str::trim).filter(|value| !value.is_empty());
+    match (photo, global) {
+        (Some(photo), Some(global)) => Some(format!("{photo}\n\n{global}")),
+        (Some(photo), None) => Some(photo.to_string()),
+        (None, Some(global)) => Some(global.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Words to aim for inside the allowed title range. A range alone lets the model
 /// land on the same boundary again, so retries name one exact target.
 fn target_title_words(range: (usize, usize)) -> usize {
@@ -1273,6 +1287,26 @@ mod tests {
     }
 
     #[test]
+    fn combined_context_puts_the_image_note_first() {
+        assert_eq!(combined_context(None, None), None);
+        assert_eq!(combined_context(Some("   "), None), None);
+        assert_eq!(combined_context(None, Some("  ")), None);
+        assert_eq!(
+            combined_context(None, Some(" Night market in Taipei ")).as_deref(),
+            Some("Night market in Taipei")
+        );
+        assert_eq!(
+            combined_context(
+                Some("Stock agency prefers travel"),
+                Some("Night market in Taipei")
+            )
+            .as_deref(),
+            Some("Night market in Taipei\n\nStock agency prefers travel"),
+            "the image's own note is the more specific ground truth, so it leads"
+        );
+    }
+
+    #[test]
     fn user_prompt_includes_existing_file_metadata() {
         let existing = ExistingMetadata {
             title: Some("Canal Sunset".to_string()),
@@ -1566,7 +1600,6 @@ mod tests {
         assert!(!prompt.contains("{CAPTION_AIM_CHARS}"));
     }
 
-    #[test]
     #[test]
     fn titles_lose_stray_punctuation_and_digits() {
         assert_eq!(normalize_title("Golden Gate Bridge."), "Golden Gate Bridge");

@@ -847,6 +847,47 @@ async fn generate_uses_capture_date_for_editorial_prompt() {
 }
 
 #[tokio::test]
+async fn generate_sends_the_file_context_with_the_app_context() {
+    let reply = r#"{"choices":[{"message":{"content":"Title: Night Market Stalls\nEditorial Status: Commercial\nCaption: A factual caption that is long enough for this test.\nKeywords: apple, banana, cherry"}}]}"#;
+    let server = mock_server_sequence(vec![("200 OK", reply)]);
+    let existing = crate::metadata::ExistingMetadata {
+        context: Some("Shot at the harbour festival with permission.".to_string()),
+        ..Default::default()
+    };
+
+    generate(AiRequest {
+        provider: Provider::LmStudio,
+        settings: ProviderSettings {
+            base_url: server.url().to_string(),
+            model: "test-model".to_string(),
+            api_key: String::new(),
+        },
+        image_base64: "QUJD".to_string(),
+        context: Some("Stock agency prefers travel imagery.".to_string()),
+        existing,
+        global_prompt: String::new(),
+        date: "November 6, 2026".to_string(),
+        keyword_target: 3,
+        keyword_accept_percent: 80,
+        title_range: (3, 5),
+        caption_range: (50, 180),
+    })
+    .await
+    .expect("metadata should generate");
+
+    let requests = server.finish();
+    assert!(
+        requests.contains("Shot at the harbour festival with permission."),
+        "the context stored with the file must reach the model"
+    );
+    assert!(
+        requests.contains("Stock agency prefers travel imagery."),
+        "the app-wide context must still be sent alongside it"
+    );
+    assert_eq!(requests.matches("POST /v1/chat/completions").count(), 1);
+}
+
+#[tokio::test]
 async fn generate_retries_an_unparsable_reply() {
     let bad =
         r#"{"choices":[{"message":{"content":"I am sorry, I cannot describe this image."}}]}"#;

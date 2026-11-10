@@ -50,11 +50,13 @@ pub struct AutoWordingView {
     search: Entity<InputState>,
     title: Entity<InputState>,
     caption: Entity<TextareaState>,
+    photo_context: Entity<TextareaState>,
     keywords: Entity<InputState>,
     category: Entity<InputState>,
     batch_title: Entity<InputState>,
     batch_caption: Entity<TextareaState>,
     batch_keywords: Entity<InputState>,
+    batch_context: Entity<TextareaState>,
     item_creator: Entity<InputState>,
     item_copyright: Entity<InputState>,
     item_credit_line: Entity<InputState>,
@@ -111,6 +113,11 @@ impl AutoWordingView {
         let caption = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder("Factual caption and description")
         });
+        let photo_context = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder(
+                "Context for the AI: who, where, when, anything the pixels cannot show",
+            )
+        });
         let keywords =
             cx.new(|cx| InputState::new(window, cx).placeholder("Comma-separated keywords"));
         let category = cx.new(|cx| {
@@ -122,6 +129,9 @@ impl AutoWordingView {
             cx.new(|cx| TextareaState::new(window, cx).placeholder("Caption for selection"));
         let batch_keywords =
             cx.new(|cx| InputState::new(window, cx).placeholder("Keywords to append or replace"));
+        let batch_context = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder("Context to apply to every selected image")
+        });
         let item_creator =
             cx.new(|cx| InputState::new(window, cx).placeholder("Blank uses the Settings creator"));
         let item_copyright = cx
@@ -243,6 +253,23 @@ impl AutoWordingView {
                 }
             },
         ));
+        subscriptions.push(Self::subscribe_textarea(
+            cx,
+            window,
+            &photo_context,
+            |this, value, _, cx| {
+                if let Some(path) = this.core.active_path() {
+                    if let Some(item) = this.core.items.get_mut(&path) {
+                        if item.context != value {
+                            item.context = value;
+                            item.dirty = true;
+                            item.message = None;
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        ));
         subscriptions.push(Self::subscribe_input(
             cx,
             window,
@@ -333,6 +360,15 @@ impl AutoWordingView {
             &batch_keywords,
             |this, value, _, cx| {
                 this.core.batch_keywords = value;
+                cx.notify();
+            },
+        ));
+        subscriptions.push(Self::subscribe_textarea(
+            cx,
+            window,
+            &batch_context,
+            |this, value, _, cx| {
+                this.core.batch_context = value;
                 cx.notify();
             },
         ));
@@ -534,11 +570,13 @@ impl AutoWordingView {
             search,
             title,
             caption,
+            photo_context,
             keywords,
             category,
             batch_title,
             batch_caption,
             batch_keywords,
+            batch_context,
             item_creator,
             item_copyright,
             item_credit_line,
@@ -650,6 +688,18 @@ impl AutoWordingView {
                 {
                     let value = item.caption.clone();
                     self.caption
+                        .update(cx, |state, cx| state.set_value(value, window, cx));
+                }
+                if active_changed
+                    || (!self
+                        .photo_context
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                        && self.photo_context.read(cx).value().as_ref() != item.context.as_str())
+                {
+                    let value = item.context.clone();
+                    self.photo_context
                         .update(cx, |state, cx| state.set_value(value, window, cx));
                 }
                 let keyword_text = item.keywords.join(", ");
@@ -811,6 +861,8 @@ impl AutoWordingView {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
         self.caption
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.photo_context
             .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
@@ -1907,6 +1959,11 @@ impl AutoWordingView {
                 Textarea::new(&self.caption).h(px(92.0)),
                 cx,
             ))
+            .child(labeled(
+                "Context (sent to the AI)",
+                Textarea::new(&self.photo_context).h(px(72.0)),
+                cx,
+            ))
             .child(labeled("Category", Input::new(&self.category), cx))
             .child(section_label("Rights overrides — blank uses Settings", cx))
             .child(rights_labeled(
@@ -2164,6 +2221,11 @@ impl AutoWordingView {
                 cx,
             ))
             .child(labeled("Keywords", Input::new(&self.batch_keywords), cx))
+            .child(labeled(
+                "Context",
+                Textarea::new(&self.batch_context).h(px(72.0)),
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -2184,6 +2246,16 @@ impl AutoWordingView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.core
                                     .apply_batch_caption(this.core.batch_caption.clone());
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("apply-context")
+                            .label("Apply context")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.core
+                                    .apply_batch_context(this.core.batch_context.clone());
                                 cx.notify();
                             })),
                     )

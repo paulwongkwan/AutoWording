@@ -198,6 +198,7 @@ pub struct ImageItemSnapshot {
     pub keywords: Vec<String>,
     pub editorial: bool,
     pub category: String,
+    pub context: String,
     pub creator: String,
     pub copyright: String,
     pub credit_line: String,
@@ -221,6 +222,9 @@ pub struct ImageItem {
     pub keywords: Vec<String>,
     pub editorial: bool,
     pub category: String,
+    /// Free-text photo context stored in the file and sent to the AI as ground
+    /// truth for this image ("what you cannot see in the pixels").
+    pub context: String,
     /// Per-image rights overrides; empty means use the Settings value.
     pub creator: String,
     pub copyright: String,
@@ -258,6 +262,7 @@ impl ImageItem {
             keywords: Vec::new(),
             editorial: false,
             category: String::new(),
+            context: String::new(),
             creator: String::new(),
             copyright: String::new(),
             credit_line: String::new(),
@@ -317,6 +322,7 @@ impl ImageItem {
             keywords: self.keywords.clone(),
             editorial: self.editorial,
             category: self.category.clone(),
+            context: self.context.clone(),
             creator: self.creator.clone(),
             copyright: self.copyright.clone(),
             credit_line: self.credit_line.clone(),
@@ -358,6 +364,7 @@ impl ImageItem {
         self.keywords = snapshot.keywords;
         self.editorial = snapshot.editorial;
         self.category = snapshot.category;
+        self.context = snapshot.context;
         self.creator = snapshot.creator;
         self.copyright = snapshot.copyright;
         self.credit_line = snapshot.credit_line;
@@ -398,6 +405,7 @@ impl ImageItem {
             copyright,
             credit_line,
             usage_terms,
+            context,
             ..
         } = meta;
         if self.title.is_empty() && self.caption.is_empty() && self.keywords.is_empty() {
@@ -412,6 +420,13 @@ impl ImageItem {
         // Skip this for an item with unsaved edits, where a blank override may
         // be a deliberate choice to use the Settings value.
         if !self.dirty {
+            // Context is user-written ground truth, so a file's copy only
+            // fills an empty slot and never replaces typed text.
+            if self.context.trim().is_empty() {
+                if let Some(value) = context.filter(|value| !value.trim().is_empty()) {
+                    self.context = value.trim().to_string();
+                }
+            }
             for (slot, value) in [
                 (&mut self.creator, creator),
                 (&mut self.copyright, copyright),

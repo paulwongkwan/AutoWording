@@ -138,6 +138,7 @@ pub struct App {
     pub batch_title: String,
     pub batch_caption: String,
     pub batch_keywords: String,
+    pub batch_context: String,
     keyword_cleanup_undo: Option<KeywordCleanupUndo>,
     pub pending_export: Option<PendingExport>,
     pub show_about: bool,
@@ -175,6 +176,7 @@ fn existing_metadata(item: &ImageItem) -> ExistingMetadata {
         caption: (!caption.is_empty()).then(|| caption.to_string()),
         keywords: item.keywords.clone(),
         category: (!item.category.trim().is_empty()).then(|| item.category.trim().to_string()),
+        context: (!item.context.trim().is_empty()).then(|| item.context.trim().to_string()),
         gps: item.gps.clone(),
         date: item.date.clone(),
         dims: item.dims,
@@ -190,6 +192,7 @@ fn apply_journal_entry(item: &mut ImageItem, entry: &journal::JournalEntry) {
     item.keywords = entry.keywords.clone();
     item.editorial = entry.editorial;
     item.category = entry.category.clone();
+    item.context = entry.context.clone();
     item.creator = entry.creator.clone();
     item.copyright = entry.copyright.clone();
     item.credit_line = entry.credit_line.clone();
@@ -267,6 +270,7 @@ impl App {
             batch_title: String::new(),
             batch_caption: String::new(),
             batch_keywords: String::new(),
+            batch_context: String::new(),
             keyword_cleanup_undo: None,
             pending_export: None,
             show_about: false,
@@ -465,6 +469,7 @@ impl App {
                         keywords: item.keywords.clone(),
                         editorial: item.editorial,
                         category: item.category.clone(),
+                        context: item.context.clone(),
                         creator: item.creator.clone(),
                         copyright: item.copyright.clone(),
                         credit_line: item.credit_line.clone(),
@@ -1679,6 +1684,7 @@ impl App {
             PathBuf,
             Metadata,
             Rights,
+            String,
             bool,
             Option<u64>,
             Option<SystemTime>,
@@ -1693,6 +1699,7 @@ impl App {
                             path.clone(),
                             item.to_metadata(),
                             item.rights(&defaults),
+                            item.context.trim().to_string(),
                             item.clear_keywords,
                             item.disk_len,
                             item.disk_modified,
@@ -1717,14 +1724,14 @@ impl App {
             );
         }
 
-        for (path, _, _, _, _, _) in &items {
+        for (path, _, _, _, _, _, _) in &items {
             if let Some(item) = self.items.get_mut(path) {
                 item.begin_save();
             }
         }
         self.batch_up_next = items
             .iter()
-            .map(|(path, _, _, _, _, _)| path.clone())
+            .map(|(path, _, _, _, _, _, _)| path.clone())
             .collect();
         let total = items.len();
         self.batch = Some(BatchProgress {
@@ -1745,7 +1752,8 @@ impl App {
         self.rt.spawn(async move {
             let mut ok = 0usize;
             let mut failed = 0usize;
-            for (path, metadata, rights, clear_keywords, disk_len, disk_modified) in items {
+            for (path, metadata, rights, context, clear_keywords, disk_len, disk_modified) in items
+            {
                 let _ = tx.send(WorkerEvent::SaveStarted { path: path.clone() });
                 ctx2.request_repaint();
                 let tool = tool.clone();
@@ -1759,12 +1767,14 @@ impl App {
                         &task_path,
                         &metadata,
                         &rights,
+                        &context,
                         clear_keywords,
                     )?;
                     if verify_writes {
                         let read = tool.read(&task_path)?;
                         crate::metadata::verify_written(&metadata, &read)?;
                         crate::metadata::verify_rights(&rights, &read)?;
+                        crate::metadata::verify_context(&context, &read)?;
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -1855,6 +1865,24 @@ impl App {
         }
         self.notify(
             format!("Caption applied to {} image(s)", paths.len()),
+            false,
+        );
+    }
+
+    /// Fill the photo context on every selected image, the equivalent of
+    /// LrGeniusAI's "Use for all following pictures" answer. The same text is
+    /// written to each file on save; a blank value clears the loaded items.
+    pub fn apply_batch_context(&mut self, value: String) {
+        let paths = self.selected_paths();
+        let context = value.trim().to_string();
+        for path in &paths {
+            if let Some(item) = self.items.get_mut(path) {
+                item.context = context.clone();
+                item.dirty = true;
+            }
+        }
+        self.notify(
+            format!("Context applied to {} image(s)", paths.len()),
             false,
         );
     }
@@ -2101,7 +2129,7 @@ impl App {
         while !self.auto_save_queue.is_empty() {
             let path = self.auto_save_queue.remove(0);
             let defaults = self.cfg.rights();
-            let Some((metadata, rights, clear_keywords, disk_len, disk_modified)) = self
+            let Some((metadata, rights, context, clear_keywords, disk_len, disk_modified)) = self
                 .items
                 .get(&path)
                 .filter(|item| item.has_metadata())
@@ -2109,6 +2137,7 @@ impl App {
                     (
                         item.to_metadata(),
                         item.rights(&defaults),
+                        item.context.trim().to_string(),
                         item.clear_keywords,
                         item.disk_len,
                         item.disk_modified,
@@ -2136,12 +2165,14 @@ impl App {
                         &task_path,
                         &metadata,
                         &rights,
+                        &context,
                         clear_keywords,
                     )?;
                     if verify_writes {
                         let read = tool.read(&task_path)?;
                         crate::metadata::verify_written(&metadata, &read)?;
                         crate::metadata::verify_rights(&rights, &read)?;
+                        crate::metadata::verify_context(&context, &read)?;
                     }
                     Ok::<(), anyhow::Error>(())
                 })
@@ -2632,6 +2663,7 @@ mod tests {
             copyright: "© 2026 Jane Doe".into(),
             credit_line: "Jane Doe".into(),
             rights_usage_terms: "Commercial use only".into(),
+            context: "Shot before sunrise from the pier.".into(),
             clear_keywords: false,
         };
 
@@ -2640,6 +2672,7 @@ mod tests {
         assert_eq!(item.title, "Harbour at dawn");
         assert_eq!(item.caption, "Boats rest in the harbour before sunrise.");
         assert_eq!(item.keywords, vec!["harbour", "dawn"]);
+        assert_eq!(item.context, "Shot before sunrise from the pier.");
         assert!(item.editorial);
         assert!(item.dirty, "recovered edits must still count as unsaved");
         assert_eq!(item.status, Status::Generated);
@@ -2715,6 +2748,31 @@ mod tests {
         assert!(app.undo_batch_keyword_cleanup());
         assert_eq!(app.items[&first].keywords, first_before);
         assert_eq!(app.items[&second].keywords, second_before);
+    }
+
+    #[test]
+    fn batch_context_applies_to_every_selected_image() {
+        let mut app = App::from_config(Config::default(), None);
+        let first = PathBuf::from("D:/photos/first.jpg");
+        let second = PathBuf::from("D:/photos/second.jpg");
+        for path in [&first, &second] {
+            app.items.insert(path.clone(), ImageItem::new(path.clone()));
+        }
+        app.folder_images = vec![first.clone(), second.clone()];
+        app.selection.select_all(&app.folder_images);
+
+        app.apply_batch_context("  Shot for the harbour series.  ".into());
+
+        assert_eq!(app.items[&first].context, "Shot for the harbour series.");
+        assert_eq!(app.items[&second].context, "Shot for the harbour series.");
+        assert!(
+            app.items[&first].dirty && app.items[&second].dirty,
+            "applied context is an unsaved edit"
+        );
+
+        app.apply_batch_context("   ".into());
+        assert!(app.items[&first].context.is_empty());
+        assert!(app.items[&second].context.is_empty());
     }
 
     #[test]

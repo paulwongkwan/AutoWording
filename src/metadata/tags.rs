@@ -11,6 +11,9 @@ pub struct ExistingMetadata {
     pub copyright: Option<String>,
     pub credit_line: Option<String>,
     pub usage_terms: Option<String>,
+    /// Free-text photo context stored with the file and sent to the AI as
+    /// ground truth for this image.
+    pub context: Option<String>,
     pub gps: Option<String>,
     pub date: Option<String>,
     pub dims: Option<(u32, u32)>,
@@ -32,6 +35,8 @@ pub const READ_TAGS: &[&str] = &[
     "-XMP-dc:Rights",
     "-XMP-photoshop:Credit",
     "-XMP-xmpRights:UsageTerms",
+    "-XMP-photoshop:Instructions",
+    "-IPTC:SpecialInstructions",
     "-GPSPosition",
     "-GPSLatitude",
     "-GPSLongitude",
@@ -63,6 +68,7 @@ pub const VIDEO_READ_TAGS: &[&str] = &[
     "-Keys:Copyright",
     "-XMP-photoshop:Credit",
     "-XMP-xmpRights:UsageTerms",
+    "-XMP-photoshop:Instructions",
     "-ImageSize",
     "-CreateDate",
     "-Keys:CreationDate",
@@ -178,6 +184,7 @@ pub(crate) fn parse_video_read_object(object: &Value) -> ExistingMetadata {
     let copyright = first_string(object, &["XMP-dc:Rights", "Keys:Copyright"]);
     let credit_line = first_string(object, &["XMP-photoshop:Credit"]);
     let usage_terms = first_string(object, &["XMP-xmpRights:UsageTerms"]);
+    let context = first_string(object, &["XMP-photoshop:Instructions"]);
 
     let mut keywords: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -209,6 +216,7 @@ pub(crate) fn parse_video_read_object(object: &Value) -> ExistingMetadata {
         copyright,
         credit_line,
         usage_terms,
+        context,
         gps: gps_location(object),
         date: first_string(
             object,
@@ -258,6 +266,7 @@ pub(crate) fn parse_read_object(
     let copyright = first_string(object, &["Rights"]);
     let credit_line = first_string(object, &["Credit"]);
     let usage_terms = first_string(object, &["UsageTerms"]);
+    let context = first_string(object, &["Instructions", "SpecialInstructions"]);
 
     let mut keywords: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -300,6 +309,7 @@ pub(crate) fn parse_read_object(
         copyright,
         credit_line,
         usage_terms,
+        context,
         gps,
         date,
         dims,
@@ -419,6 +429,39 @@ mod tests {
                 .dims,
             Some((6000, 4000)),
             "EXIF says upright, so the XMP rotation must not be applied"
+        );
+    }
+
+    #[test]
+    fn reads_the_photo_context_from_xmp_or_iptc() {
+        let object: Value = serde_json::from_str(
+            r#"{"Instructions":"Shot for the harbour series.","SpecialInstructions":"Legacy copy."}"#,
+        )
+        .expect("json");
+        let read = parse_read_object(&object, None);
+        assert_eq!(
+            read.context.as_deref(),
+            Some("Shot for the harbour series.")
+        );
+
+        let legacy: Value =
+            serde_json::from_str(r#"{"SpecialInstructions":"Legacy copy."}"#).expect("json");
+        assert_eq!(
+            parse_read_object(&legacy, None).context.as_deref(),
+            Some("Legacy copy."),
+            "IPTC instructions are the fallback for files without XMP"
+        );
+    }
+
+    #[test]
+    fn reads_video_context_from_xmp_instructions() {
+        let object: Value = serde_json::from_str(
+            r#"{"XMP-photoshop:Instructions":"Drone footage of the harbour."}"#,
+        )
+        .expect("json");
+        assert_eq!(
+            parse_video_read_object(&object).context.as_deref(),
+            Some("Drone footage of the harbour.")
         );
     }
 

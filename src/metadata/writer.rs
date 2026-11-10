@@ -38,6 +38,21 @@ pub fn clear_keyword_args() -> Vec<String> {
     ]
 }
 
+/// ExifTool arguments for the per-image photo context. XMP is the
+/// interchange format every tool reads; still images also get the legacy IPTC
+/// instructions tag so Lightroom and Photoshop show the same note.
+pub fn context_args(context: &str, video: bool) -> Vec<String> {
+    let context = context.trim();
+    if context.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec![format!("-XMP-photoshop:Instructions={context}")];
+    if !video {
+        args.push(format!("-IPTC:SpecialInstructions={context}"));
+    }
+    args
+}
+
 /// ExifTool arguments for MP4/MOV metadata. XMP is the interchange format used
 /// by Adobe, while QuickTime Keys is used by Apple and other video tools. Both
 /// are written so the same file carries usable metadata in either pipeline.
@@ -216,6 +231,30 @@ mod tests {
         assert!(args.contains(&"-XMP-photoshop:Category=Nature".to_string()));
         assert!(!args.iter().any(|arg| arg.contains("+=")));
         assert!(args.contains(&"-overwrite_original".to_string()));
+    }
+
+    #[test]
+    fn writes_the_photo_context_to_xmp_and_iptc() {
+        let args = context_args("  Shot for the harbour series, no releases.  ", false);
+
+        assert_eq!(
+            args,
+            vec![
+                "-XMP-photoshop:Instructions=Shot for the harbour series, no releases.".to_string(),
+                "-IPTC:SpecialInstructions=Shot for the harbour series, no releases.".to_string(),
+            ],
+            "the context is trimmed and written to both tag families"
+        );
+    }
+
+    #[test]
+    fn blank_context_writes_nothing_and_video_skips_iptc() {
+        assert!(context_args("   ", false).is_empty());
+        assert_eq!(
+            context_args("Night market, shot with permission", true),
+            vec!["-XMP-photoshop:Instructions=Night market, shot with permission".to_string()],
+            "MP4/MOV files only carry the XMP tag"
+        );
     }
 
     #[test]

@@ -107,7 +107,10 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
         title_range,
         caption_range,
     );
-    let user = prompt::user_prompt(req.context.as_deref(), Some(&req.existing));
+    // The per-image context stored with the file is more specific than the
+    // app-wide context, so both are sent, image first.
+    let context = prompt::combined_context(req.context.as_deref(), req.existing.context.as_deref());
+    let user = prompt::user_prompt(context.as_deref(), Some(&req.existing));
     let settings = &req.settings;
 
     if settings.model.trim().is_empty() {
@@ -191,7 +194,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
 
     if !valid {
         let retry_user = prompt::retry_prompt(
-            req.context.as_deref(),
+            context.as_deref(),
             Some(&req.existing),
             keyword_target,
             keyword_accept_percent,
@@ -239,7 +242,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
             caption_range,
         );
         let escalation_user = prompt::escalation_prompt(
-            req.context.as_deref(),
+            context.as_deref(),
             Some(&req.existing),
             keyword_target,
             keyword_accept_percent,
@@ -281,7 +284,7 @@ pub async fn generate(req: AiRequest) -> Result<GeneratedMetadata> {
     if metadata_ok(&result, title_range, caption_range) && result.keywords.len() < minimum_keywords
     {
         let topup_user = prompt::keyword_topup_prompt(
-            req.context.as_deref(),
+            context.as_deref(),
             Some(&req.existing),
             keyword_target,
             keyword_accept_percent,

@@ -22,6 +22,8 @@ pub struct JournalEntry {
     pub copyright: String,
     pub credit_line: String,
     pub rights_usage_terms: String,
+    /// Photo context typed for this image but not yet written to the file.
+    pub context: String,
     pub clear_keywords: bool,
 }
 
@@ -48,6 +50,8 @@ struct StoredEntry {
     credit_line: String,
     #[serde(default)]
     rights_usage_terms: String,
+    #[serde(default)]
+    context: String,
     #[serde(default)]
     clear_keywords: bool,
 }
@@ -104,6 +108,7 @@ fn load_from(path: &Path) -> HashMap<PathBuf, JournalEntry> {
                     copyright: stored.copyright,
                     credit_line: stored.credit_line,
                     rights_usage_terms: stored.rights_usage_terms,
+                    context: stored.context,
                     clear_keywords: stored.clear_keywords,
                 },
             ))
@@ -135,6 +140,7 @@ fn save_to(entries: &HashMap<PathBuf, JournalEntry>, path: &Path) -> anyhow::Res
                 copyright: entry.copyright.clone(),
                 credit_line: entry.credit_line.clone(),
                 rights_usage_terms: entry.rights_usage_terms.clone(),
+                context: entry.context.clone(),
                 clear_keywords: entry.clear_keywords,
             })
             .collect(),
@@ -168,6 +174,7 @@ mod tests {
             copyright: "© 2026 Jane Doe".to_string(),
             credit_line: "Jane Doe".to_string(),
             rights_usage_terms: "Commercial use only".to_string(),
+            context: "Shot for the harbour series.".to_string(),
             clear_keywords: false,
         }
     }

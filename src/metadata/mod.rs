@@ -203,23 +203,29 @@ impl ExifTool {
 
     /// Write generated metadata plus the rights fields configured in Settings.
     pub fn write_with_rights(&self, path: &Path, md: &Metadata, rights: &Rights) -> Result<()> {
-        self.write_with_rights_and_clear(path, md, rights, false)
+        self.write_with_rights_and_clear(path, md, rights, "", false)
     }
 
-    /// Write metadata, the resolved rights fields, and optionally remove both
-    /// keyword tags when the user explicitly cleared the keyword list.
+    /// Write metadata, the resolved rights fields, the photo context and
+    /// optionally remove both keyword tags when the user explicitly cleared the
+    /// keyword list.
     pub fn write_with_rights_and_clear(
         &self,
         path: &Path,
         md: &Metadata,
         rights: &Rights,
+        context: &str,
         clear_keywords: bool,
     ) -> Result<()> {
-        let args = if is_video_path(path) {
-            writer::video_write_args(md, rights, clear_keywords)
+        let video = is_video_path(path);
+        let args = if video {
+            let mut args = writer::video_write_args(md, rights, clear_keywords);
+            args.extend(writer::context_args(context, true));
+            args
         } else {
             let mut args = writer::write_args(md);
             args.extend(writer::rights_args(rights));
+            args.extend(writer::context_args(context, false));
             if clear_keywords {
                 args.extend(writer::clear_keyword_args());
             }
@@ -378,6 +384,25 @@ pub fn verify_written(md: &Metadata, read: &ExistingMetadata) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Verify the photo context ExifTool reads back after a write. A blank context
+/// is not written, so there is nothing to compare.
+pub fn verify_context(context: &str, read: &ExistingMetadata) -> Result<()> {
+    let expected = context.trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let read_context = read
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| "Saved context could not be read back")?;
+    if read_context != expected {
+        bail!("Saved context did not verify: expected {expected:?}, found {read_context:?}");
+    }
     Ok(())
 }
 
@@ -696,7 +721,7 @@ mod tests {
             keywords: Vec::new(),
             ..metadata
         };
-        tool.write_with_rights_and_clear(&path, &cleared, &Rights::default(), true)
+        tool.write_with_rights_and_clear(&path, &cleared, &Rights::default(), "", true)
             .expect("clear keywords");
         let read = tool.read(&path).expect("read cleared");
         assert!(read.keywords.is_empty(), "got {:?}", read.keywords);
@@ -745,6 +770,25 @@ mod tests {
             ..read
         };
         assert!(verify_written(&metadata, &bad).is_err());
+    }
+
+    #[test]
+    fn photo_context_round_trips_through_the_file() {
+        let Some(tool) = require_tool() else { return };
+        let path = temp_jpeg("context", 32, 24);
+        let metadata = Metadata {
+            title: "Context Round Trip".into(),
+            caption: "A caption for the context round-trip test.".into(),
+            keywords: vec!["context".into()],
+            category: "Nature".into(),
+        };
+        let context = "Shot for the harbour series; no model releases.";
+        tool.write_with_rights_and_clear(&path, &metadata, &Rights::default(), context, false)
+            .expect("write context");
+
+        let read = tool.read(&path).expect("read context");
+        verify_context(context, &read).expect("context verification");
+        assert_eq!(read.context.as_deref(), Some(context));
     }
 
     #[test]
